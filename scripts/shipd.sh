@@ -690,8 +690,8 @@ preflight() {
         die "Playwright not installed. Run: ./run.sh --setup"
     fi
 
-    if [[ "${SUBMIT}" -eq 1 ]] && [[ "${SEPARATE_STEPS}" -eq 1 ]]; then
-        die "--submit requires orchestrator mode (omit --separate-steps)"
+    if [[ "${SUBMIT}" -eq 1 ]] && [[ "${REVIEW}" -eq 0 ]]; then
+        die "--submit requires --review (or a saved reviews/pending-submit.json for manual submit)"
     fi
 
     if [[ "${REVIEW}" -eq 1 ]] && [[ "${NO_CLONE}" -eq 1 ]]; then
@@ -785,6 +785,10 @@ find_latest_submission() {
     printf '%s' "${dir}"
 }
 
+load_session_review_url() {
+    (cd "${AGENT_DIR}" && PYTHONPATH=. "${PYTHON}" -c "from review.review_io import load_session_meta; print(load_session_meta()['review_url'])")
+}
+
 run_separate_phase() {
     local phase="$1"
     local label="$2"
@@ -808,13 +812,16 @@ run_separate_steps_cycle() {
     [[ "${HEADED}" -eq 1 ]] && review_args+=(--headed)
     [[ "${NO_CLONE}" -eq 1 ]] && review_args+=(--no-clone)
     [[ -n "${CLONE_DIR}" ]] && review_args+=(--clone-dir "${CLONE_DIR}")
+    review_args+=(--quest "${QUEST}")
     run_separate_phase reserve "Reserve submission and clone (workflow/review.py)" workflow/review.py "${review_args[@]}" || return 1
 
     if [[ "${REVIEW}" -eq 1 ]]; then
-        local repo_path
+        local repo_path review_url
         repo_path="$(find_latest_submission)" || return 1
+        review_url="$(load_session_review_url)" || return 1
         log "Review target: ${repo_path}"
-        if run_separate_phase review "Autonomous review (review/agent.py)" review/agent.py "${repo_path}" --quest "${QUEST}"; then
+        log "Review URL: ${review_url}"
+        if run_separate_phase review "Autonomous review (review/agent.py)" review/agent.py "${repo_path}" --quest "${QUEST}" --review-url "${review_url}"; then
             :
         else
             record_workflow_failure
@@ -824,7 +831,19 @@ run_separate_steps_cycle() {
         ui_phase_update review "skip"
     fi
 
-    ui_phase_update submit "skip"
+    if [[ "${SUBMIT}" -eq 1 ]]; then
+        local submit_args=()
+        [[ "${HEADED}" -eq 1 ]] && submit_args+=(--headed)
+        submit_args+=(--quest "${QUEST}")
+        if run_separate_phase submit "Submit on Shipd (workflow/submit_from_json.py)" workflow/submit_from_json.py "${submit_args[@]}"; then
+            :
+        else
+            record_workflow_failure
+            return 1
+        fi
+    else
+        ui_phase_update submit "skip"
+    fi
     ui_phase_update stats "start"
     ui_phase_update stats "done"
     return 0

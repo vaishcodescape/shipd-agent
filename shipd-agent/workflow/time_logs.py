@@ -204,7 +204,7 @@ def return_to_reviews(page: Page) -> None:
     except PlaywrightTimeoutError:
         pass
 
-    deck_ready = page.get_by_role("button", name="Continue →").or_(
+    deck_ready = page.get_by_role("button", name="Continue →", exact=True).or_(
         page.get_by_role("button", name=re.compile(r"Reserve", re.I))
     )
     deck_ready.first.wait_for(state="visible", timeout=15_000)

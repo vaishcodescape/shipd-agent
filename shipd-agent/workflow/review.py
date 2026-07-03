@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from playwright.sync_api import (
@@ -34,15 +35,16 @@ PROBLEM_DECK_URL = REVIEWS_URL
 # Button/label text used to claim a submission. Order = preference.
 RESERVE_BUTTON_NAMES = ("Reserve", "Reserve Submission", "Claim")
 
-# Controls that open a reserved submission's review. Order = preference.
-REVIEW_ENTRY_NAMES = ("Continue →", "Review", "Continue Review", "Open", "Continue")
+# Controls that open a reserved submission's review. Exact match only.
+REVIEW_ENTRY_NAMES = ("Continue →", "Continue Review", "Open")
 
 # Once reserved, how we know we've landed on the review view for the submission.
 POST_RESERVE_TIMEOUT_MS = 10_000
-REVIEW_READY_TIMEOUT_MS = 20_000
+REVIEW_READY_TIMEOUT_MS = 45_000
 DECK_TIMEOUT_MS = 30_000
 
 QUICK_SETUP_HEADING = "Quick Setup"
+QUICK_SETUP_HEADING_RE = re.compile(r"Quick Setup", re.I)
 VIEW_SCRIPT_BUTTON = "View Script"
 
 SETUP_SCRIPT_PATTERN = re.compile(
@@ -55,8 +57,8 @@ GIT_CLONE_DIR_PATTERN = re.compile(r"git clone \S+ (\S+)")
 
 def wait_for_problem_deck(page: Page, *, timeout: int = DECK_TIMEOUT_MS) -> None:
     """Wait until the deck shows Reserve or Continue controls."""
-    deck_ready = page.get_by_role("button", name="Continue →").or_(
-        page.get_by_role("button", name=re.compile(r"Reserve", re.I))
+    deck_ready = page.get_by_role("button", name="Continue →", exact=True).or_(
+        page.get_by_role("button", name=re.compile(r"^Reserve", re.I))
     )
     deck_ready.first.wait_for(state="visible", timeout=timeout)
 
@@ -81,28 +83,80 @@ def is_challenge_review_page(page: Page) -> bool:
     return "/challenges/" in page.url
 
 
+def _review_ready_locator(page: Page) -> Locator:
+    """Signals that the challenge review view has loaded."""
+    return (
+        page.get_by_role("heading", name=QUICK_SETUP_HEADING_RE)
+        .or_(page.get_by_text(QUICK_SETUP_HEADING_RE))
+        .or_(page.get_by_role("button", name=VIEW_SCRIPT_BUTTON))
+        .or_(page.get_by_role("heading", name=re.compile(r"Holistic Check", re.I)))
+    )
+
+
+def _review_signal_visible(page: Page) -> bool:
+    locator = _review_ready_locator(page)
+    if locator.count() == 0:
+        return False
+    target = locator.first
+    if not target.is_visible():
+        try:
+            target.scroll_into_view_if_needed(timeout=2_000)
+        except PlaywrightTimeoutError:
+            return False
+    return target.is_visible()
+
+
 def is_review_ready(page: Page) -> bool:
-    """True when Quick Setup is visible (review UI is usable)."""
-    heading = page.get_by_text(QUICK_SETUP_HEADING, exact=True)
-    return heading.count() > 0 and heading.first.is_visible()
+    """True when the review UI is present and usable."""
+    return _review_signal_visible(page)
 
 
 def wait_for_review_ready(page: Page, *, timeout: int = REVIEW_READY_TIMEOUT_MS) -> None:
-    """Wait until the review view shows Quick Setup."""
-    page.get_by_text(QUICK_SETUP_HEADING, exact=True).wait_for(
-        state="visible",
-        timeout=timeout,
+    """Wait until the review view loads, scrolling to reveal below-fold content."""
+    deadline = time.monotonic() + timeout / 1000
+    last_url = page.url
+    signals = _review_ready_locator(page)
+
+    while time.monotonic() < deadline:
+        if _review_signal_visible(page):
+            return
+
+        try:
+            page.wait_for_url("**/challenges/**", timeout=500, wait_until="commit")
+        except PlaywrightTimeoutError:
+            pass
+
+        if page.url != last_url:
+            last_url = page.url
+            page.wait_for_load_state("domcontentloaded", timeout=5_000)
+
+        try:
+            signals.first.wait_for(state="attached", timeout=500)
+            signals.first.scroll_into_view_if_needed(timeout=2_000)
+            if signals.first.is_visible():
+                return
+        except PlaywrightTimeoutError:
+            pass
+
+        page.evaluate(
+            "window.scrollBy(0, Math.max(window.innerHeight * 0.75, 400))"
+        )
+        page.wait_for_timeout(250)
+
+    raise RuntimeError(
+        "Review page did not show Quick Setup or other review sections "
+        f"within {timeout // 1000}s. Current URL: {page.url}"
     )
 
 
 def _post_reserve_signals(page: Page) -> Locator:
     """Locators that indicate reserve succeeded (review open or entry control)."""
-    signals = page.get_by_text(QUICK_SETUP_HEADING, exact=True).or_(
-        page.get_by_role("button", name="Continue →")
+    signals = _review_ready_locator(page).or_(
+        page.get_by_role("button", name="Continue →", exact=True)
     )
     for name in REVIEW_ENTRY_NAMES[1:]:
-        signals = signals.or_(page.get_by_role("button", name=name))
-        signals = signals.or_(page.get_by_role("link", name=name))
+        signals = signals.or_(page.get_by_role("button", name=name, exact=True))
+        signals = signals.or_(page.get_by_role("link", name=name, exact=True))
     return signals
 
 
@@ -112,17 +166,17 @@ def wait_for_post_reserve(page: Page, *, timeout: int = POST_RESERVE_TIMEOUT_MS)
 
 
 def find_review_entry_control(page: Page) -> Locator | None:
-    """Return the first visible, enabled control that opens a reserved review."""
-    # Continue → is the usual post-reserve control; check it first.
-    continue_btn = page.get_by_role("button", name="Continue →")
-    if continue_btn.count() > 0:
-        first = continue_btn.first
-        if first.is_visible() and first.is_enabled():
-            return first
+    """Return the visible, enabled control that opens a reserved review."""
+    # Exact names only — substring "Review" matches the sidebar "Review Queue" tab.
+    continue_buttons = page.get_by_role("button", name="Continue →", exact=True)
+    for i in range(continue_buttons.count() - 1, -1, -1):
+        button = continue_buttons.nth(i)
+        if button.is_visible() and button.is_enabled():
+            return button
 
     for name in REVIEW_ENTRY_NAMES[1:]:
         for role in ("button", "link"):
-            targets = page.get_by_role(role, name=name)
+            targets = page.get_by_role(role, name=name, exact=True)
             for i in range(targets.count()):
                 target = targets.nth(i)
                 if target.is_visible() and target.is_enabled():
@@ -130,15 +184,43 @@ def find_review_entry_control(page: Page) -> Locator | None:
     return None
 
 
+def _click_into_review(page: Page, control: Locator) -> None:
+    """Click a deck entry control and wait for the challenge review route."""
+    try:
+        with page.expect_navigation(timeout=15_000, wait_until="commit"):
+            control.click()
+    except PlaywrightTimeoutError:
+        control.click()
+    wait_for_review_ready(page)
+
+
+def _open_review_from_deck(page: Page) -> None:
+    """Click through from the problem deck into the review view."""
+    if is_review_ready(page):
+        return
+
+    if is_challenge_review_page(page):
+        wait_for_review_ready(page)
+        return
+
+    control = find_review_entry_control(page)
+    if control is None:
+        raise RuntimeError(
+            "Reserved a submission but could not find a control to open its "
+            f"review. Expected one of {REVIEW_ENTRY_NAMES}."
+        )
+
+    _click_into_review(page, control)
+
+
 def continue_existing_review(page: Page) -> bool:
     """Open an in-progress reservation when the deck shows Continue."""
     if "/reviews" not in page.url:
         goto_page(page, PROBLEM_DECK_URL)
     wait_for_problem_deck(page)
-    continue_btn = page.get_by_role("button", name="Continue →")
+    continue_btn = page.get_by_role("button", name="Continue →", exact=True)
     if continue_btn.count() and continue_btn.first.is_visible():
-        continue_btn.first.click()
-        wait_for_review_ready(page)
+        _click_into_review(page, continue_btn.first)
         print(f"Continued existing review: {page.url}")
         return True
     return False
@@ -157,24 +239,7 @@ def reserve_submission(page: Page) -> None:
 
 def open_review(page: Page) -> None:
     """Open the reserved submission's review view and leave it ready."""
-    if is_review_ready(page):
-        print(f"Review open: {page.url}")
-        return
-
-    if is_challenge_review_page(page):
-        wait_for_review_ready(page)
-        print(f"Review open: {page.url}")
-        return
-
-    control = find_review_entry_control(page)
-    if control is None:
-        raise RuntimeError(
-            "Reserved a submission but could not find a control to open its "
-            f"review. Expected one of {REVIEW_ENTRY_NAMES}."
-        )
-
-    control.click()
-    wait_for_review_ready(page)
+    _open_review_from_deck(page)
     print(f"Review open: {page.url}")
 
 
@@ -190,17 +255,7 @@ def reserve_and_open_review(page: Page) -> None:
     find_reserve_button(page).click()
     wait_for_post_reserve(page)
     print("Reserved a submission.")
-
-    if not is_review_ready(page):
-        control = find_review_entry_control(page)
-        if control is None:
-            raise RuntimeError(
-                "Reserved a submission but could not find a control to open its "
-                f"review. Expected one of {REVIEW_ENTRY_NAMES}."
-            )
-        control.click()
-        wait_for_review_ready(page)
-
+    _open_review_from_deck(page)
     print(f"Review open: {page.url}")
 
 
@@ -213,17 +268,25 @@ def open_quick_setup(page: Page) -> None:
             return
 
     view_script = page.get_by_role("button", name=VIEW_SCRIPT_BUTTON)
-    if view_script.count() > 0 and view_script.first.is_visible():
-        view_script.first.click()
-        pre.wait_for(state="visible", timeout=10_000)
-        return
+    if view_script.count() > 0:
+        try:
+            view_script.first.scroll_into_view_if_needed(timeout=2_000)
+        except PlaywrightTimeoutError:
+            pass
+        if view_script.first.is_visible():
+            view_script.first.click()
+            pre.wait_for(state="visible", timeout=10_000)
+            return
 
-    heading = page.get_by_text(QUICK_SETUP_HEADING, exact=True)
-    heading.wait_for(state="visible", timeout=15_000)
-    heading.click()
+    heading = page.get_by_role("heading", name=QUICK_SETUP_HEADING_RE)
+    if heading.count() == 0:
+        heading = page.get_by_text(QUICK_SETUP_HEADING_RE)
+    heading.first.wait_for(state="attached", timeout=15_000)
+    heading.first.scroll_into_view_if_needed()
+    heading.first.click()
 
     view_script.wait_for(state="visible", timeout=10_000)
-    view_script.click()
+    view_script.first.click()
     pre.wait_for(state="visible", timeout=10_000)
 
 
@@ -288,6 +351,7 @@ def run_reserve_and_review(
     auth_state_path: Path = AUTH_STATE_PATH,
     clone_dir: Path | None = None,
     clone: bool = True,
+    quest: str = "olympus",
 ) -> Path | None:
     config = config or AuthConfig()
     auth_state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -313,6 +377,15 @@ def run_reserve_and_review(
                 setup_script,
                 clone_dir=clone_dir or (REPO_ROOT / "submissions"),
             )
+
+        from review.review_io import save_session_meta
+
+        save_session_meta(
+            review_url=page.url,
+            quest=quest,
+            repo_path=cloned_path,
+        )
+        print(f"Session meta saved (review_url={page.url}).")
 
         if not headless:
             print("Press Enter to close the browser...")
@@ -354,6 +427,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Open the review page without running Quick Setup locally.",
     )
+    parser.add_argument(
+        "--quest",
+        choices=("olympus", "mars"),
+        default="olympus",
+        help="Quest name for session meta (default: olympus).",
+    )
     return parser.parse_args()
 
 
@@ -371,6 +450,7 @@ def main() -> int:
             auth_state_path=args.auth_state,
             clone_dir=args.clone_dir or default_clone_dir,
             clone=not args.no_clone,
+            quest=args.quest,
         )
     except (
         PlaywrightTimeoutError,

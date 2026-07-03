@@ -11,6 +11,8 @@ from playwright.sync_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 
+from review.feedback_format import format_compact_author_note
+
 DECISION_LABELS: dict[str, str] = {
     "approve": "Approve",
     "request_changes": "Request Changes",
@@ -80,6 +82,33 @@ def _normalize_confidence(confidence: str) -> str:
     raise ValueError(f"Unknown confidence level: {confidence!r}")
 
 
+def _section_has_score_buttons(section: Locator) -> bool:
+    """True when a band container includes 0–3 score buttons (not just confidence)."""
+    for label in SCORE_LABELS.values():
+        if section.get_by_role("button", name=label).count():
+            return True
+    for score in SCORE_LABELS:
+        if section.get_by_role(
+            "button", name=re.compile(rf"^{score}\b")
+        ).count():
+            return True
+    return False
+
+
+def _pick_tightest_band_section(candidates: list[Locator]) -> Locator | None:
+    """Prefer the smallest container that still has 0–3 score buttons."""
+    best: Locator | None = None
+    best_count = float("inf")
+    for section in candidates:
+        if not _section_has_score_buttons(section):
+            continue
+        count = section.get_by_role("button").count()
+        if count < best_count:
+            best = section
+            best_count = count
+    return best
+
+
 def _band_section(page: Page, heading: str) -> Locator:
     """Locate the band rating block by its section heading."""
     heading_loc = page.get_by_role("heading", name=heading)
@@ -89,15 +118,25 @@ def _band_section(page: Page, heading: str) -> Locator:
     heading_loc.wait_for(state="visible", timeout=15_000)
     heading_loc.scroll_into_view_if_needed()
 
-    section = heading_loc.locator(
-        "xpath=ancestor::*[self::section or self::div or self::fieldset][1]"
+    ancestors = heading_loc.locator(
+        "xpath=ancestor::*[self::section or self::div or self::fieldset]"
     )
-    if section.count():
-        return section.first
+    ancestor_sections = [ancestors.nth(i) for i in range(ancestors.count())]
+    section = _pick_tightest_band_section(ancestor_sections)
+    if section is not None:
+        return section
 
-    return page.locator("div, section, fieldset").filter(
+    fallback = page.locator("div, section, fieldset").filter(
         has=page.get_by_text(heading, exact=True)
-    ).first
+    )
+    fallback_sections = [fallback.nth(i) for i in range(fallback.count())]
+    section = _pick_tightest_band_section(fallback_sections)
+    if section is not None:
+        return section
+
+    raise RuntimeError(
+        f"Could not find band section with score buttons for {heading!r}."
+    )
 
 
 def _click_button_in_scope(
@@ -172,8 +211,10 @@ def _click_band_score(section: Locator, score: int) -> None:
     candidates = (
         str(score),
         f"{score} {label}",
+        f"{score} | {label}",
         label,
         f"{score}\n{label}",
+        f"{score}\n| {label}",
     )
     for name in candidates:
         button = section.get_by_role("button", name=name)
@@ -224,26 +265,13 @@ def _fill_band_ratings(page: Page, band_ratings: dict[str, Any]) -> None:
 
         section = _band_section(page, heading)
         _click_band_score(section, int(score))
+        # Score selection re-renders the band row; re-resolve before confidence.
+        section = _band_section(page, heading)
         _click_band_confidence(section, str(confidence))
 
 
 def _build_author_note(review: dict[str, Any]) -> str:
-    parts: list[str] = []
-    feedback = str(review.get("contributor_feedback", "")).strip()
-    if feedback:
-        parts.append(feedback)
-
-    band_ratings = review.get("band_ratings", {})
-    for band_key, heading in BAND_HEADINGS.items():
-        band = band_ratings.get(band_key, {})
-        if not isinstance(band, dict):
-            continue
-        score = band.get("score")
-        reasoning = str(band.get("reasoning", "")).strip()
-        if score is not None and int(score) < 3 and reasoning:
-            parts.append(f"{heading} ({score}/3): {reasoning}")
-
-    return "\n\n".join(parts).strip()
+    return format_compact_author_note(review)
 
 
 def _author_note_field(page: Page) -> Locator:
@@ -251,6 +279,15 @@ def _author_note_field(page: Page) -> Locator:
         field = page.get_by_label(label, exact=False)
         if field.count():
             return field.first
+
+    author_label = page.get_by_text("Note — sent to the author", exact=True)
+    if not author_label.count():
+        author_label = page.get_by_text("Note - sent to the author", exact=True)
+    if author_label.count():
+        block = author_label.first.locator("xpath=ancestor::*[1]/..")
+        field = block.locator("textarea")
+        if field.count():
+            return field.last
 
     field = page.get_by_role(
         "textbox",
@@ -331,7 +368,13 @@ def _finalize_submission(page: Page) -> None:
             return
 
 
-def submit_review(page: Page, review: dict[str, Any], *, quest: str) -> None:
+def submit_review(
+    page: Page,
+    review: dict[str, Any],
+    *,
+    quest: str,
+    finalize: bool = True,
+) -> None:
     """Fill the Shipd submit-review form from a structured review dict."""
     if not review.get("decision"):
         raise ValueError("review dict must include 'decision'.")
@@ -349,6 +392,9 @@ def submit_review(page: Page, review: dict[str, Any], *, quest: str) -> None:
 
     if review.get("downgrade_to_mars") and quest == "olympus":
         _set_downgrade_to_mars(page, enabled=True)
+
+    if not finalize:
+        return
 
     try:
         _finalize_submission(page)

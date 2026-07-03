@@ -194,4 +194,14 @@ FINALIZE_PHASE_INSTRUCTIONS = f"""
 
 **Decision guards:**
 {DECISION_GUARDS_PROMPT}
+
+**contributor_feedback:** Fills the author note textarea — keep it **compact** (minimal lines, no fluff):
+- One issue per line; no paragraphs, preamble, or filler.
+- Prefer `Band (score/3): brief actionable issue` when tied to a band (Problem, Tests, Solution).
+- Approve with only minor notes: 1–2 lines max.
+- Band `reasoning` for scores < 3 is appended on submit; avoid repeating the same point in both fields.
+Example:
+Problem (2/3): Scope unclear — specify which Lark versions are in scope.
+Tests (2/3): Missing edge cases for ambiguous grammars.
+Solution (1/3): Implementation doesn't handle nested labels.
 """

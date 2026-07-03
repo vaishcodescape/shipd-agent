@@ -10,6 +10,17 @@ from dotenv import load_dotenv
 from auth import REPO_ROOT
 from review.rubric_defaults import MARS_MAX_EFFECTIVE_LOC, OLYMPUS_MAX_EFFECTIVE_LOC
 
+# Retired Anthropic IDs still seen in older .env files → current API model IDs.
+DEPRECATED_MODEL_ALIASES: dict[str, str] = {
+    "claude-opus-4-20250514": "claude-opus-4-8",
+    "claude-opus-4-6": "claude-opus-4-8",
+    "claude-opus-4-20251101": "claude-opus-4-8",
+    "claude-sonnet-4-20250514": "claude-sonnet-4-6",
+}
+
+DEFAULT_REVIEW_MODEL = "claude-opus-4-8"
+DEFAULT_EXPLORE_MODEL = "claude-sonnet-4-6"
+
 
 @dataclass(frozen=True)
 class ReviewConfig:
@@ -30,6 +41,18 @@ def _truthy(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def resolve_model_id(raw: str, *, default: str) -> str:
+    """Return a supported model ID, remapping known retired aliases."""
+    model = raw.strip() or default
+    resolved = DEPRECATED_MODEL_ALIASES.get(model, model)
+    if resolved != model:
+        print(
+            f"WARNING: REVIEW model {model!r} is retired; using {resolved!r} instead.",
+            flush=True,
+        )
+    return resolved
+
+
 def get_review_config(*, dry_run_override: bool | None = None) -> ReviewConfig:
     """Load review settings from .env and environment."""
     load_dotenv(REPO_ROOT / ".env")
@@ -37,11 +60,15 @@ def get_review_config(*, dry_run_override: bool | None = None) -> ReviewConfig:
     dry_run_env = _truthy(os.getenv("REVIEW_DRY_RUN", "0"))
     dry_run = dry_run_override if dry_run_override is not None else dry_run_env
 
-    review_model = os.getenv(
-        "REVIEW_MODEL",
-        "claude-opus-4-8",
-    ).strip()
-    explore_model = os.getenv("REVIEW_EXPLORE_MODEL", "").strip() or review_model
+    review_model = resolve_model_id(
+        os.getenv("REVIEW_MODEL", DEFAULT_REVIEW_MODEL),
+        default=DEFAULT_REVIEW_MODEL,
+    )
+    explore_raw = os.getenv("REVIEW_EXPLORE_MODEL", "").strip()
+    explore_model = resolve_model_id(
+        explore_raw or DEFAULT_EXPLORE_MODEL,
+        default=DEFAULT_EXPLORE_MODEL,
+    )
 
     return ReviewConfig(
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", "").strip(),

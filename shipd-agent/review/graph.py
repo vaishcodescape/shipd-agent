@@ -35,6 +35,11 @@ from review.prompts import (
     build_holistic_check_prompt_section,
     build_unified_review_user_prompt,
 )
+from review.result import (
+    mark_review_complete,
+    mark_review_incomplete,
+    review_failure_reason,
+)
 from review.schemas import (
     BandRating,
     BandRatings,
@@ -266,7 +271,7 @@ def _dry_run_result(state: ReviewState) -> dict:
         result = result.model_copy(update={"repo_eligible": None, "solvability_ok": None})
     else:
         result = result.model_copy(update={"quality": None, "difficulty": None})
-    return result.to_submit_dict()
+    return mark_review_incomplete(result.to_submit_dict(), error="REVIEW_DRY_RUN")
 
 
 def unified_review_node(state: ReviewState) -> dict:
@@ -315,7 +320,6 @@ def unified_review_node(state: ReviewState) -> dict:
     llm = ChatAnthropic(
         model=config.review_explore_model,
         api_key=config.anthropic_api_key,
-        temperature=0,
         max_tokens=8192,
     )
     agent = create_react_agent(llm, tools)
@@ -342,15 +346,23 @@ def unified_review_node(state: ReviewState) -> dict:
         max_tool_steps=config.review_max_tool_steps,
     )
 
-    result = agent.invoke(
-        {
-            "messages": [
-                SystemMessage(content=UNIFIED_REVIEW_SYSTEM_PROMPT),
-                HumanMessage(content=user_prompt),
-            ]
-        },
-        config={"recursion_limit": config.review_max_tool_steps + 5},
-    )
+    try:
+        result = agent.invoke(
+            {
+                "messages": [
+                    SystemMessage(content=UNIFIED_REVIEW_SYSTEM_PROMPT),
+                    HumanMessage(content=user_prompt),
+                ]
+            },
+            config={"recursion_limit": config.review_max_tool_steps + 5},
+        )
+    except Exception as exc:
+        return {
+            **phase0_updates,
+            "error": f"Explore phase failed: {exc}",
+            "explore_notes": f"Unified review agent error: {exc}",
+        }
+
     messages = result.get("messages", [])
     notes = _summarize_explore_messages(messages)
     return {
@@ -417,7 +429,6 @@ def finalize_node(state: ReviewState) -> dict:
     llm = ChatAnthropic(
         model=config.review_model,
         api_key=config.anthropic_api_key,
-        temperature=0,
     ).with_structured_output(ReviewResult)
 
     last_error: Exception | None = None
@@ -518,7 +529,7 @@ def finalize_node(state: ReviewState) -> dict:
     if loc_updates:
         review = review.model_copy(update=loc_updates)
 
-    return {"review_result": review.to_submit_dict()}
+    return {"review_result": mark_review_complete(review.to_submit_dict())}
 
 
 def validate_node(state: ReviewState) -> dict:
@@ -555,7 +566,13 @@ def validate_node(state: ReviewState) -> dict:
                 }
             )
 
-    return {"review_result": review.to_submit_dict()}
+    result_dict = review.to_submit_dict()
+    if raw.get("review_complete") is False:
+        error = str(raw.get("review_error", "")).strip() or review_failure_reason(raw)
+        return {
+            "review_result": mark_review_incomplete(result_dict, error=error),
+        }
+    return {"review_result": mark_review_complete(result_dict)}
 
 
 def _apply_rubric_guards(review: ReviewResult, state: ReviewState) -> ReviewResult:
@@ -646,7 +663,7 @@ def _fallback_result(state: ReviewState, reason: str) -> dict:
     )
     if quest == "olympus":
         result = result.model_copy(update={"repo_eligible": None, "solvability_ok": None})
-    return result.to_submit_dict()
+    return mark_review_incomplete(result.to_submit_dict(), error=reason)
 
 
 def _summarize_explore_messages(messages: list[BaseMessage], *, max_chars: int = 12_000) -> str:

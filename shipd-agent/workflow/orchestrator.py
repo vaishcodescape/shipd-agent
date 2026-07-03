@@ -33,6 +33,8 @@ try:
     from review.agent import run_review_agent
 except (ImportError, AttributeError):
     run_review_agent = None  # type: ignore[assignment, misc]
+from review.review_io import save_review_bundle
+from review.result import is_review_complete, review_failure_reason
 from workflow.review import (
     clone_submission_locally,
     extract_setup_script,
@@ -271,6 +273,15 @@ def run_workflow(
                                 f"WARNING: {review_error}",
                                 log_file=log_file,
                             )
+                        elif not is_review_complete(review_result):
+                            review_error = review_failure_reason(review_result)
+                            phases.fail("review", review_error)
+                            session_stats.record_failure()
+                            log_message(
+                                f"WARNING: Review agent did not finish rubric "
+                                f"phases: {review_error}",
+                                log_file=log_file,
+                            )
                         else:
                             phases.done("review")
                             log_message(
@@ -284,8 +295,22 @@ def run_workflow(
                                 review_url=review_url,
                                 quest=quest,
                             )
+                            bundle_path = save_review_bundle(
+                                review_result,
+                                review_url=review_url,
+                                quest=quest,
+                                repo_path=cloned_path,
+                            )
+                            log_message(
+                                f"Saved review bundle to {bundle_path}.",
+                                log_file=log_file,
+                            )
 
-                    if submit and review_result and review_result.get("decision"):
+                    if (
+                        submit
+                        and review_result
+                        and is_review_complete(review_result)
+                    ):
                         from workflow.submit import submit_review
 
                         with phases.step("submit"):
@@ -293,11 +318,16 @@ def run_workflow(
                                 "Submitting review on Shipd.",
                                 log_file=log_file,
                             )
+                            if review_url not in page.url:
+                                goto_page(page, review_url)
                             submit_review(page, review_result, quest=quest)
                     elif submit:
                         phases.skip("submit", "review-failed")
                     else:
                         phases.skip("submit", "not-requested")
+
+                    if review_error and review_attempted:
+                        raise RuntimeError(review_error)
             else:
                 phases.skip("review", "no-review")
                 phases.skip("submit", "no-review")

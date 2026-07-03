@@ -10,6 +10,8 @@ from typing import Any
 
 from review.config import ReviewConfig, get_review_config
 from review.graph import run_review_graph
+from review.result import is_review_complete, review_failure_reason
+from review.review_io import PENDING_SUBMIT_PATH, save_review_bundle
 
 
 def run_review_agent(
@@ -62,7 +64,10 @@ def parse_args() -> argparse.Namespace:
         "--output",
         type=Path,
         default=None,
-        help="Write review JSON to this file.",
+        help=(
+            "Write review JSON bundle for submit_from_json.py "
+            f"(default: {PENDING_SUBMIT_PATH} when --review-url is set)."
+        ),
     )
     return parser.parse_args()
 
@@ -78,16 +83,30 @@ def main() -> int:
         config=config,
     )
 
-    payload = json.dumps(result, indent=2)
-    if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(payload + "\n", encoding="utf-8")
-        print(f"Wrote review to {args.output}", file=sys.stderr)
+    output_path = args.output
+    if output_path is None and args.review_url.strip():
+        output_path = PENDING_SUBMIT_PATH
+
+    if output_path:
+        written = save_review_bundle(
+            result,
+            review_url=args.review_url.strip(),
+            quest=args.quest,
+            repo_path=args.repo_path,
+            path=output_path,
+        )
+        print(f"Wrote review bundle to {written}", file=sys.stderr)
     else:
-        print(payload)
+        print(json.dumps(result, indent=2))
 
     if not result.get("decision"):
         print("Error: review result missing 'decision'.", file=sys.stderr)
+        return 1
+    if not is_review_complete(result):
+        print(
+            f"Error: review did not complete — {review_failure_reason(result)}",
+            file=sys.stderr,
+        )
         return 1
     return 0
 
