@@ -1,2 +1,2 @@
 # shipd-agent
-An automatic Review Agents that does code reviews for you on the Shipd.ai Platform
+An automatic review agents that does code reviews for you on the Shipd.ai Platform
