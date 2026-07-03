@@ -36,6 +36,9 @@ MANIFEST
 pip-log.txt
 pip-delete-this-directory.txt
 
+# Session review statistics
+logs/
+
 # Unit test / coverage reports
 htmlcov/
 .tox/
@@ -151,6 +154,13 @@ activemq-data/
 .env
 .envrc
 .venv
+
+# Playwright auth state
+auth/
+auth-session/
+submissions/
+reviews/
+node_modules/
 env/
 venv/
 ENV/
@@ -200,6 +210,8 @@ cython_debug/
 #   and can be added to the global gitignore or merged into this file. However, if you prefer, 
 #   you could uncomment the following to ignore the entire vscode folder
 # .vscode/
+logs/session-stats.json
+
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
