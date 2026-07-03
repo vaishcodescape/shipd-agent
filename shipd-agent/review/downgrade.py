@@ -10,7 +10,8 @@ def evaluate_loc_phase4(
     loc_info: dict,
     *,
     quest: str,
-    olympus_max_loc: int,
+    olympus_min_loc: int,
+    mars_min_loc: int,
     mars_max_loc: int,
 ) -> tuple[PhaseResult, list[Finding], str]:
     """
@@ -38,6 +39,32 @@ def evaluate_loc_phase4(
         file_evidence += f" (+{len(files) - 5} more)"
 
     if quest == "mars":
+        if effective_loc < mars_min_loc:
+            findings.append(
+                Finding(
+                    phase="4",
+                    severity="MAJOR",
+                    finding="Solution below Mars minimum scope",
+                    evidence=(
+                        f"effective_loc={effective_loc} < mars_min={mars_min_loc}; "
+                        f"files: {file_evidence or 'n/a'}"
+                    ),
+                    suggested_fix=(
+                        f"Expand the solution to at least {mars_min_loc} substantive "
+                        "lines (median successful agent runs bar for Mars)."
+                    ),
+                )
+            )
+            return (
+                PhaseResult(
+                    status="FAIL",
+                    summary=(
+                        f"Effective LOC {effective_loc} below Mars minimum ({mars_min_loc})."
+                    ),
+                ),
+                findings,
+                f"Effective LOC {effective_loc} below Mars minimum {mars_min_loc}.",
+            )
         if effective_loc > mars_max_loc:
             findings.append(
                 Finding(
@@ -68,39 +95,47 @@ def evaluate_loc_phase4(
             PhaseResult(
                 status="PASS",
                 summary=(
-                    f"Effective LOC {effective_loc} within Mars limit ({mars_max_loc})."
+                    f"Effective LOC {effective_loc} within Mars scope "
+                    f"({mars_min_loc}–{mars_max_loc})."
                 ),
             ),
             findings,
-            f"Effective LOC {effective_loc} within Mars limit ({mars_max_loc}).",
+            (
+                f"Effective LOC {effective_loc} within Mars scope "
+                f"({mars_min_loc}–{mars_max_loc})."
+            ),
         )
 
-    # Olympus quest
-    if effective_loc <= olympus_max_loc:
+    # Olympus quest — long-horizon minimum
+    if effective_loc >= olympus_min_loc:
         return (
             PhaseResult(
                 status="PASS",
                 summary=(
-                    f"Effective LOC {effective_loc} within Olympus limit ({olympus_max_loc})."
+                    f"Effective LOC {effective_loc} meets Olympus long-horizon minimum "
+                    f"({olympus_min_loc})."
                 ),
             ),
             findings,
-            f"Effective LOC {effective_loc} within Olympus limit ({olympus_max_loc}).",
+            (
+                f"Effective LOC {effective_loc} meets Olympus long-horizon minimum "
+                f"({olympus_min_loc})."
+            ),
         )
 
-    if effective_loc <= mars_max_loc:
+    if effective_loc >= mars_min_loc:
         findings.append(
             Finding(
                 phase="4",
                 severity="MAJOR",
-                finding="Solution LOC fits Mars better than Olympus",
+                finding="Solution scope fits Mars better than Olympus",
                 evidence=(
-                    f"effective_loc={effective_loc} > olympus_max={olympus_max_loc} "
-                    f"and ≤ mars_max={mars_max_loc}; files: {file_evidence or 'n/a'}"
+                    f"effective_loc={effective_loc} < olympus_min={olympus_min_loc} "
+                    f"and ≥ mars_min={mars_min_loc}; files: {file_evidence or 'n/a'}"
                 ),
                 suggested_fix=(
-                    "Consider Mars scope: tighten the problem or reduce solution size, "
-                    "or accept downgrade to Mars on submit."
+                    "Expand to Olympus long-horizon scope (≥ "
+                    f"{olympus_min_loc} substantive LOC) or accept downgrade to Mars."
                 ),
             )
         )
@@ -108,13 +143,13 @@ def evaluate_loc_phase4(
             PhaseResult(
                 status="FAIL",
                 summary=(
-                    f"Effective LOC {effective_loc} exceeds Olympus limit ({olympus_max_loc}) "
-                    f"but fits Mars (≤ {mars_max_loc}) — downgrade recommended."
+                    f"Effective LOC {effective_loc} below Olympus long-horizon minimum "
+                    f"({olympus_min_loc}) but within Mars scope — downgrade recommended."
                 ),
             ),
             findings,
             (
-                f"Effective LOC {effective_loc} exceeds Olympus max {olympus_max_loc}; "
+                f"Effective LOC {effective_loc} below Olympus minimum {olympus_min_loc}; "
                 f"within Mars range — downgrade to Mars recommended."
             ),
         )
@@ -123,14 +158,13 @@ def evaluate_loc_phase4(
         Finding(
             phase="4",
             severity="MAJOR",
-            finding="Solution exceeds Mars effective LOC limit",
+            finding="Solution below Mars minimum scope",
             evidence=(
-                f"effective_loc={effective_loc} > mars_max={mars_max_loc}; "
+                f"effective_loc={effective_loc} < mars_min={mars_min_loc}; "
                 f"files: {file_evidence or 'n/a'}"
             ),
             suggested_fix=(
-                f"Reduce substantive solution changes to ≤ {mars_max_loc} lines "
-                "or split scope; too large for Mars downgrade."
+                f"Expand substantive solution changes to at least {mars_min_loc} lines."
             ),
         )
     )
@@ -138,14 +172,14 @@ def evaluate_loc_phase4(
         PhaseResult(
             status="FAIL",
             summary=(
-                f"Effective LOC {effective_loc} exceeds Mars limit ({mars_max_loc}); "
+                f"Effective LOC {effective_loc} below Mars minimum ({mars_min_loc}); "
                 "not eligible for Mars downgrade."
             ),
         ),
         findings,
         (
-            f"Effective LOC {effective_loc} exceeds both Olympus ({olympus_max_loc}) "
-            f"and Mars ({mars_max_loc}) limits."
+            f"Effective LOC {effective_loc} below both Olympus ({olympus_min_loc}) "
+            f"and Mars ({mars_min_loc}) minimums."
         ),
     )
 
@@ -155,14 +189,17 @@ def apply_downgrade_logic(
     loc_info: dict,
     *,
     quest: str,
-    olympus_max_loc: int,
+    olympus_min_loc: int,
+    mars_min_loc: int,
     mars_max_loc: int,
 ) -> ReviewResult:
     """
     Post-validation downgrade_to_mars and decision adjustments (Olympus only).
 
-    Sets downgrade_to_mars when effective LOC exceeds Olympus max but stays within Mars max.
+    Sets downgrade_to_mars when effective LOC is below Olympus minimum but at
+    least Mars minimum scope.
     """
+    del mars_max_loc  # downgrade path does not use the Mars ceiling
     if quest != "olympus":
         return review
 
@@ -173,17 +210,17 @@ def apply_downgrade_logic(
     effective_loc = int(loc_info.get("effective_loc", 0))
     updates: dict = {}
 
-    if effective_loc <= olympus_max_loc:
+    if effective_loc >= olympus_min_loc:
         if review.downgrade_to_mars is None:
             updates["downgrade_to_mars"] = False
         return review.model_copy(update=updates) if updates else review
 
-    if effective_loc <= mars_max_loc:
+    if effective_loc >= mars_min_loc:
         updates["downgrade_to_mars"] = True
         downgrade_note = (
-            f"Effective solution LOC ({effective_loc}) exceeds Olympus limit "
-            f"({olympus_max_loc}) but fits Mars (≤ {mars_max_loc}). "
-            "Downgrade to Mars recommended."
+            f"Effective solution LOC ({effective_loc}) is below Olympus long-horizon "
+            f"minimum ({olympus_min_loc}) but meets Mars minimum scope "
+            f"(≥ {mars_min_loc}). Downgrade to Mars recommended."
         )
         if LOC_DOWNGRADE_TAG not in review.suggested_tags:
             updates["suggested_tags"] = [*review.suggested_tags, LOC_DOWNGRADE_TAG]
@@ -202,9 +239,9 @@ def apply_downgrade_logic(
         feedback = review.contributor_feedback.strip()
         if "Mars" not in feedback and "LOC" not in feedback:
             loc_feedback = (
-                f"The solution change is larger than typical Olympus scope "
-                f"({effective_loc} substantive lines vs Olympus max {olympus_max_loc}). "
-                "This may be better suited as a Mars submission; consider tightening scope "
+                f"The solution change is smaller than Olympus long-horizon scope "
+                f"({effective_loc} substantive lines vs Olympus minimum {olympus_min_loc}). "
+                "This may be better suited as a Mars submission; consider expanding scope "
                 "or accepting a Mars downgrade."
             )
             updates["contributor_feedback"] = (
@@ -215,18 +252,19 @@ def apply_downgrade_logic(
             updates["decision"] = "request_changes"
             summary = review.recommendation_summary
             updates["recommendation_summary"] = (
-                f"LOC exceeds Olympus limit — downgrade to Mars or reduce scope. {summary}"
+                f"LOC below Olympus long-horizon minimum — downgrade to Mars or expand scope. "
+                f"{summary}"
             )
     else:
         updates["downgrade_to_mars"] = False
-        bloat_note = (
-            f"Effective LOC {effective_loc} exceeds Mars limit ({mars_max_loc}); "
+        small_note = (
+            f"Effective LOC {effective_loc} below Mars minimum ({mars_min_loc}); "
             "downgrade to Mars not appropriate."
         )
         internal = review.internal_notes.strip()
-        if bloat_note not in internal:
+        if small_note not in internal:
             updates["internal_notes"] = (
-                (internal + "\n" + bloat_note).strip() if internal else bloat_note
+                (internal + "\n" + small_note).strip() if internal else small_note
             )
         if review.decision == "approve":
             updates["decision"] = "request_changes"

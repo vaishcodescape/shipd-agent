@@ -7,6 +7,8 @@ from typing import Any
 
 from playwright.sync_api import Locator, TimeoutError as PlaywrightTimeoutError
 
+from review.agent_runs_checks import parse_agent_run_metrics
+
 DEFAULT_TIMEOUT_MS = 8_000
 _UNAVAILABLE_MSG = "not available — run via orchestrator with browser session"
 
@@ -151,10 +153,12 @@ def parse_agent_runs_from_text(raw_text: str) -> dict[str, Any]:
             break
     summary = "\n".join(summary_lines).strip()
 
+    metrics = parse_agent_run_metrics(text)
     available = bool(
         pass_rate
         or summary
         or failure_patterns
+        or metrics.get("median_loc") is not None
         or re.search(r"Agent Runs?", text, re.I)
     )
     return {
@@ -163,6 +167,7 @@ def parse_agent_runs_from_text(raw_text: str) -> dict[str, Any]:
         "summary": summary,
         "failure_patterns": failure_patterns,
         "raw_text": text,
+        "metrics": metrics,
     }
 
 

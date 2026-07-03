@@ -257,7 +257,14 @@ def compute_effective_loc(
     }
 
 
-def format_loc_analysis(loc_info: dict, *, quest: str, olympus_max: int, mars_max: int) -> str:
+def format_loc_analysis(
+    loc_info: dict,
+    *,
+    quest: str,
+    olympus_min: int,
+    mars_min: int,
+    mars_max: int,
+) -> str:
     """Human-readable loc_analysis string for ReviewResult."""
     loc = loc_info.get("effective_loc", 0)
     method = loc_info.get("method", "none")
@@ -267,7 +274,7 @@ def format_loc_analysis(loc_info: dict, *, quest: str, olympus_max: int, mars_ma
     files = loc_info.get("files_analyzed") or []
     file_note = f" Files: {', '.join(files)}." if files else ""
     threshold_note = (
-        f" Thresholds — Olympus max {olympus_max}, Mars max {mars_max}."
+        f" Thresholds — Olympus min {olympus_min}, Mars {mars_min}–{mars_max}."
     )
     return (
         f"Effective solution LOC: {loc} ({method}).{file_note}{threshold_note} "

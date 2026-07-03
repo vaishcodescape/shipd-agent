@@ -8,7 +8,11 @@ from dataclasses import dataclass
 from dotenv import load_dotenv
 
 from auth import REPO_ROOT
-from review.rubric_defaults import MARS_MAX_EFFECTIVE_LOC, OLYMPUS_MAX_EFFECTIVE_LOC
+from review.rubric_defaults import (
+    MARS_MAX_EFFECTIVE_LOC,
+    MARS_MIN_EFFECTIVE_LOC,
+    OLYMPUS_MIN_EFFECTIVE_LOC,
+)
 
 # Retired Anthropic IDs still seen in older .env files → current API model IDs.
 DEPRECATED_MODEL_ALIASES: dict[str, str] = {
@@ -28,12 +32,15 @@ class ReviewConfig:
     review_model: str
     review_explore_model: str
     review_phase0: str
+    review_phase0_test_timeout: int
+    review_phase0_docker_build_timeout: int
     review_dry_run: bool
     review_max_tool_steps: int
     review_rubric_max_chars: int
     review_skip_explore_on_phase0_fail: bool
     rubric_path: str
-    olympus_max_loc: int
+    olympus_min_loc: int
+    mars_min_loc: int
     mars_max_loc: int
 
 
@@ -74,16 +81,30 @@ def get_review_config(*, dry_run_override: bool | None = None) -> ReviewConfig:
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", "").strip(),
         review_model=review_model,
         review_explore_model=explore_model,
-        review_phase0=os.getenv("REVIEW_PHASE0", "fast").strip().lower(),
+        review_phase0=os.getenv("REVIEW_PHASE0", "full").strip().lower(),
+        review_phase0_test_timeout=int(
+            os.getenv("REVIEW_PHASE0_TEST_TIMEOUT", "600")
+        ),
+        review_phase0_docker_build_timeout=int(
+            os.getenv("REVIEW_PHASE0_DOCKER_BUILD_TIMEOUT", "600")
+        ),
         review_dry_run=dry_run,
         review_max_tool_steps=int(os.getenv("REVIEW_MAX_TOOL_STEPS", "20")),
         review_rubric_max_chars=int(os.getenv("REVIEW_RUBRIC_MAX_CHARS", "16000")),
+        # Default off: even when Phase 0 fails, the rubric requires evaluating
+        # phases 1-6 so contributor feedback covers the whole submission.
         review_skip_explore_on_phase0_fail=_truthy(
-            os.getenv("REVIEW_SKIP_EXPLORE_ON_PHASE0_FAIL", "1")
+            os.getenv("REVIEW_SKIP_EXPLORE_ON_PHASE0_FAIL", "0")
         ),
         rubric_path=str(REPO_ROOT / "shipd-rubric.md"),
-        olympus_max_loc=int(
-            os.getenv("REVIEW_OLYMPUS_MAX_LOC", str(OLYMPUS_MAX_EFFECTIVE_LOC))
+        olympus_min_loc=int(
+            os.getenv(
+                "REVIEW_OLYMPUS_MIN_LOC",
+                os.getenv("REVIEW_OLYMPUS_MAX_LOC", str(OLYMPUS_MIN_EFFECTIVE_LOC)),
+            )
+        ),
+        mars_min_loc=int(
+            os.getenv("REVIEW_MARS_MIN_LOC", str(MARS_MIN_EFFECTIVE_LOC))
         ),
         mars_max_loc=int(
             os.getenv("REVIEW_MARS_MAX_LOC", str(MARS_MAX_EFFECTIVE_LOC))

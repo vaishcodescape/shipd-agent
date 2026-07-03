@@ -33,6 +33,7 @@ try:
     from review.agent import run_review_agent
 except (ImportError, AttributeError):
     run_review_agent = None  # type: ignore[assignment, misc]
+from review.activity import set_activity_log_file
 from review.review_io import save_review_bundle
 from review.result import is_review_complete, review_failure_reason
 from workflow.review import (
@@ -55,6 +56,10 @@ from workflow.time_logs import (
 
 
 PHASE_PREFIX = "SHIPD:PHASE:"
+
+
+class ReviewAgentError(RuntimeError):
+    """Review agent failed; the failure is already recorded in session stats."""
 
 
 def log_message(message: str, *, log_file: Path | None = None) -> None:
@@ -172,6 +177,7 @@ def run_workflow(
     config = config or AuthConfig()
     auth_state_path.parent.mkdir(parents=True, exist_ok=True)
 
+    set_activity_log_file(log_file)
     log_message("Starting workflow run.", log_file=log_file)
     phases = PhaseTracker(log_file)
     do_cleanup = cleanup if cleanup is not None else cleanup_after_review_enabled()
@@ -229,117 +235,132 @@ def run_workflow(
 
             if review:
                 review_attempted = True
-                if cloned_path is None:
-                    phases.skip("review", "no-clone")
-                    phases.skip("submit", "no-clone" if submit else "not-requested")
-                elif run_review_agent is None:
-                    raise RuntimeError(
-                        "Autonomous review requires review.agent with "
-                        "run_review_agent(). Implement shipd-agent/review/agent.py "
-                        "or run without --review."
-                    )
-                else:
-                    review_result: dict | None = None
-                    review_error: str | None = None
-                    try:
-                        log_message(
-                            "Running autonomous review agent.",
-                            log_file=log_file,
-                        )
-                        phases.start("review")
-                        review_result = run_review_agent(
-                            repo_path=cloned_path,
-                            quest=quest,
-                            review_url=review_url,
-                            page=page,
-                        )
-                    except Exception as exc:
-                        review_error = str(exc)
-                        phases.fail("review", review_error)
-                        session_stats.record_failure()
-                        log_message(
-                            f"WARNING: Review agent failed: {review_error}",
-                            log_file=log_file,
+                try:
+                    if cloned_path is None:
+                        phases.skip("review", "no-clone")
+                        phases.skip("submit", "no-clone" if submit else "not-requested")
+                    elif run_review_agent is None:
+                        raise RuntimeError(
+                            "Autonomous review requires review.agent with "
+                            "run_review_agent(). Implement shipd-agent/review/agent.py "
+                            "or run without --review."
                         )
                     else:
-                        if not review_result or not review_result.get("decision"):
-                            review_error = (
-                                "run_review_agent() returned no decision "
-                                "(check review/agent.py or use --no-review)."
-                            )
-                            phases.fail("review", review_error)
-                            session_stats.record_failure()
+                        review_result: dict | None = None
+                        review_error: str | None = None
+                        try:
                             log_message(
-                                f"WARNING: {review_error}",
+                                "Running autonomous review agent.",
                                 log_file=log_file,
                             )
-                        elif not is_review_complete(review_result):
-                            review_error = review_failure_reason(review_result)
+                            phases.start("review")
+                            review_result = run_review_agent(
+                                repo_path=cloned_path,
+                                quest=quest,
+                                review_url=review_url,
+                                page=page,
+                            )
+                        except Exception as exc:
+                            review_error = str(exc)
                             phases.fail("review", review_error)
                             session_stats.record_failure()
                             log_message(
-                                f"WARNING: Review agent did not finish rubric "
-                                f"phases: {review_error}",
+                                f"WARNING: Review agent failed: {review_error}",
                                 log_file=log_file,
                             )
                         else:
-                            phases.done("review")
-                            log_message(
-                                f"Review decision: {review_result.get('decision')} — "
-                                f"{review_result.get('recommendation_summary', '')}",
-                                log_file=log_file,
-                            )
-                            session_stats.record_decision(
-                                review_result["decision"],
-                                repo_path=cloned_path,
-                                review_url=review_url,
-                                quest=quest,
-                            )
-                            bundle_path = save_review_bundle(
-                                review_result,
-                                review_url=review_url,
-                                quest=quest,
-                                repo_path=cloned_path,
-                            )
-                            log_message(
-                                f"Saved review bundle to {bundle_path}.",
-                                log_file=log_file,
-                            )
+                            if not review_result or not review_result.get("decision"):
+                                review_error = (
+                                    "run_review_agent() returned no decision "
+                                    "(check review/agent.py or use --no-review)."
+                                )
+                                phases.fail("review", review_error)
+                                session_stats.record_failure()
+                                log_message(
+                                    f"WARNING: {review_error}",
+                                    log_file=log_file,
+                                )
+                            elif not is_review_complete(review_result):
+                                review_error = review_failure_reason(review_result)
+                                phases.fail("review", review_error)
+                                session_stats.record_failure()
+                                log_message(
+                                    f"WARNING: Review agent did not finish rubric "
+                                    f"phases: {review_error}",
+                                    log_file=log_file,
+                                )
+                            else:
+                                phases.done("review")
+                                log_message(
+                                    f"Review decision: {review_result.get('decision')} — "
+                                    f"{review_result.get('recommendation_summary', '')}",
+                                    log_file=log_file,
+                                )
+                                session_stats.record_decision(
+                                    review_result["decision"],
+                                    repo_path=cloned_path,
+                                    review_url=review_url,
+                                    quest=quest,
+                                )
+                                bundle_path = save_review_bundle(
+                                    review_result,
+                                    review_url=review_url,
+                                    quest=quest,
+                                    repo_path=cloned_path,
+                                )
+                                log_message(
+                                    f"Saved review bundle to {bundle_path}.",
+                                    log_file=log_file,
+                                )
 
-                    if (
-                        submit
-                        and review_result
-                        and is_review_complete(review_result)
-                    ):
-                        from workflow.submit import submit_review
+                        if (
+                            submit
+                            and review_result
+                            and is_review_complete(review_result)
+                        ):
+                            from workflow.submit import submit_review
 
-                        with phases.step("submit"):
-                            log_message(
-                                "Submitting review on Shipd.",
-                                log_file=log_file,
+                            with phases.step("submit"):
+                                log_message(
+                                    "Submitting review on Shipd.",
+                                    log_file=log_file,
+                                )
+                                if review_url not in page.url:
+                                    goto_page(page, review_url)
+                                confirmed = submit_review(
+                                    page,
+                                    review_result,
+                                    quest=quest,
+                                    log=lambda m: log_message(m, log_file=log_file),
+                                    review_url=review_url,
+                                )
+                                if not confirmed:
+                                    log_message(
+                                        "WARNING: Submission not confirmed — "
+                                        "verify manually on Shipd.",
+                                        log_file=log_file,
+                                    )
+                        elif submit:
+                            phases.skip("submit", "review-failed")
+                        else:
+                            phases.skip("submit", "not-requested")
+
+                        if review_error and review_attempted:
+                            raise ReviewAgentError(review_error)
+                finally:
+                    if do_cleanup:
+                        with phases.step("cleanup"):
+                            cleanup_submission_artifacts(
+                                cloned_path,
+                                docker_state_before=docker_state_before,
+                                log=lambda message: log_message(
+                                    message, log_file=log_file
+                                ),
                             )
-                            if review_url not in page.url:
-                                goto_page(page, review_url)
-                            submit_review(page, review_result, quest=quest)
-                    elif submit:
-                        phases.skip("submit", "review-failed")
-                    else:
-                        phases.skip("submit", "not-requested")
-
-                    if review_error and review_attempted:
-                        raise RuntimeError(review_error)
+                        cloned_path = None
             else:
                 phases.skip("review", "no-review")
                 phases.skip("submit", "no-review")
-
-            if review_attempted and cloned_path is not None and do_cleanup:
-                with phases.step("cleanup"):
-                    cleanup_submission_artifacts(
-                        cloned_path,
-                        docker_state_before=docker_state_before,
-                        log=lambda message: log_message(message, log_file=log_file),
-                    )
-                cloned_path = None
 
             if clock_out_on_exit:
                 _clock_out_in_session(
@@ -478,7 +499,8 @@ def run_watch_loop(
                 subprocess.CalledProcessError,
             ) as exc:
                 exit_code = 1
-                session_stats.record_failure()
+                if not isinstance(exc, ReviewAgentError):
+                    session_stats.record_failure()
                 log_message(f"Run {runs} failed: {exc}", log_file=log_file)
                 log_message(
                     f"SHIPD:REVIEW:{runs}:{max_display}:fail",
@@ -688,7 +710,8 @@ def main() -> int:
         ValueError,
         subprocess.CalledProcessError,
     ) as exc:
-        session_stats.record_failure()
+        if not isinstance(exc, ReviewAgentError):
+            session_stats.record_failure()
         log_message(f"Workflow failed: {exc}", log_file=log_file)
         log_message("SHIPD:REVIEW:1:1:fail", log_file=log_file)
         log_phase("stats", "start", log_file=log_file)

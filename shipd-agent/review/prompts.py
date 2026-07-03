@@ -3,13 +3,22 @@
 from __future__ import annotations
 
 from review.rubric_defaults import (
+    AGENT_RUN_THRESHOLDS_PROMPT,
     APPROVE_CHECKLIST,
     APPROVE_MIN_BAND_SCORE,
     BAND_SCORE_MEANINGS,
     DECISION_GUARDS_PROMPT,
     LOC_THRESHOLDS_PROMPT,
     MARS_MAX_EFFECTIVE_LOC,
-    OLYMPUS_MAX_EFFECTIVE_LOC,
+    MARS_MIN_EFFECTIVE_LOC,
+    MARS_MIN_MEDIAN_LOC,
+    MIN_AGENT_RUNS,
+    OLYMPUS_MAX_PASS_RATE_PCT,
+    OLYMPUS_MIN_EFFECTIVE_LOC,
+    OLYMPUS_MIN_MEDIAN_FILES,
+    OLYMPUS_MIN_MEDIAN_LOC,
+    OLYMPUS_MIN_MEDIAN_MESSAGES,
+    MARS_MAX_PASS_RATE_PCT,
     PHASE0_PASS_CRITERIA,
 )
 
@@ -23,7 +32,7 @@ Work through rubric phases **in order** (0 through 6):
 
 | Phase | Focus |
 |-------|--------|
-| 0 | Artifacts present, git HEAD, patch apply --check (use `run_phase0_checks`, `list_artifacts`, `check_patch_apply`); pass criteria: {_PHASE0_CRITERIA} |
+| 0 | Artifacts, git HEAD, patch apply --check, **Docker test.sh base/new runs** (`docker build` + `docker run --network none`; deterministic at review start when REVIEW_PHASE0=full; re-run with `run_phase0_checks`); pass criteria: {_PHASE0_CRITERIA} |
 | 1 | Problem description quality (concise, no AI slop, repo fit, duplicates) |
 | 2 | Dockerfile & test.sh harness (minimal Dockerfile, base/new split) |
 | 3 | Test quality (coverage, determinism, behaviour not implementation, no network) |
@@ -37,9 +46,10 @@ Band scores (0–3): {_BAND_SCORE_GUIDE}
 UNIFIED_REVIEW_SYSTEM_PROMPT = """You are a Shipd submission reviewer evaluating **all rubric phases 0–6** in one coherent pass.
 
 Rules:
-- Evaluate phases 0 → 6 systematically. Phase 0 combines mechanical checks with your review judgment.
-- Use `run_phase0_checks`, `list_artifacts`, and `check_patch_apply` for Phase 0 mechanics; initial results are in the user prompt.
-- **Start with** problem description, test.patch, solution.patch, test.sh, and Dockerfile — avoid redundant reads.
+- Evaluate phases 0 → 6 systematically. **Every phase must be evaluated** — even when Phase 0 fails mechanically, still review problem description, tests, solution, and platform fit (phases 1–6) so the author gets complete feedback. Use SKIP only when the underlying data truly does not exist.
+- Phase 0 mechanical results (artifact checks, patch apply, Docker build, test.sh base/new contract) were **already executed deterministically** and appear in the user prompt; `run_phase0_checks` returns the same cached results. Do not try to re-run Docker builds.
+- **Phase 0 test contract (Docker):** tests run inside the submission container with `--network none` — base PASS and new FAIL without solution; both PASS with solution. Cite `phase0_log` outputs; do not invent results.
+- **Work fast:** issue multiple independent tool calls in a single turn (e.g. read problem description + test.patch + solution.patch + Dockerfile together). Avoid redundant reads.
 - Tag every issue with phase number (0–6) and severity (BLOCKER, MAJOR, MINOR, QUESTION).
 - Do not invent paths, line numbers, or command results — verify with tools.
 - Do not approve anything; your job is evidence collection for the finalize step.
@@ -51,8 +61,9 @@ Rules:
 - **LOC discipline (Phase 4):** deterministic effective LOC is computed at review start from `solution.patch`.
   Compare against quest thresholds. Do not contradict the precomputed `loc_analysis` unless you re-run
   `compute_effective_loc` and find an error.
-- **Olympus downgrade:** when effective LOC exceeds the Olympus max but stays within the Mars max,
-  recommend `downgrade_to_mars: true` and note Mars fit in `other_notes` / contributor feedback.
+- **Olympus downgrade:** when effective LOC is below the Olympus long-horizon minimum (≥ 400)
+  but meets Mars minimum scope (≥ 100), recommend `downgrade_to_mars: true` and note Mars fit
+  in `other_notes` / contributor feedback.
 - Stay within the tool budget — finish with a summary once key artifacts are inspected.
 
 When done, end with a structured summary:
@@ -107,31 +118,46 @@ def build_unified_review_user_prompt(
     related_submissions: str,
     holistic_check: str = "",
     loc_analysis: str = "",
-    olympus_max_loc: int = OLYMPUS_MAX_EFFECTIVE_LOC,
+    olympus_min_loc: int = OLYMPUS_MIN_EFFECTIVE_LOC,
+    mars_min_loc: int = MARS_MIN_EFFECTIVE_LOC,
     mars_max_loc: int = MARS_MAX_EFFECTIVE_LOC,
     max_tool_steps: int = 20,
 ) -> str:
     holistic_section = holistic_check or _HOLISTIC_UNAVAILABLE
     loc_section = loc_analysis.strip() or "LOC analysis not yet run."
     loc_thresholds = LOC_THRESHOLDS_PROMPT.format(
-        olympus_max=olympus_max_loc,
+        olympus_min=olympus_min_loc,
+        mars_min=mars_min_loc,
         mars_max=mars_max_loc,
+    )
+    agent_thresholds = AGENT_RUN_THRESHOLDS_PROMPT.format(
+        min_runs=MIN_AGENT_RUNS,
+        olympus_pass_pct=OLYMPUS_MAX_PASS_RATE_PCT,
+        olympus_median_files=OLYMPUS_MIN_MEDIAN_FILES,
+        olympus_median_messages=OLYMPUS_MIN_MEDIAN_MESSAGES,
+        olympus_median_loc=OLYMPUS_MIN_MEDIAN_LOC,
+        mars_pass_pct=MARS_MAX_PASS_RATE_PCT,
+        mars_median_loc=MARS_MIN_MEDIAN_LOC,
     )
     return f"""Review this Shipd **{quest}** submission across **all phases 0–6**.
 
 Repo: {repo_path}
 Commit: {commit or "unknown"}
 
-Initial Phase 0 mechanical checks (run at review start — verify or re-run with tools):
+Initial Phase 0 mechanical checks (already run deterministically at review start —
+includes **Docker** test.sh base/new contract when REVIEW_PHASE0=full; results are
+cached, so cite them instead of re-running):
 Status: **{phase0_status}**
 
-Phase 0 log:
+Phase 0 log (Docker build/run output, `--network none` test contract):
 {phase0_log}
 
 ## Precomputed effective LOC (Phase 4)
 {loc_section}
 
 {loc_thresholds}
+
+{agent_thresholds}
 
 {holistic_section}
 
@@ -145,10 +171,11 @@ Tool budget: ~{max_tool_steps} tool steps — inspect key artifacts first, then 
 
 {PHASE_CHECKLIST}
 
-Use tools to inspect problem description, test.patch, solution.patch, test.sh, and Dockerfile.
-Use `compute_effective_loc` to re-check LOC if needed. Evaluate every phase 0–6.
-Reference phase numbers in every finding.
-If Phase 0 mechanical checks failed, still complete phases 1–6 for contributor feedback.
+Use tools to inspect problem description, test.patch, solution.patch, test.sh, and Dockerfile
+(batch these reads in one turn). Use `compute_effective_loc` to re-check LOC if needed.
+Evaluate **every** phase 0–6 and reference phase numbers in every finding.
+If Phase 0 mechanical checks failed, still complete phases 1–6 for contributor feedback —
+a review that skips phases is not submittable.
 """
 
 
@@ -162,7 +189,8 @@ _APPROVE_CHECKLIST_TEXT = "\n".join(f"  {i}. {item}" for i, item in enumerate(AP
 FINALIZE_PHASE_INSTRUCTIONS = f"""
 **phase_results requirements (mandatory):**
 - Include keys "0" through "6", each with {{status: PASS|FAIL|SKIP, summary: str}}.
-- Phase "0" mechanical status must align with `phase0_result` from deterministic checks;
+- Phase "0" mechanical status must align with `phase0_result` from deterministic checks
+  (artifacts, patch apply, and Docker test.sh base/new contract when run);
   incorporate explore notes for Phase 0 context in the summary.
 - Populate phases 1–6 from your rubric evaluation and explore_notes; never omit a key.
 - Use SKIP only when data is genuinely unavailable (e.g. phase 5 with no agent runs).
@@ -175,13 +203,21 @@ FINALIZE_PHASE_INSTRUCTIONS = f"""
 
 **Effective LOC (Phase 4 — deterministic):**
 - `loc_analysis` and `loc_info` are precomputed from `solution.patch` at review start.
-- Thresholds: Olympus max {OLYMPUS_MAX_EFFECTIVE_LOC} substantive LOC → downgrade consideration;
-  Mars max {MARS_MAX_EFFECTIVE_LOC} → hard ceiling.
+- Thresholds: Olympus long-horizon minimum {OLYMPUS_MIN_EFFECTIVE_LOC} substantive LOC;
+  Mars minimum {MARS_MIN_EFFECTIVE_LOC}, maximum {MARS_MAX_EFFECTIVE_LOC}.
 - Populate `loc_analysis` with the precomputed summary unless you re-ran `compute_effective_loc`.
-- For **Olympus** quest: set `downgrade_to_mars: true` when effective LOC exceeds Olympus max
-  but stays within Mars max; `false` when within Olympus max; do not downgrade when above Mars max.
+- For **Olympus** quest: set `downgrade_to_mars: true` when effective LOC is below the Olympus
+  minimum but at least Mars minimum; `false` when ≥ Olympus minimum; do not downgrade when below
+  Mars minimum.
 - Phase `"4"` status from deterministic LOC check is authoritative for LOC limits; incorporate
   your code-quality findings into phase 4 summary and solution band without reversing LOC PASS/FAIL.
+
+**Agent runs (Phase 5 — platform bars):**
+- At least 10 agent runs must complete.
+- Olympus: pass rate ≤ 20%; median successful runs ≥ 3 files, ≥ 80 messages, ≥ 400 LOC.
+- Mars: pass rate ≤ 30%; median successful runs ≥ 100 LOC.
+- Deterministic phase 5 checks run when agent run data is scraped; incorporate without reversing
+  PASS/FAIL unless you have contradictory evidence.
 
 **Shipd page context (when provided):**
 - `agent_run_notes` ← agent runs scrape (pass rates, failure patterns, LOC hints).

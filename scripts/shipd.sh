@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 # Run the Shipd agent  
 
 set -euo pipefail
@@ -10,7 +9,7 @@ VENV_DIR="${ROOT_DIR}/.venv"
 ENV_FILE="${ROOT_DIR}/.env"
 LOG_DIR="${ROOT_DIR}/logs"
 DEFAULT_LOG_FILE="${LOG_DIR}/run.log"
-DEFAULT_INTERVAL=3600
+DEFAULT_INTERVAL=10
 
 QUEST="olympus"
 SEPARATE_STEPS=0
@@ -22,7 +21,8 @@ HEADED=0
 NO_CLONE=0
 NO_CLEANUP=0
 REVIEW=1
-SUBMIT=0
+SUBMIT=1
+SUBMIT_EXPLICIT=0
 FOREGROUND=0
 CLONE_DIR=""
 LOG_FILE=""
@@ -51,11 +51,12 @@ Options:
   --max-runs N          Run N reviews without prompting
   --no-prompt           Require --reviews or --max-runs (non-interactive)
   --quest NAME          Quest for time logs: olympus or mars (default: olympus)
-  --no-review           Skip the autonomous review step
-  --submit              Submit review on Shipd (implies review)
+  --no-review           Skip the autonomous review step (implies --no-submit)
+  --submit              Submit review on Shipd (default: on; implies review)
+  --no-submit           Review only; do not submit on Shipd
   --no-clone            Reserve/open review without cloning locally
   --no-cleanup          Keep cloned repo and Docker artifacts after review
-  --interval SECONDS    Seconds between cycles (default: 3600 or WATCH_INTERVAL_SEC)
+  --interval SECONDS    Seconds between cycles (default: 60 or WATCH_INTERVAL_SEC)
   --headed              Show browser window
   --foreground-priority Do not lower CPU nice level
   --clone-dir PATH      Where to clone submissions
@@ -288,10 +289,13 @@ ui_format_log_line() {
         return
     fi
 
+    ui_clear_spinner_line
     if [[ "${body}" == ERROR:* ]] || [[ "${body}" == *" failed:"* ]] || [[ "${body}" == *"Failed"* ]]; then
         _emit_terminal "${C_DIM}${line%${body}}${C_RESET}${C_RED}${body}${C_RESET}"
     elif [[ "${body}" == WARNING:* ]] || [[ "${body}" == Warning:* ]]; then
         _emit_terminal "${C_DIM}${line%${body}}${C_RESET}${C_YELLOW}${body}${C_RESET}"
+    elif [[ "${body}" == submit:* ]]; then
+        _emit_terminal "${C_DIM}${line%${body}}${C_RESET}${C_CYAN}${body}${C_RESET}"
     elif [[ "${body}" == *"Session stats:"* ]]; then
         _emit_terminal "${C_DIM}${line%${body}}${C_RESET}${C_BLUE}${body}${C_RESET}"
     elif [[ "${body}" == *"Review decision:"* ]]; then
@@ -301,6 +305,34 @@ ui_format_log_line() {
     else
         _emit_terminal "${C_DIM}${line}${C_RESET}"
     fi
+}
+
+ui_clear_spinner_line() {
+    # Keep streamed lines from colliding with an active phase spinner.
+    if [[ "${USE_TTY_UI}" -eq 1 ]] && [[ -n "${SPINNER_PID:-}" ]]; then
+        printf '\r\033[K'
+    fi
+}
+
+ui_activity_line() {
+    # Agent activity: "[HH:MM:SS] [review|phase0|agent] message"
+    local timestamp="$1"
+    local category="$2"
+    local body="$3"
+
+    if [[ "${USE_TTY_UI}" -eq 0 ]]; then
+        printf '%s\n' "[${timestamp}] [${category}] ${body}"
+        return
+    fi
+
+    ui_clear_spinner_line
+    local color="${C_CYAN}"
+    case "${body}" in
+        *FAILED*|*"CRITICAL FAIL"*) color="${C_RED}" ;;
+        WARNING*|*"did not register"*) color="${C_YELLOW}" ;;
+        "→ "*|"← "*) color="${C_DIM}" ;;
+    esac
+    _emit_terminal "    ${C_DIM}${timestamp} ${category}${C_RESET} ${color}${body}${C_RESET}"
 }
 
 ui_handle_structured_line() {
@@ -347,6 +379,12 @@ ui_handle_structured_line() {
 ui_process_stream_line() {
     local line="$1"
     _log_to_file "$line"
+
+    # Agent activity lines: "[HH:MM:SS] [review|phase0|agent] message"
+    if [[ "${line}" =~ ^\[([0-9]{2}:[0-9]{2}:[0-9]{2})\]\ \[([a-z0-9_-]+)\]\ (.*)$ ]]; then
+        ui_activity_line "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+        return
+    fi
 
     local body="${line}"
     if [[ "${line}" =~ ^\[([0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ UTC)\]\ (.*)$ ]]; then
@@ -536,7 +574,12 @@ while [[ $# -gt 0 ]]; do
             ;;
         --submit)
             SUBMIT=1
+            SUBMIT_EXPLICIT=1
             REVIEW=1
+            shift
+            ;;
+        --no-submit)
+            SUBMIT=0
             shift
             ;;
         --no-clone)
@@ -602,6 +645,10 @@ if [[ -z "${LOG_FILE}" ]]; then
 elif [[ "${LOG_FILE}" != /* ]]; then
     LOG_FILE="${ROOT_DIR}/${LOG_FILE#./}"
 fi
+
+# shipd.sh owns the run log (it tees every streamed line); keep LOG_FILE out
+# of the Python child environment so orchestrator/activity don't double-write.
+export -n LOG_FILE 2>/dev/null || true
 
 if [[ -z "${INTERVAL}" ]]; then
     INTERVAL="${WATCH_INTERVAL_SEC:-${DEFAULT_INTERVAL}}"
@@ -691,7 +738,11 @@ preflight() {
     fi
 
     if [[ "${SUBMIT}" -eq 1 ]] && [[ "${REVIEW}" -eq 0 ]]; then
-        die "--submit requires --review (or a saved reviews/pending-submit.json for manual submit)"
+        if [[ "${SUBMIT_EXPLICIT}" -eq 1 ]]; then
+            die "--submit requires --review (or a saved reviews/pending-submit.json for manual submit)"
+        fi
+        # Submit defaults on; --no-review implies nothing to submit.
+        SUBMIT=0
     fi
 
     if [[ "${REVIEW}" -eq 1 ]] && [[ "${NO_CLONE}" -eq 1 ]]; then
@@ -710,7 +761,8 @@ build_orchestrator_args() {
     [[ "${SUBMIT}" -eq 1 ]] && ORCH_ARGS+=(--submit)
     [[ "${FOREGROUND}" -eq 1 ]] && ORCH_ARGS+=(--foreground-priority)
     [[ -n "${CLONE_DIR}" ]] && ORCH_ARGS+=(--clone-dir "${CLONE_DIR}")
-    ORCH_ARGS+=(--log-file "${LOG_FILE}")
+    # No --log-file: shipd.sh tees every streamed line into LOG_FILE itself;
+    # passing it would write each orchestrator/activity line twice.
 
     if [[ -n "${MAX_RUNS}" ]]; then
         ORCH_ARGS+=(--watch --max-runs "${MAX_RUNS}" --interval "${INTERVAL}")
@@ -804,6 +856,7 @@ run_separate_phase() {
 
 run_separate_steps_cycle() {
     log "Cycle mode: separate steps"
+    local cycle_ok=0
 
     run_separate_phase auth "Sign in (auth/auth.py)" auth/auth.py || return 1
     run_separate_phase clock_in "Clock in for quest ${QUEST} (workflow/time_logs.py)" workflow/time_logs.py --quest "${QUEST}" || return 1
@@ -824,6 +877,7 @@ run_separate_steps_cycle() {
         if run_separate_phase review "Autonomous review (review/agent.py)" review/agent.py "${repo_path}" --quest "${QUEST}" --review-url "${review_url}"; then
             :
         else
+            cycle_ok=1
             record_workflow_failure
             log "WARNING: Review agent failed; continuing without submit"
         fi
@@ -838,15 +892,28 @@ run_separate_steps_cycle() {
         if run_separate_phase submit "Submit on Shipd (workflow/submit_from_json.py)" workflow/submit_from_json.py "${submit_args[@]}"; then
             :
         else
+            cycle_ok=1
             record_workflow_failure
-            return 1
         fi
     else
         ui_phase_update submit "skip"
     fi
+
+    if [[ "${REVIEW}" -eq 1 ]] && [[ "${NO_CLEANUP}" -eq 0 ]]; then
+        if run_separate_phase cleanup "Cleanup cloned repo and Docker (workflow/cleanup.py)" workflow/cleanup.py --from-session-meta; then
+            :
+        else
+            log "WARNING: Post-review cleanup failed; artifacts may remain"
+        fi
+    elif [[ "${NO_CLEANUP}" -eq 1 ]]; then
+        ui_phase_update cleanup "skip:no-cleanup"
+    else
+        ui_phase_update cleanup "skip"
+    fi
+
     ui_phase_update stats "start"
     ui_phase_update stats "done"
-    return 0
+    return "${cycle_ok}"
 }
 
 run_separate_steps_batch() {
@@ -920,7 +987,6 @@ run_once() {
         [[ "${SUBMIT}" -eq 1 ]] && ORCH_ARGS+=(--submit)
         [[ "${FOREGROUND}" -eq 1 ]] && ORCH_ARGS+=(--foreground-priority)
         [[ -n "${CLONE_DIR}" ]] && ORCH_ARGS+=(--clone-dir "${CLONE_DIR}")
-        ORCH_ARGS+=(--log-file "${LOG_FILE}")
         run_python_stream orchestrator.py "${ORCH_ARGS[@]}" || die "Pipeline cycle failed"
         log_session_summary
     fi

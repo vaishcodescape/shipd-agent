@@ -24,15 +24,18 @@ def save_session_meta(
     review_url: str,
     quest: str,
     repo_path: Path | str | None = None,
+    docker_snapshot_before: dict[str, list[str]] | None = None,
     path: Path = SESSION_META_PATH,
 ) -> Path:
     """Persist the active Shipd review URL after reserve/open."""
-    payload = {
+    payload: dict[str, Any] = {
         "review_url": review_url.strip(),
         "quest": quest.strip().lower(),
         "repo_path": str(repo_path) if repo_path else "",
         "saved_at": datetime.now(timezone.utc).isoformat(),
     }
+    if docker_snapshot_before is not None:
+        payload["docker_snapshot_before"] = docker_snapshot_before
     _write_json(path, payload)
     return path
 

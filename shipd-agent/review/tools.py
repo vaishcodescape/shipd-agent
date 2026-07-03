@@ -13,7 +13,8 @@ from pydantic import BaseModel, Field
 
 from review.context import build_submission_summary, discover_artifacts, resolve_repo_path
 from review.loc import compute_effective_loc, format_loc_analysis
-from review.phase0 import check_patch_apply, run_phase0_fast
+from review.phase0 import Phase0Result, run_phase0
+from review.phase0 import check_patch_apply as git_check_patch_apply
 
 
 class ReadFileInput(BaseModel):
@@ -65,6 +66,7 @@ def make_review_tools(
     page: Any = None,
     cached_scrape: dict[str, str] | None = None,
     cached_holistic: dict | None = None,
+    cached_phase0: Phase0Result | None = None,
 ) -> list[StructuredTool]:
     repo_path = resolve_repo_path(repo_path)
 
@@ -165,15 +167,32 @@ def make_review_tools(
         return "\n".join(lines)
 
     def run_phase0_checks() -> str:
+        # Docker build + 4 test.sh runs take minutes; the deterministic result
+        # from review start is authoritative, so serve it from cache.
+        if cached_phase0 is not None:
+            return (
+                "Phase 0 checks (cached — Docker build and test.sh contract "
+                "already executed deterministically at review start):\n"
+                f"Phase 0 status: {cached_phase0.status}\n"
+                f"Summary: {cached_phase0.summary}\n\n"
+                f"{cached_phase0.phase0_log}"
+            )
+
+        from review.config import get_review_config
+
+        cfg = get_review_config()
         summary = cached_summary or build_submission_summary(
             repo_path,
             quest=quest,
             review_url=review_url,
         )
-        result = run_phase0_fast(
+        result = run_phase0(
             repo_path,
             artifacts=summary.get("artifacts"),
             commit=summary.get("commit"),
+            run_tests=cfg.review_phase0 != "fast",
+            test_timeout=cfg.review_phase0_test_timeout,
+            build_timeout=cfg.review_phase0_docker_build_timeout,
         )
         return (
             f"Phase 0 status: {result.status}\n"
@@ -182,11 +201,15 @@ def make_review_tools(
         )
 
     def check_patch_apply(patch_name: str) -> str:
-        artifacts = discover_artifacts(repo_path)
+        artifacts = (
+            cached_phase0.artifacts
+            if cached_phase0 is not None and cached_phase0.artifacts
+            else discover_artifacts(repo_path)
+        )
         rel = artifacts.get(patch_name)
         if rel is None:
             return f"{patch_name}: artifact not found"
-        ok, msg = check_patch_apply(repo_path, rel)
+        ok, msg = git_check_patch_apply(repo_path, rel)
         status = "OK" if ok else "FAILED"
         return f"{patch_name}: git apply --check {status}\n{msg}"
 
@@ -233,7 +256,8 @@ def make_review_tools(
         analysis = format_loc_analysis(
             info,
             quest=quest,
-            olympus_max=cfg.olympus_max_loc,
+            olympus_min=cfg.olympus_min_loc,
+            mars_min=cfg.mars_min_loc,
             mars_max=cfg.mars_max_loc,
         )
         per_file = info.get("per_file") or {}
@@ -282,8 +306,10 @@ def make_review_tools(
             func=run_phase0_checks,
             name="run_phase0_checks",
             description=(
-                "Run Phase 0 mechanical checks: artifact presence, git HEAD, "
-                "patch apply --check."
+                "Get Phase 0 mechanical check results: artifact presence, git "
+                "HEAD, patch apply --check, and Docker test.sh base/new runs "
+                "(--network none). Served from the deterministic run at review "
+                "start — cheap to call."
             ),
         ),
         StructuredTool.from_function(

@@ -150,6 +150,8 @@ Review from the **problem description alone** — not reverse-engineered from te
 - Meets **all** stated requirements; no irrelevant edits; doesn't break existing code (Phase 0 `base` + reasoning).
 - Follows repo patterns; no AI slop; no code smells.
 - **LOC discipline:** estimate substantive solution LOC (exclude blanks, dead code, doc inflation, unrelated churn). Compare to **median agent solution LOC** when agent data exists — user solution should meet requirements without bloat or suspicious minimalism. Flag LOC bumps from reordering, irrelevant refactors, or filler.
+- **Olympus long-horizon:** effective solution LOC should be **≥ 400** substantive lines. Below 400 but ≥ 100 → Mars fit (`downgrade_to_mars`).
+- **Mars minimum scope:** effective solution LOC should be **≥ 100** substantive lines; flag bloat above **600**.
 - Hardcoded / test-fit values vs general solution.
 - Security & robustness at boundaries.
 
@@ -161,6 +163,9 @@ Review from the **problem description alone** — not reverse-engineered from te
 
 When agent run data is available (pass/fail, diffs, failure reasons, LOC):
 
+- **Minimum runs:** at least **10/10** agent runs must complete before approval.
+- **Difficulty (pass rate):** Olympus ≤ **20%** (Hard); Mars ≤ **30%** (Hard).
+- **Scope medians (successful runs):** Olympus long-horizon — ≥ **3** files, ≥ **80** messages, ≥ **400** LOC; Mars minimum — ≥ **100** LOC median.
 - **Do not trust pass/fail alone** — inspect diffs and failure reasons.
 - Passing agents → task may be solvable; also check for **weak tests** if short/incomplete solutions pass.
 - Failing agents → confirm failures are **fair** (expose ambiguous prompt or unfair tests vs trickery).
@@ -186,11 +191,13 @@ When agent run data is available (pass/fail, diffs, failure reasons, LOC):
 ### Olympus
 
 - Set `repo_eligible` and `solvability_ok` (boolean).
+- Long-horizon scope: effective solution LOC **≥ 400**; agent medians **≥ 3** files, **≥ 80** messages, **≥ 400** LOC; pass rate **≤ 20%**; **10/10** agent runs complete.
 - Ineligible repo or solvability concerns → usually **`request_changes`**, not `reject`, unless wrong repo entirely.
 
 ### Mars
 
 - Set `quality` (1–3) and `difficulty` (1–3; usually 2, rarely 3).
+- Minimum scope: median successful agent runs **≥ 100** LOC; pass rate **≤ 30%**; **10/10** agent runs complete.
 - Weight code quality heavily. Low ratings → **`request_changes`** with clear fixes, not `reject`, unless extreme.
 
 ---

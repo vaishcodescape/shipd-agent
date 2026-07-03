@@ -6,6 +6,12 @@ import argparse
 import sys
 from pathlib import Path
 
+# workflow/review.py shadows the review package when this script is run as
+# `python workflow/submit_from_json.py` (sys.path[0] is workflow/).
+_PKG_ROOT = Path(__file__).resolve().parent.parent
+if str(_PKG_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PKG_ROOT))
+
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from auth import (
@@ -63,10 +69,23 @@ def run_submit_from_json(
         if target_url not in page.url:
             goto_page(page, target_url)
 
-        submit_review(page, review, quest=target_quest, finalize=finalize)
+        confirmed = submit_review(
+            page,
+            review,
+            quest=target_quest,
+            finalize=finalize,
+            review_url=target_url,
+        )
 
         if finalize:
-            print("Review submitted on Shipd.")
+            if confirmed:
+                print("Review submitted on Shipd.")
+            else:
+                print(
+                    "WARNING: Submit clicked but confirmation not observed — "
+                    "verify on Shipd.",
+                    file=sys.stderr,
+                )
         else:
             print("Form filled (--no-finalize); not clicking final Submit.")
 

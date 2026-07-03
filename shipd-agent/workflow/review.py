@@ -26,7 +26,12 @@ from auth import (
     load_auth_config,
     managed_browser,
 )
-from workflow.cleanup import remove_clone_directory
+from workflow.cleanup import (
+    cleanup_after_review_enabled,
+    docker_snapshot_to_dict,
+    remove_clone_directory,
+    snapshot_docker_state,
+)
 
 # The problem deck. Defaults to the reviews page; override if the deck lives
 # at a different path.
@@ -371,7 +376,12 @@ def run_reserve_and_review(
         context.storage_state(path=str(auth_state_path))
 
         cloned_path: Path | None = None
+        docker_snapshot_before = None
         if clone:
+            if cleanup_after_review_enabled():
+                docker_snapshot_before = docker_snapshot_to_dict(
+                    snapshot_docker_state()
+                )
             setup_script = extract_setup_script(page)
             cloned_path = clone_submission_locally(
                 setup_script,
@@ -384,6 +394,7 @@ def run_reserve_and_review(
             review_url=page.url,
             quest=quest,
             repo_path=cloned_path,
+            docker_snapshot_before=docker_snapshot_before,
         )
         print(f"Session meta saved (review_url={page.url}).")
 

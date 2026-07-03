@@ -43,7 +43,7 @@ LIGHTWEIGHT_CHROMIUM_ARGS = (
 )
 
 DEFAULT_PROCESS_NICE = 10
-DEFAULT_WATCH_INTERVAL_SEC = 3600
+DEFAULT_WATCH_INTERVAL_SEC = 60
 
 
 def background_priority(*, nice: int | None = None) -> None:

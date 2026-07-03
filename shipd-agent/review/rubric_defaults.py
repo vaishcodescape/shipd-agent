@@ -91,15 +91,25 @@ PHASE0_FAIL_DEFAULT_DECISION: Final[str] = "request_changes"
 
 # --- Effective LOC (Phase 4 / Phase 6 Mars vs Olympus) ---
 
-# rubric: Phase 4 — "LOC discipline: estimate substantive solution LOC (exclude blanks,
-# dead code, doc inflation, unrelated churn). Compare to median agent solution LOC…"
-# Rubric does not specify numeric limits; operational defaults below.
-OLYMPUS_MAX_EFFECTIVE_LOC: Final[int] = 150
-MARS_MAX_EFFECTIVE_LOC: Final[int] = 300
+# Shipd platform scope bars (substantive solution LOC from solution.patch).
+OLYMPUS_MIN_EFFECTIVE_LOC: Final[int] = 400
+MARS_MIN_EFFECTIVE_LOC: Final[int] = 100
+MARS_MAX_EFFECTIVE_LOC: Final[int] = 600
 
 # rubric: Phase 6 — "if submission fits Mars-level expectations better than Olympus,
 # note downgrade suggestion… prefer request_changes over reject"
 LOC_DOWNGRADE_TAG: Final[str] = "Lines of code"
+
+# --- Agent run platform bars (Phase 5) ---
+
+MIN_AGENT_RUNS: Final[int] = 10
+OLYMPUS_MAX_PASS_RATE_PCT: Final[float] = 20.0
+MARS_MAX_PASS_RATE_PCT: Final[float] = 30.0
+# Median of successful agent runs (long-horizon / minimum scope).
+OLYMPUS_MIN_MEDIAN_LOC: Final[int] = 400
+OLYMPUS_MIN_MEDIAN_FILES: Final[int] = 3
+OLYMPUS_MIN_MEDIAN_MESSAGES: Final[float] = 80.0
+MARS_MIN_MEDIAN_LOC: Final[int] = 100
 
 # --- Mars mode-specific fields ---
 
@@ -135,12 +145,22 @@ SUGGESTED_TAGS: Final[tuple[str, ...]] = (
 # --- Prompt helpers ---
 
 LOC_THRESHOLDS_PROMPT: Final[str] = (
-    "LOC thresholds: Olympus max {olympus_max} substantive lines; Mars max {mars_max}. "
-    "Count excludes blanks and comment-only lines from solution.patch added hunks. "
-    "For Olympus: if effective LOC > {olympus_max} and ≤ {mars_max}, flag Mars fit and "
-    "recommend downgrade (downgrade_to_mars: true). If > {mars_max}, flag bloat — "
-    "downgrade not appropriate. For Mars: if effective LOC > {mars_max}, flag as MAJOR "
-    "Phase 4 finding."
+    "LOC thresholds (substantive added lines in solution.patch): "
+    "Olympus long-horizon minimum {olympus_min}; Mars minimum scope {mars_min}, "
+    "Mars maximum {mars_max}. "
+    "Olympus: effective LOC < {olympus_min} → too small for long-horizon Olympus; "
+    "recommend downgrade_to_mars when ≥ {mars_min}. "
+    "Mars: effective LOC < {mars_min} → below minimum scope; "
+    "> {mars_max} → bloat (MAJOR Phase 4 finding)."
+)
+
+AGENT_RUN_THRESHOLDS_PROMPT: Final[str] = (
+    "Agent run platform bars: at least {min_runs} runs must complete. "
+    "Olympus: pass rate ≤ {olympus_pass_pct:.0f}% (Hard); median successful runs "
+    "≥ {olympus_median_files} files, ≥ {olympus_median_messages:.0f} messages, "
+    "≥ {olympus_median_loc} LOC (long-horizon). "
+    "Mars: pass rate ≤ {mars_pass_pct:.0f}% (Hard); median successful runs "
+    "≥ {mars_median_loc} LOC (minimum scope)."
 )
 
 DECISION_GUARDS_PROMPT: Final[str] = (

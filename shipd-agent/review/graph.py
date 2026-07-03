@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Annotated, Any, TypedDict
 
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import create_react_agent
 
+from review.activity import log_activity, timed_step
 from review.config import ReviewConfig
 from review.rubric_defaults import (
     APPROVE_BLOCKING_BAND_SCORES,
@@ -18,9 +26,10 @@ from review.rubric_defaults import (
     SEVERITY_BLOCK_APPROVE,
 )
 from review.context import build_submission_summary
+from review.agent_runs_checks import evaluate_agent_runs_phase5
 from review.downgrade import apply_downgrade_logic, evaluate_loc_phase4
 from review.loc import compute_effective_loc, format_loc_analysis
-from review.phase0 import phase0_to_phase_result, run_phase0_fast
+from review.phase0 import phase0_to_phase_result, run_phase0
 from review.phases import (
     any_phase_failed,
     dicts_to_phase_results,
@@ -70,6 +79,7 @@ class ReviewState(TypedDict, total=False):
     explore_notes: str
     force_request_changes: bool
     holistic_check: dict[str, Any]
+    agent_runs_data: dict[str, Any]
     scrape_context: dict[str, str]
     loc_info: dict
     loc_analysis: str
@@ -123,9 +133,11 @@ def scrape_node(state: ReviewState) -> dict:
     """Scrape Shipd review page panels before LLM review when a page is available."""
     page = state.get("page")
     if page is not None:
-        ctx = scrape_review_page_context(page)
-        return {
+        with timed_step("scraping Shipd review page panels", category="review"):
+            ctx = scrape_review_page_context(page)
+        out = {
             "holistic_check": ctx.get("holistic_check", {}),
+            "agent_runs_data": ctx.get("agent_runs_data", {}),
             "scrape_context": {
                 "agent_runs": ctx.get("agent_runs", "not available"),
                 "related_submissions": ctx.get("related_submissions", "not available"),
@@ -138,6 +150,17 @@ def scrape_node(state: ReviewState) -> dict:
                 "holistic_check_raw": ctx.get("holistic_check_raw", ""),
             },
         }
+        out.update(
+            _run_agent_runs_analysis(
+                {
+                    **state,
+                    "agent_runs_data": out["agent_runs_data"],
+                    "phase_results": dict(state.get("phase_results", {})),
+                    "findings": list(state.get("findings", [])),
+                }
+            )
+        )
+        return out
 
     if state.get("scrape_context"):
         return {}
@@ -145,8 +168,24 @@ def scrape_node(state: ReviewState) -> dict:
     stub = unavailable_scrape_page_context()
     return {
         "holistic_check": stub.get("holistic_check", {}),
+        "agent_runs_data": stub.get("agent_runs_data", {}),
         "scrape_context": unavailable_scrape_context(),
     }
+
+
+def _run_agent_runs_analysis(state: ReviewState) -> dict:
+    """Run deterministic Phase 5 agent run platform checks when scraped."""
+    quest = state.get("quest", "olympus")
+    agent_runs_data = state.get("agent_runs_data") or {}
+    phase5_result, phase5_findings = evaluate_agent_runs_phase5(
+        agent_runs_data,
+        quest=quest,
+    )
+    phase_results = dict(state.get("phase_results", {}))
+    phase_results["5"] = phase5_result.model_dump()
+    findings = list(state.get("findings", []))
+    findings.extend(f.model_dump() for f in phase5_findings)
+    return {"phase_results": phase_results, "findings": findings}
 
 
 def _run_loc_analysis(state: ReviewState) -> dict:
@@ -160,13 +199,15 @@ def _run_loc_analysis(state: ReviewState) -> dict:
     phase4_result, loc_findings, _ = evaluate_loc_phase4(
         loc_info,
         quest=quest,
-        olympus_max_loc=config.olympus_max_loc,
+        olympus_min_loc=config.olympus_min_loc,
+        mars_min_loc=config.mars_min_loc,
         mars_max_loc=config.mars_max_loc,
     )
     loc_analysis = format_loc_analysis(
         loc_info,
         quest=quest,
-        olympus_max=config.olympus_max_loc,
+        olympus_min=config.olympus_min_loc,
+        mars_min=config.mars_min_loc,
         mars_max=config.mars_max_loc,
     )
     phase_results = dict(state.get("phase_results", {}))
@@ -187,10 +228,21 @@ def _run_phase0_into_state(state: ReviewState) -> dict:
 
     repo_path = Path(state["repo_path"])
     summary = state.get("submission_summary", {})
-    phase0 = run_phase0_fast(
-        repo_path,
-        artifacts=summary.get("artifacts"),
-        commit=summary.get("commit"),
+    config: ReviewConfig = state["config"]
+    with timed_step(
+        f"Phase 0 checks ({config.review_phase0} tier) on {repo_path.name}",
+        category="phase0",
+    ):
+        phase0 = run_phase0(
+            repo_path,
+            artifacts=summary.get("artifacts"),
+            commit=summary.get("commit"),
+            run_tests=config.review_phase0 != "fast",
+            test_timeout=config.review_phase0_test_timeout,
+            build_timeout=config.review_phase0_docker_build_timeout,
+        )
+    log_activity(
+        f"Phase 0 result: {phase0.status} — {phase0.summary}", category="phase0"
     )
     phase_results = dict(state.get("phase_results", {}))
     phase_results["0"] = phase0_to_phase_result(phase0).model_dump()
@@ -228,7 +280,8 @@ def _dry_run_result(state: ReviewState) -> dict:
     loc_analysis = state.get("loc_analysis") or format_loc_analysis(
         state.get("loc_info") or {},
         quest=quest,
-        olympus_max=state.get("config").olympus_max_loc,
+        olympus_min=state.get("config").olympus_min_loc,
+        mars_min=state.get("config").mars_min_loc,
         mars_max=state.get("config").mars_max_loc,
     )
     result = ReviewResult(
@@ -264,7 +317,8 @@ def _dry_run_result(state: ReviewState) -> dict:
             result,
             state["loc_info"],
             quest=quest,
-            olympus_max_loc=state["config"].olympus_max_loc,
+            olympus_min_loc=state["config"].olympus_min_loc,
+            mars_min_loc=state["config"].mars_min_loc,
             mars_max_loc=state["config"].mars_max_loc,
         )
     if quest == "olympus":
@@ -308,14 +362,20 @@ def unified_review_node(state: ReviewState) -> dict:
     from pathlib import Path
 
     repo_path = Path(state["repo_path"])
+    phase0_result = phase0_updates.get("phase0_result")
+    # Playwright's sync API is greenlet-bound to the main thread, but LangGraph
+    # runs parallel tool calls on worker threads — never hand the live page to
+    # explore tools ("cannot switch to a different thread"). scrape_node already
+    # captured every panel on the main thread; tools serve that cache.
     tools = make_review_tools(
         repo_path,
         quest=state["quest"],
         review_url=state.get("review_url", ""),
         cached_summary=state.get("submission_summary"),
-        page=state.get("page"),
+        page=None,
         cached_scrape=state.get("scrape_context"),
         cached_holistic=state.get("holistic_check"),
+        cached_phase0=phase0_result,
     )
     llm = ChatAnthropic(
         model=config.review_explore_model,
@@ -341,13 +401,22 @@ def unified_review_node(state: ReviewState) -> dict:
         related_submissions=scrape.get("related_submissions", "not available"),
         holistic_check=holistic_section,
         loc_analysis=loc_analysis,
-        olympus_max_loc=config.olympus_max_loc,
+        olympus_min_loc=config.olympus_min_loc,
+        mars_min_loc=config.mars_min_loc,
         mars_max_loc=config.mars_max_loc,
         max_tool_steps=config.review_max_tool_steps,
     )
 
+    log_activity(
+        f"explore agent starting (model {config.review_explore_model}, "
+        f"budget ~{config.review_max_tool_steps} tool steps, "
+        "phases 0–6)",
+        category="review",
+    )
+    started = time.monotonic()
+    messages: list[BaseMessage] = []
     try:
-        result = agent.invoke(
+        for chunk in agent.stream(
             {
                 "messages": [
                     SystemMessage(content=UNIFIED_REVIEW_SYSTEM_PROMPT),
@@ -355,7 +424,12 @@ def unified_review_node(state: ReviewState) -> dict:
                 ]
             },
             config={"recursion_limit": config.review_max_tool_steps + 5},
-        )
+            stream_mode="values",
+        ):
+            new_messages = chunk.get("messages", [])
+            for msg in new_messages[len(messages):]:
+                _log_agent_message(msg)
+            messages = new_messages
     except Exception as exc:
         return {
             **phase0_updates,
@@ -363,7 +437,15 @@ def unified_review_node(state: ReviewState) -> dict:
             "explore_notes": f"Unified review agent error: {exc}",
         }
 
-    messages = result.get("messages", [])
+    elapsed = time.monotonic() - started
+    tool_calls = sum(
+        len(m.tool_calls) for m in messages
+        if isinstance(m, AIMessage) and m.tool_calls
+    )
+    log_activity(
+        f"explore agent finished in {elapsed:.1f}s ({tool_calls} tool calls)",
+        category="review",
+    )
     notes = _summarize_explore_messages(messages)
     return {
         **phase0_updates,
@@ -414,7 +496,8 @@ def finalize_node(state: ReviewState) -> dict:
             "force_request_changes": state.get("force_request_changes", False),
             "loc_analysis": state.get("loc_analysis", ""),
             "loc_info": state.get("loc_info", {}),
-            "olympus_max_loc": config.olympus_max_loc,
+            "olympus_min_loc": config.olympus_min_loc,
+            "mars_min_loc": config.mars_min_loc,
             "mars_max_loc": config.mars_max_loc,
         },
         indent=2,
@@ -429,8 +512,15 @@ def finalize_node(state: ReviewState) -> dict:
     llm = ChatAnthropic(
         model=config.review_model,
         api_key=config.anthropic_api_key,
+        max_tokens=8192,
     ).with_structured_output(ReviewResult)
 
+    log_activity(
+        f"finalize: structuring review with {config.review_model} "
+        "(rubric phases 0–6, band scores, findings)",
+        category="review",
+    )
+    started = time.monotonic()
     last_error: Exception | None = None
     review: ReviewResult | None = None
     for attempt in range(2):
@@ -444,7 +534,17 @@ def finalize_node(state: ReviewState) -> dict:
             break
         except Exception as exc:
             last_error = exc
+            log_activity(
+                f"finalize attempt {attempt + 1} failed: {exc}", category="review"
+            )
             human_content += f"\n\nPrevious validation error (fix output): {exc}"
+
+    if review is not None:
+        log_activity(
+            f"finalize done in {time.monotonic() - started:.1f}s "
+            f"(decision={review.decision})",
+            category="review",
+        )
 
     if review is None:
         return {
@@ -496,7 +596,8 @@ def finalize_node(state: ReviewState) -> dict:
     loc_analysis = state.get("loc_analysis") or format_loc_analysis(
         loc_info,
         quest=quest,
-        olympus_max=config.olympus_max_loc,
+        olympus_min=config.olympus_min_loc,
+        mars_min=config.mars_min_loc,
         mars_max=config.mars_max_loc,
     )
     loc_updates: dict[str, Any] = {}
@@ -526,6 +627,24 @@ def finalize_node(state: ReviewState) -> dict:
             *[Finding(**f) for f in loc_findings],
         ]
 
+    phase5_det = state.get("phase_results", {}).get("5")
+    if phase5_det:
+        merged_phases = dict(loc_updates.get("phase_results", review.phase_results))
+        merged_phases["5"] = PhaseResult(**phase5_det)
+        loc_updates["phase_results"] = merged_phases
+        phase5_findings = [
+            f for f in state.get("findings", [])
+            if isinstance(f, dict)
+            and f.get("phase") == "5"
+            and ("5", f.get("finding", "")) not in existing_finding_keys
+        ]
+        if phase5_findings:
+            base_findings = loc_updates.get("findings", review.findings)
+            loc_updates["findings"] = [
+                *base_findings,
+                *[Finding(**f) for f in phase5_findings],
+            ]
+
     if loc_updates:
         review = review.model_copy(update=loc_updates)
 
@@ -551,7 +670,8 @@ def validate_node(state: ReviewState) -> dict:
             review,
             loc_info,
             quest=state.get("quest", "olympus"),
-            olympus_max_loc=config.olympus_max_loc,
+            olympus_min_loc=config.olympus_min_loc,
+            mars_min_loc=config.mars_min_loc,
             mars_max_loc=config.mars_max_loc,
         )
         if not review.loc_analysis.strip():
@@ -560,7 +680,8 @@ def validate_node(state: ReviewState) -> dict:
                     "loc_analysis": format_loc_analysis(
                         loc_info,
                         quest=state.get("quest", "olympus"),
-                        olympus_max=config.olympus_max_loc,
+                        olympus_min=config.olympus_min_loc,
+                        mars_min=config.mars_min_loc,
                         mars_max=config.mars_max_loc,
                     )
                 }
@@ -572,6 +693,23 @@ def validate_node(state: ReviewState) -> dict:
         return {
             "review_result": mark_review_incomplete(result_dict, error=error),
         }
+
+    # Phases 1-3 (problem, harness, tests) always have material to review;
+    # SKIP there means the agent never actually evaluated the submission.
+    skipped_core = [
+        key
+        for key in ("1", "2", "3")
+        if result_dict.get("phase_results", {}).get(key, {}).get("status") == "SKIP"
+    ]
+    if skipped_core:
+        error = (
+            f"Rubric phases {', '.join(skipped_core)} were not evaluated "
+            "(status SKIP) — review is incomplete and must not be submitted. "
+            "Check REVIEW_SKIP_EXPLORE_ON_PHASE0_FAIL=0 and explore agent output."
+        )
+        log_activity(f"validate: {error}", category="review")
+        return {"review_result": mark_review_incomplete(result_dict, error=error)}
+
     return {"review_result": mark_review_complete(result_dict)}
 
 
@@ -666,18 +804,59 @@ def _fallback_result(state: ReviewState, reason: str) -> dict:
     return mark_review_incomplete(result.to_submit_dict(), error=reason)
 
 
+def _log_agent_message(msg: BaseMessage) -> None:
+    """Live-log a single explore agent message (tool call, result, or note)."""
+    if isinstance(msg, AIMessage):
+        for tc in msg.tool_calls or []:
+            try:
+                args = json.dumps(tc.get("args", {}), default=str)
+            except (TypeError, ValueError):
+                args = str(tc.get("args", ""))
+            if len(args) > 200:
+                args = args[:200] + "…"
+            log_activity(f"→ {tc['name']}({args})", category="review")
+        if not msg.tool_calls:
+            text = msg.content if isinstance(msg.content, str) else str(msg.content)
+            preview = " ".join(text.split())[:180]
+            log_activity(
+                f"agent notes ({len(text)} chars): {preview}…"
+                if len(text) > 180
+                else f"agent notes: {preview}",
+                category="review",
+            )
+    elif isinstance(msg, ToolMessage):
+        content = msg.content if isinstance(msg.content, str) else str(msg.content)
+        preview = " ".join(content.split())[:160]
+        suffix = "…" if len(content) > 160 else ""
+        log_activity(
+            f"← {msg.name or 'tool'} ({len(content)} chars): {preview}{suffix}",
+            category="review",
+        )
+
+
 def _summarize_explore_messages(messages: list[BaseMessage], *, max_chars: int = 12_000) -> str:
+    """Condense the explore transcript for the finalize step.
+
+    Human prompts are dropped (phase0 log, rubric, and scrape context are
+    passed to finalize separately) and tool outputs are truncated so the
+    finalize call stays small and fast.
+    """
     parts: list[str] = []
     for msg in messages:
         if isinstance(msg, HumanMessage):
-            parts.append(f"Human: {msg.content}")
-        elif isinstance(msg, AIMessage):
+            continue
+        if isinstance(msg, AIMessage):
             text = msg.content if isinstance(msg.content, str) else str(msg.content)
             if msg.tool_calls:
                 tools = ", ".join(tc["name"] for tc in msg.tool_calls)
                 parts.append(f"Assistant [tools: {tools}]: {text}")
             else:
                 parts.append(f"Assistant: {text}")
+        elif isinstance(msg, ToolMessage):
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            if len(content) > 800:
+                content = content[:800] + "… [tool output truncated]"
+            parts.append(f"Tool[{msg.name or 'tool'}]: {content}")
         else:
             parts.append(str(msg.content))
     joined = "\n".join(parts)

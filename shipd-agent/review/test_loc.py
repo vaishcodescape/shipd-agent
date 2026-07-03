@@ -8,7 +8,11 @@ from pathlib import Path
 
 from review.downgrade import apply_downgrade_logic, evaluate_loc_phase4
 from review.loc import compute_effective_loc, count_substantive_lines_from_patch
-from review.rubric_defaults import MARS_MAX_EFFECTIVE_LOC, OLYMPUS_MAX_EFFECTIVE_LOC
+from review.rubric_defaults import (
+    MARS_MAX_EFFECTIVE_LOC,
+    MARS_MIN_EFFECTIVE_LOC,
+    OLYMPUS_MIN_EFFECTIVE_LOC,
+)
 from review.schemas import ReviewResult, BandRatings, BandRating
 
 
@@ -54,23 +58,33 @@ class EffectiveLocTests(unittest.TestCase):
             self.assertEqual(info["method"], "none")
             self.assertEqual(info["effective_loc"], 0)
 
-    def test_olympus_within_limit_passes(self) -> None:
-        loc_info = {"method": "solution.patch", "effective_loc": 80, "files_analyzed": ["a.py"]}
+    def test_olympus_long_horizon_passes(self) -> None:
+        loc_info = {
+            "method": "solution.patch",
+            "effective_loc": 450,
+            "files_analyzed": ["a.py"],
+        }
         phase, findings, _ = evaluate_loc_phase4(
             loc_info,
             quest="olympus",
-            olympus_max_loc=OLYMPUS_MAX_EFFECTIVE_LOC,
+            olympus_min_loc=OLYMPUS_MIN_EFFECTIVE_LOC,
+            mars_min_loc=MARS_MIN_EFFECTIVE_LOC,
             mars_max_loc=MARS_MAX_EFFECTIVE_LOC,
         )
         self.assertEqual(phase.status, "PASS")
         self.assertEqual(findings, [])
 
-    def test_olympus_over_limit_recommends_downgrade(self) -> None:
-        loc_info = {"method": "solution.patch", "effective_loc": 200, "files_analyzed": ["a.py"]}
+    def test_olympus_below_minimum_recommends_downgrade(self) -> None:
+        loc_info = {
+            "method": "solution.patch",
+            "effective_loc": 200,
+            "files_analyzed": ["a.py"],
+        }
         phase, findings, _ = evaluate_loc_phase4(
             loc_info,
             quest="olympus",
-            olympus_max_loc=OLYMPUS_MAX_EFFECTIVE_LOC,
+            olympus_min_loc=OLYMPUS_MIN_EFFECTIVE_LOC,
+            mars_min_loc=MARS_MIN_EFFECTIVE_LOC,
             mars_max_loc=MARS_MAX_EFFECTIVE_LOC,
         )
         self.assertEqual(phase.status, "FAIL")
@@ -78,7 +92,11 @@ class EffectiveLocTests(unittest.TestCase):
         self.assertIn("Mars", findings[0].finding)
 
     def test_apply_downgrade_sets_flag(self) -> None:
-        loc_info = {"method": "solution.patch", "effective_loc": 200, "files_analyzed": ["a.py"]}
+        loc_info = {
+            "method": "solution.patch",
+            "effective_loc": 200,
+            "files_analyzed": ["a.py"],
+        }
         review = ReviewResult(
             decision="approve",
             band_ratings=BandRatings(
@@ -93,7 +111,8 @@ class EffectiveLocTests(unittest.TestCase):
             review,
             loc_info,
             quest="olympus",
-            olympus_max_loc=OLYMPUS_MAX_EFFECTIVE_LOC,
+            olympus_min_loc=OLYMPUS_MIN_EFFECTIVE_LOC,
+            mars_min_loc=MARS_MIN_EFFECTIVE_LOC,
             mars_max_loc=MARS_MAX_EFFECTIVE_LOC,
         )
         self.assertTrue(updated.downgrade_to_mars)

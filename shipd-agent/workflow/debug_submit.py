@@ -16,13 +16,12 @@ if str(_PKG_ROOT) not in sys.path:
 from auth import AUTH_STATE_PATH, ensure_signed_in, load_auth_config, managed_browser, goto_page
 from review.review_io import SESSION_META_PATH, load_session_meta
 from workflow.submit import (
+    BAND_HEADINGS,
     DECISION_LABELS,
     SUBMIT_FORM_MARKERS,
-    _band_section,
-    _click_band_confidence,
-    _click_band_score,
     _click_decision,
     _ensure_submit_review_form,
+    _fill_band,
     submit_review,
 )
 
@@ -126,16 +125,15 @@ def run_probe(*, headless: bool = True) -> int:
 
         page.screenshot(path=str(DEBUG_DIR / "03-decision-clicked.png"), full_page=True)
 
-        for band_key, heading in (
-            ("problem", "Problem Description"),
-            ("tests", "Tests"),
-            ("solution", "Solution & Code"),
-        ):
+        for band_key, heading in BAND_HEADINGS.items():
             band = SAMPLE_REVIEW["band_ratings"][band_key]
             try:
-                section = _band_section(page, heading)
-                _click_band_score(section, int(band["score"]))
-                _click_band_confidence(section, str(band["confidence"]))
+                _fill_band(
+                    page,
+                    heading,
+                    score=int(band["score"]),
+                    confidence=str(band["confidence"]),
+                )
                 print(f"✓ band {band_key} score={band['score']} conf={band['confidence']}")
             except Exception as exc:
                 print(f"✗ band {band_key} failed: {exc}", file=sys.stderr)
