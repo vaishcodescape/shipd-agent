@@ -39,7 +39,7 @@ def get_review_config(*, dry_run_override: bool | None = None) -> ReviewConfig:
 
     review_model = os.getenv(
         "REVIEW_MODEL",
-        "claude-opus-4-20250514",
+        "claude-opus-4-8",
     ).strip()
     explore_model = os.getenv("REVIEW_EXPLORE_MODEL", "").strip() or review_model
 

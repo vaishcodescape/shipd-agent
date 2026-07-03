@@ -35,10 +35,13 @@ except (ImportError, AttributeError):
     run_review_agent = None  # type: ignore[assignment, misc]
 from workflow.review import (
     clone_submission_locally,
-    continue_existing_review,
     extract_setup_script,
-    open_review,
-    reserve_submission,
+    reserve_and_open_review,
+)
+from workflow.cleanup import (
+    cleanup_after_review_enabled,
+    cleanup_submission_artifacts,
+    snapshot_docker_state,
 )
 from workflow.time_logs import (
     clock_in,
@@ -154,6 +157,7 @@ def run_workflow(
     clone: bool = True,
     review: bool = False,
     submit: bool = False,
+    cleanup: bool | None = None,
     clock_out_on_exit: bool = False,
     log_file: Path | None = None,
 ) -> Path | None:
@@ -168,8 +172,11 @@ def run_workflow(
 
     log_message("Starting workflow run.", log_file=log_file)
     phases = PhaseTracker(log_file)
+    do_cleanup = cleanup if cleanup is not None else cleanup_after_review_enabled()
 
     cloned_path: Path | None = None
+    docker_state_before = None
+    review_attempted = False
     phases.start("browser")
     browser_ready = 0
     try:
@@ -196,16 +203,14 @@ def run_workflow(
                 wait_for_time_logs(page)
                 clock_in(page, quest)
                 return_to_reviews(page)
-                context.storage_state(path=str(auth_state_path))
 
             with phases.step("reserve"):
-                if not continue_existing_review(page):
-                    reserve_submission(page)
-                    open_review(page)
-                context.storage_state(path=str(auth_state_path))
+                reserve_and_open_review(page)
 
             review_url = page.url
             if clone:
+                if do_cleanup:
+                    docker_state_before = snapshot_docker_state()
                 with phases.step("clone"):
                     setup_script = extract_setup_script(page)
                     cloned_path = clone_submission_locally(
@@ -221,6 +226,7 @@ def run_workflow(
                 log_message(f"Review ready at {review_url}.", log_file=log_file)
 
             if review:
+                review_attempted = True
                 if cloned_path is None:
                     phases.skip("review", "no-clone")
                     phases.skip("submit", "no-clone" if submit else "not-requested")
@@ -296,6 +302,15 @@ def run_workflow(
                 phases.skip("review", "no-review")
                 phases.skip("submit", "no-review")
 
+            if review_attempted and cloned_path is not None and do_cleanup:
+                with phases.step("cleanup"):
+                    cleanup_submission_artifacts(
+                        cloned_path,
+                        docker_state_before=docker_state_before,
+                        log=lambda message: log_message(message, log_file=log_file),
+                    )
+                cloned_path = None
+
             if clock_out_on_exit:
                 _clock_out_in_session(
                     page,
@@ -305,6 +320,8 @@ def run_workflow(
                     context=context,
                     auth_state_path=auth_state_path,
                 )
+            else:
+                context.storage_state(path=str(auth_state_path))
 
             if not headless:
                 print("Press Enter to close the browser...")
@@ -379,6 +396,7 @@ def run_watch_loop(
     clone: bool,
     review: bool,
     submit: bool,
+    cleanup: bool | None,
     interval_sec: int,
     max_runs: int | None,
     log_file: Path | None,
@@ -414,6 +432,7 @@ def run_watch_loop(
                     clone=clone,
                     review=review,
                     submit=submit,
+                    cleanup=cleanup,
                     clock_out_on_exit=False,
                     log_file=log_file,
                 )
@@ -549,6 +568,14 @@ def parse_args() -> argparse.Namespace:
         help="Stop watch mode after this many runs (default: run until Ctrl+C).",
     )
     parser.add_argument(
+        "--no-cleanup",
+        action="store_true",
+        help=(
+            "Keep the cloned submission and Docker artifacts after review "
+            "(default removes them when CLEANUP_AFTER_REVIEW=1)."
+        ),
+    )
+    parser.add_argument(
         "--log-file",
         type=Path,
         default=None,
@@ -585,6 +612,7 @@ def main() -> int:
     clone = not args.no_clone
     review = args.review or args.submit
     submit = args.submit
+    cleanup = False if args.no_cleanup else None
     headless = not args.headed
 
     if args.watch:
@@ -602,6 +630,7 @@ def main() -> int:
             clone=clone,
             review=review,
             submit=submit,
+            cleanup=cleanup,
             interval_sec=args.interval,
             max_runs=args.max_runs,
             log_file=log_file,
@@ -618,6 +647,7 @@ def main() -> int:
             clone=clone,
             review=review,
             submit=submit,
+            cleanup=cleanup,
             clock_out_on_exit=True,
             log_file=log_file,
         )

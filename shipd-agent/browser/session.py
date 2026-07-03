@@ -19,6 +19,9 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
+DEFAULT_PAGE_TIMEOUT_MS = 20_000
+DEFAULT_NAVIGATION_TIMEOUT_MS = 30_000
+
 # Skip images, fonts, and media — enough for Shipd UI automation, much lighter.
 _BLOCKED_RESOURCE_TYPES = frozenset({"image", "media", "font"})
 
@@ -144,6 +147,8 @@ def managed_browser(
         browser = launch_lightweight_browser(playwright, headless=headless)
         context = create_browser_context(browser, auth_state_path=auth_state_path)
         page = context.new_page()
+        page.set_default_timeout(DEFAULT_PAGE_TIMEOUT_MS)
+        page.set_default_navigation_timeout(DEFAULT_NAVIGATION_TIMEOUT_MS)
         if lightweight:
             configure_lightweight_page(page)
         yield BrowserSession(

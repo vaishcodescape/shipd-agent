@@ -40,7 +40,7 @@ QUEST_COMBOBOX_PATTERN = re.compile(
 )
 
 
-def wait_for_time_logs(page: Page, *, timeout: int = 30_000) -> None:
+def wait_for_time_logs(page: Page, *, timeout: int = 20_000) -> None:
     clock_controls = page.get_by_role("button", name="Clock In", exact=True).or_(
         page.get_by_role("button", name="Clock Out", exact=True)
     )
@@ -64,14 +64,14 @@ def quest_combobox(page: Page):
 def select_quest(page: Page, quest: str) -> None:
     quest_label = QUEST_LABELS[quest]
     combobox = quest_combobox(page)
-    combobox.wait_for(state="visible", timeout=30_000)
+    combobox.wait_for(state="visible", timeout=10_000)
 
     if quest_label.lower() in combobox.inner_text().lower():
         return
 
     combobox.click()
     option = page.get_by_role("option", name=quest_label, exact=True)
-    option.wait_for(state="visible", timeout=10_000)
+    option.wait_for(state="visible", timeout=5_000)
     option.click()
 
 
@@ -86,18 +86,18 @@ def clock_in(page: Page, quest: str) -> None:
         clock_out_btn.click()
         page.get_by_role("button", name="Clock In", exact=True).wait_for(
             state="visible",
-            timeout=15_000,
+            timeout=10_000,
         )
 
     select_quest(page, quest)
 
     clock_in_btn = page.get_by_role("button", name="Clock In", exact=True)
-    clock_in_btn.wait_for(state="visible", timeout=15_000)
+    clock_in_btn.wait_for(state="visible", timeout=10_000)
     clock_in_btn.click()
 
     page.get_by_role("button", name="Clock Out", exact=True).wait_for(
         state="visible",
-        timeout=15_000,
+        timeout=10_000,
     )
     print(f"Clocked in for {QUEST_LABELS[quest]}.")
 
@@ -199,7 +199,15 @@ def return_to_reviews(page: Page) -> None:
     else:
         goto_page(page, REVIEWS_URL)
 
-    page.wait_for_url("**/reviews**", timeout=30_000)
+    try:
+        page.wait_for_url("**/reviews**", timeout=10_000, wait_until="commit")
+    except PlaywrightTimeoutError:
+        pass
+
+    deck_ready = page.get_by_role("button", name="Continue →").or_(
+        page.get_by_role("button", name=re.compile(r"Reserve", re.I))
+    )
+    deck_ready.first.wait_for(state="visible", timeout=15_000)
     print(f"Back on reviews: {page.url}")
 
 

@@ -25,6 +25,7 @@ from auth import (
     load_auth_config,
     managed_browser,
 )
+from workflow.cleanup import remove_clone_directory
 
 # The problem deck. Defaults to the reviews page; override if the deck lives
 # at a different path.
@@ -33,9 +34,13 @@ PROBLEM_DECK_URL = REVIEWS_URL
 # Button/label text used to claim a submission. Order = preference.
 RESERVE_BUTTON_NAMES = ("Reserve", "Reserve Submission", "Claim")
 
+# Controls that open a reserved submission's review. Order = preference.
+REVIEW_ENTRY_NAMES = ("Continue →", "Review", "Continue Review", "Open", "Continue")
+
 # Once reserved, how we know we've landed on the review view for the submission.
-REVIEW_URL_GLOB = "**/reviews/**"
-CHALLENGE_REVIEW_URL_GLOB = "**/challenges/**"
+POST_RESERVE_TIMEOUT_MS = 10_000
+REVIEW_READY_TIMEOUT_MS = 20_000
+DECK_TIMEOUT_MS = 30_000
 
 QUICK_SETUP_HEADING = "Quick Setup"
 VIEW_SCRIPT_BUTTON = "View Script"
@@ -48,7 +53,7 @@ CLONE_DIR_PATTERN = re.compile(r"^cd (\S+)\s*$", re.MULTILINE)
 GIT_CLONE_DIR_PATTERN = re.compile(r"git clone \S+ (\S+)")
 
 
-def wait_for_problem_deck(page: Page, *, timeout: int = 60_000) -> None:
+def wait_for_problem_deck(page: Page, *, timeout: int = DECK_TIMEOUT_MS) -> None:
     """Wait until the deck shows Reserve or Continue controls."""
     deck_ready = page.get_by_role("button", name="Continue →").or_(
         page.get_by_role("button", name=re.compile(r"Reserve", re.I))
@@ -58,12 +63,13 @@ def wait_for_problem_deck(page: Page, *, timeout: int = 60_000) -> None:
 
 def find_reserve_button(page: Page) -> Locator:
     """Return the first visible, enabled Reserve button on the deck."""
-    for name in RESERVE_BUTTON_NAMES:
-        buttons = page.get_by_role("button", name=name)
-        for i in range(buttons.count()):
-            button = buttons.nth(i)
-            if button.is_visible() and button.is_enabled():
-                return button
+    candidates = page.get_by_role("button", name=RESERVE_BUTTON_NAMES[0])
+    for name in RESERVE_BUTTON_NAMES[1:]:
+        candidates = candidates.or_(page.get_by_role("button", name=name))
+    for i in range(candidates.count()):
+        button = candidates.nth(i)
+        if button.is_visible() and button.is_enabled():
+            return button
     raise RuntimeError(
         "No available Reserve button found on the problem deck. "
         "Either nothing is available to reserve, or the button label "
@@ -72,7 +78,56 @@ def find_reserve_button(page: Page) -> Locator:
 
 
 def is_challenge_review_page(page: Page) -> bool:
-    return "/challenges/" in page.url and "mode=review" in page.url
+    return "/challenges/" in page.url
+
+
+def is_review_ready(page: Page) -> bool:
+    """True when Quick Setup is visible (review UI is usable)."""
+    heading = page.get_by_text(QUICK_SETUP_HEADING, exact=True)
+    return heading.count() > 0 and heading.first.is_visible()
+
+
+def wait_for_review_ready(page: Page, *, timeout: int = REVIEW_READY_TIMEOUT_MS) -> None:
+    """Wait until the review view shows Quick Setup."""
+    page.get_by_text(QUICK_SETUP_HEADING, exact=True).wait_for(
+        state="visible",
+        timeout=timeout,
+    )
+
+
+def _post_reserve_signals(page: Page) -> Locator:
+    """Locators that indicate reserve succeeded (review open or entry control)."""
+    signals = page.get_by_text(QUICK_SETUP_HEADING, exact=True).or_(
+        page.get_by_role("button", name="Continue →")
+    )
+    for name in REVIEW_ENTRY_NAMES[1:]:
+        signals = signals.or_(page.get_by_role("button", name=name))
+        signals = signals.or_(page.get_by_role("link", name=name))
+    return signals
+
+
+def wait_for_post_reserve(page: Page, *, timeout: int = POST_RESERVE_TIMEOUT_MS) -> None:
+    """Wait until reserve settles — exits as soon as Continue or Quick Setup appears."""
+    _post_reserve_signals(page).first.wait_for(state="visible", timeout=timeout)
+
+
+def find_review_entry_control(page: Page) -> Locator | None:
+    """Return the first visible, enabled control that opens a reserved review."""
+    # Continue → is the usual post-reserve control; check it first.
+    continue_btn = page.get_by_role("button", name="Continue →")
+    if continue_btn.count() > 0:
+        first = continue_btn.first
+        if first.is_visible() and first.is_enabled():
+            return first
+
+    for name in REVIEW_ENTRY_NAMES[1:]:
+        for role in ("button", "link"):
+            targets = page.get_by_role(role, name=name)
+            for i in range(targets.count()):
+                target = targets.nth(i)
+                if target.is_visible() and target.is_enabled():
+                    return target
+    return None
 
 
 def continue_existing_review(page: Page) -> bool:
@@ -83,11 +138,7 @@ def continue_existing_review(page: Page) -> bool:
     continue_btn = page.get_by_role("button", name="Continue →")
     if continue_btn.count() and continue_btn.first.is_visible():
         continue_btn.first.click()
-        page.wait_for_url(CHALLENGE_REVIEW_URL_GLOB, timeout=30_000)
-        page.get_by_text(QUICK_SETUP_HEADING, exact=True).wait_for(
-            state="visible",
-            timeout=30_000,
-        )
+        wait_for_review_ready(page)
         print(f"Continued existing review: {page.url}")
         return True
     return False
@@ -99,69 +150,81 @@ def reserve_submission(page: Page) -> None:
         goto_page(page, PROBLEM_DECK_URL)
     wait_for_problem_deck(page)
 
-    button = find_reserve_button(page)
-    button.scroll_into_view_if_needed()
-    button.click()
-
-    # After reserving, the app typically either navigates into the review or
-    # swaps the button to a "Review"/"Continue" affordance. Wait for either.
-    try:
-        page.wait_for_url(REVIEW_URL_GLOB, timeout=15_000)
-    except PlaywrightTimeoutError:
-        wait_for_problem_deck(page)
+    find_reserve_button(page).click()
+    wait_for_post_reserve(page)
     print("Reserved a submission.")
 
 
 def open_review(page: Page) -> None:
     """Open the reserved submission's review view and leave it ready."""
-    if is_challenge_review_page(page):
-        page.get_by_text(QUICK_SETUP_HEADING, exact=True).wait_for(
-            state="visible",
-            timeout=30_000,
-        )
+    if is_review_ready(page):
         print(f"Review open: {page.url}")
         return
 
-    for name in ("Review", "Continue Review", "Open", "Continue", "Continue →"):
-        link = page.get_by_role("link", name=name)
-        button = page.get_by_role("button", name=name)
-        target = link if link.count() else button
-        if target.count() and target.first.is_visible():
-            target.first.click()
-            break
-    else:
+    if is_challenge_review_page(page):
+        wait_for_review_ready(page)
+        print(f"Review open: {page.url}")
+        return
+
+    control = find_review_entry_control(page)
+    if control is None:
         raise RuntimeError(
             "Reserved a submission but could not find a control to open its "
-            "review. Check the reserved item's action label."
+            f"review. Expected one of {REVIEW_ENTRY_NAMES}."
         )
 
-    page.wait_for_url(CHALLENGE_REVIEW_URL_GLOB, timeout=30_000)
+    control.click()
+    wait_for_review_ready(page)
+    print(f"Review open: {page.url}")
 
-    if not is_challenge_review_page(page):
-        raise RuntimeError(
-            "Review page did not open. Expected a /challenges/... URL with "
-            f"mode=review, got: {page.url}"
-        )
 
-    page.get_by_text(QUICK_SETUP_HEADING, exact=True).wait_for(
-        state="visible",
-        timeout=30_000,
-    )
+def reserve_and_open_review(page: Page) -> None:
+    """Reserve (or continue) and open the review in one pass."""
+    if continue_existing_review(page):
+        return
+
+    if "/reviews" not in page.url:
+        goto_page(page, PROBLEM_DECK_URL)
+    wait_for_problem_deck(page)
+
+    find_reserve_button(page).click()
+    wait_for_post_reserve(page)
+    print("Reserved a submission.")
+
+    if not is_review_ready(page):
+        control = find_review_entry_control(page)
+        if control is None:
+            raise RuntimeError(
+                "Reserved a submission but could not find a control to open its "
+                f"review. Expected one of {REVIEW_ENTRY_NAMES}."
+            )
+        control.click()
+        wait_for_review_ready(page)
+
     print(f"Review open: {page.url}")
 
 
 def open_quick_setup(page: Page) -> None:
     """Scroll to Quick Setup and expand the setup script."""
-    heading = page.get_by_text(QUICK_SETUP_HEADING, exact=True)
-    heading.wait_for(state="visible", timeout=30_000)
-    heading.scroll_into_view_if_needed()
-    heading.click()
+    pre = page.locator("pre").first
+    if pre.count() > 0 and pre.is_visible():
+        script = pre.inner_text().strip()
+        if script.startswith("cat <<'EOSCRIPT' | bash"):
+            return
 
     view_script = page.get_by_role("button", name=VIEW_SCRIPT_BUTTON)
-    view_script.wait_for(state="visible", timeout=15_000)
-    view_script.click()
+    if view_script.count() > 0 and view_script.first.is_visible():
+        view_script.first.click()
+        pre.wait_for(state="visible", timeout=10_000)
+        return
 
-    page.locator("pre").first.wait_for(state="visible", timeout=15_000)
+    heading = page.get_by_text(QUICK_SETUP_HEADING, exact=True)
+    heading.wait_for(state="visible", timeout=15_000)
+    heading.click()
+
+    view_script.wait_for(state="visible", timeout=10_000)
+    view_script.click()
+    pre.wait_for(state="visible", timeout=10_000)
 
 
 def extract_setup_script(page: Page) -> str:
@@ -197,10 +260,8 @@ def clone_submission_locally(setup_script: str, *, clone_dir: Path) -> Path:
     if target_name:
         target_path = clone_dir / target_name
         if target_path.exists():
-            raise RuntimeError(
-                f"Clone target already exists: {target_path}. "
-                "Remove it or choose a different --clone-dir."
-            )
+            print(f"Removing stale clone target before Quick Setup: {target_path}")
+            remove_clone_directory(target_path)
 
     print(f"Running Quick Setup in {clone_dir}...")
     subprocess.run(
@@ -242,9 +303,7 @@ def run_reserve_and_review(
         ensure_signed_in(page, PROBLEM_DECK_URL, config, headed=not headless)
         context.storage_state(path=str(auth_state_path))
 
-        if not continue_existing_review(page):
-            reserve_submission(page)
-            open_review(page)
+        reserve_and_open_review(page)
         context.storage_state(path=str(auth_state_path))
 
         cloned_path: Path | None = None

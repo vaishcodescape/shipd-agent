@@ -20,6 +20,7 @@ INTERVAL=""
 MAX_RUNS=""
 HEADED=0
 NO_CLONE=0
+NO_CLEANUP=0
 REVIEW=1
 SUBMIT=0
 FOREGROUND=0
@@ -53,6 +54,7 @@ Options:
   --no-review           Skip the autonomous review step
   --submit              Submit review on Shipd (implies review)
   --no-clone            Reserve/open review without cloning locally
+  --no-cleanup          Keep cloned repo and Docker artifacts after review
   --interval SECONDS    Seconds between cycles (default: 3600 or WATCH_INTERVAL_SEC)
   --headed              Show browser window
   --foreground-priority Do not lower CPU nice level
@@ -189,7 +191,7 @@ ui_review_banner() {
     bar="$(ui_progress_bar "${current}" "${total}" 24)"
     _emit_terminal ""
     _emit_terminal "${C_MAGENTA}${C_BOLD}╭─ Review ${current} of ${total} ${bar}${C_RESET}"
-    _emit_terminal "${C_DIM}  browser → auth → clock-in → reserve → clone → review → submit → stats → clock-out${C_RESET}"
+    _emit_terminal "${C_DIM}  browser → auth → clock-in → reserve → clone → review → submit → cleanup → stats → clock-out${C_RESET}"
 }
 
 ui_progress_bar() {
@@ -220,6 +222,7 @@ ui_phase_label() {
         clone) printf 'Clone repo' ;;
         review) printf 'Review agent' ;;
         submit) printf 'Submit on Shipd' ;;
+        cleanup) printf 'Cleanup artifacts' ;;
         stats) printf 'Session stats' ;;
         *) printf '%s' "$1" ;;
     esac
@@ -540,6 +543,10 @@ while [[ $# -gt 0 ]]; do
             NO_CLONE=1
             shift
             ;;
+        --no-cleanup)
+            NO_CLEANUP=1
+            shift
+            ;;
         --interval)
             INTERVAL="${2:?--interval requires a value}"
             shift 2
@@ -698,6 +705,7 @@ build_orchestrator_args() {
     ORCH_ARGS=(--quest "${QUEST}")
     [[ "${HEADED}" -eq 1 ]] && ORCH_ARGS+=(--headed)
     [[ "${NO_CLONE}" -eq 1 ]] && ORCH_ARGS+=(--no-clone)
+    [[ "${NO_CLEANUP}" -eq 1 ]] && ORCH_ARGS+=(--no-cleanup)
     [[ "${REVIEW}" -eq 1 ]] && ORCH_ARGS+=(--review)
     [[ "${SUBMIT}" -eq 1 ]] && ORCH_ARGS+=(--submit)
     [[ "${FOREGROUND}" -eq 1 ]] && ORCH_ARGS+=(--foreground-priority)
@@ -888,6 +896,7 @@ run_once() {
         ORCH_ARGS=(--quest "${QUEST}")
         [[ "${HEADED}" -eq 1 ]] && ORCH_ARGS+=(--headed)
         [[ "${NO_CLONE}" -eq 1 ]] && ORCH_ARGS+=(--no-clone)
+        [[ "${NO_CLEANUP}" -eq 1 ]] && ORCH_ARGS+=(--no-cleanup)
         [[ "${REVIEW}" -eq 1 ]] && ORCH_ARGS+=(--review)
         [[ "${SUBMIT}" -eq 1 ]] && ORCH_ARGS+=(--submit)
         [[ "${FOREGROUND}" -eq 1 ]] && ORCH_ARGS+=(--foreground-priority)
