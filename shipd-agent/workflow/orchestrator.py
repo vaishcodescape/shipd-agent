@@ -10,6 +10,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
@@ -28,13 +29,14 @@ from browser.session import (
     background_priority,
 )
 from stats import session_stats
+from stats import watch_batch
 
 try:
     from review.agent import run_review_agent
 except (ImportError, AttributeError):
     run_review_agent = None  # type: ignore[assignment, misc]
 from review.activity import set_activity_log_file
-from review.review_io import save_review_bundle
+from review.review_bundles import save_review_bundle
 from review.result import is_review_complete, review_failure_reason
 from workflow.review import (
     clone_submission_locally,
@@ -386,6 +388,89 @@ def run_workflow(
     return cloned_path
 
 
+def _batch_options(
+    *,
+    clone: bool,
+    review: bool,
+    submit: bool,
+    cleanup: bool | None,
+) -> dict[str, bool | None]:
+    return {
+        "review": review,
+        "submit": submit,
+        "clone": clone,
+        "cleanup": cleanup,
+        "separate_steps": False,
+    }
+
+
+def _load_failed_review_url() -> str:
+    try:
+        from review.review_bundles import load_session_meta
+
+        return str(load_session_meta().get("review_url", "")).strip()
+    except (ImportError, OSError, ValueError, FileNotFoundError):
+        return ""
+
+
+def _prepare_watch_batch(
+    *,
+    quest: str,
+    interval_sec: int,
+    max_runs: int | None,
+    clone: bool,
+    review: bool,
+    submit: bool,
+    cleanup: bool | None,
+    fresh: bool,
+    log_file: Path | None,
+) -> tuple[int | None, dict[str, Any] | None]:
+    """Load or create batch resume state for watch mode."""
+    if max_runs is None:
+        return None, None
+
+    options = _batch_options(
+        clone=clone,
+        review=review,
+        submit=submit,
+        cleanup=cleanup,
+    )
+    if fresh:
+        watch_batch.clear_batch()
+        return max_runs, watch_batch.start_batch(
+            max_runs=max_runs,
+            quest=quest,
+            interval_sec=interval_sec,
+            options=options,
+        )
+
+    active = watch_batch.get_active_batch()
+    if active is not None:
+        if not watch_batch.options_compatible(
+            active,
+            quest=quest,
+            interval_sec=interval_sec,
+            options=options,
+        ):
+            log_message(
+                "WARNING: Saved batch options differ from current flags; "
+                "pass --fresh or set SHIPD_FRESH=1 to restart.",
+                log_file=log_file,
+            )
+            raise RuntimeError(
+                "Incompatible resume state — use --fresh to start a new batch."
+            )
+        log_message(watch_batch.format_resume_message(active), log_file=log_file)
+        return int(active["max_runs"]), active
+
+    return max_runs, watch_batch.start_batch(
+        max_runs=max_runs,
+        quest=quest,
+        interval_sec=interval_sec,
+        options=options,
+    )
+
+
 def run_clock_out(
     *,
     quest: str = "olympus",
@@ -451,12 +536,25 @@ def run_watch_loop(
     interval_sec: int,
     max_runs: int | None,
     log_file: Path | None,
+    fresh: bool = False,
 ) -> int:
     """Repeat the workflow with the browser closed between runs."""
+    max_runs, batch = _prepare_watch_batch(
+        quest=quest,
+        interval_sec=interval_sec,
+        max_runs=max_runs,
+        clone=clone,
+        review=review,
+        submit=submit,
+        cleanup=cleanup,
+        fresh=fresh,
+        log_file=log_file,
+    )
+
     watcher = ShutdownWatcher()
     watcher.install()
-    runs = 0
     exit_code = 0
+    batch_complete = False
 
     log_message(
         f"Watch mode started (interval={interval_sec}s, max_runs={max_runs or '∞'}).",
@@ -466,13 +564,19 @@ def run_watch_loop(
 
     try:
         while not watcher.requested:
-            runs += 1
-            max_display = max_runs if max_runs is not None else 0
+            batch = watch_batch.get_active_batch()
+            if batch is None:
+                batch_complete = True
+                break
+
+            runs = watch_batch.next_run_number(batch)
+            max_display = int(batch["max_runs"])
             log_message(
                 f"SHIPD:REVIEW:{runs}:{max_display}:start",
                 log_file=log_file,
             )
             log_message(f"Run {runs} starting.", log_file=log_file)
+            run_status = "done"
             try:
                 run_workflow(
                     quest=quest,
@@ -499,6 +603,7 @@ def run_watch_loop(
                 subprocess.CalledProcessError,
             ) as exc:
                 exit_code = 1
+                run_status = "fail"
                 if not isinstance(exc, ReviewAgentError):
                     session_stats.record_failure()
                 log_message(f"Run {runs} failed: {exc}", log_file=log_file)
@@ -507,11 +612,19 @@ def run_watch_loop(
                     log_file=log_file,
                 )
 
+            failed_url = _load_failed_review_url() if run_status == "fail" else ""
+            finished = watch_batch.record_run_complete(
+                run_status,
+                review_url=failed_url,
+            )
+            if finished is not None and watch_batch.is_batch_complete(finished):
+                batch_complete = True
+
             log_phase("stats", "start", log_file=log_file)
             log_message(session_stats.format_summary_log(), log_file=log_file)
             log_phase("stats", "done", log_file=log_file)
 
-            if max_runs is not None and runs >= max_runs:
+            if batch_complete:
                 log_message("Reached --max-runs limit.", log_file=log_file)
                 break
             if watcher.requested:
@@ -527,13 +640,22 @@ def run_watch_loop(
         watcher.restore()
         log_message("Watch mode stopped.", log_file=log_file)
         log_message(session_stats.format_summary_log(), log_file=log_file)
-        run_clock_out(
-            quest=quest,
-            config=config,
-            headless=headless,
-            auth_state_path=auth_state_path,
-            log_file=log_file,
-        )
+        if batch_complete:
+            run_clock_out(
+                quest=quest,
+                config=config,
+                headless=headless,
+                auth_state_path=auth_state_path,
+                log_file=log_file,
+            )
+        else:
+            active = watch_batch.get_active_batch()
+            if active is not None:
+                log_message(
+                    f"{watch_batch.format_resume_message(active)} "
+                    "(rerun ./run.sh to continue).",
+                    log_file=log_file,
+                )
 
     return exit_code
 
@@ -638,11 +760,33 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not lower CPU priority (default lowers nice for background use).",
     )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help=(
+            "Start a new review batch (clear resume state and session stats). "
+            "Same as SHIPD_FRESH=1."
+        ),
+    )
     return parser.parse_args()
 
 
+def _should_reset_session(*, watch: bool, fresh: bool) -> bool:
+    if fresh:
+        return True
+    if watch and watch_batch.get_active_batch() is not None:
+        return False
+    return True
+
+
 def main() -> int:
-    session_stats.reset_session()
+    args = parse_args()
+    fresh = args.fresh or os.getenv("SHIPD_FRESH", "").strip() == "1"
+    if fresh:
+        watch_batch.clear_batch()
+    if _should_reset_session(watch=args.watch, fresh=fresh):
+        session_stats.reset_session()
+
     config = load_auth_config()
 
     submissions_dir = os.getenv("SUBMISSIONS_DIR", "").strip()
@@ -650,7 +794,6 @@ def main() -> int:
         Path(submissions_dir) if submissions_dir else REPO_ROOT / "submissions"
     )
 
-    args = parse_args()
     log_file = args.log_file
     if log_file is None:
         log_path = os.getenv("LOG_FILE", "").strip()
@@ -686,6 +829,7 @@ def main() -> int:
             interval_sec=args.interval,
             max_runs=args.max_runs,
             log_file=log_file,
+            fresh=fresh,
         )
 
     try:

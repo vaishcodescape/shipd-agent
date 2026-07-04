@@ -25,6 +25,17 @@ DEPRECATED_MODEL_ALIASES: dict[str, str] = {
 DEFAULT_REVIEW_MODEL = "claude-opus-4-8"
 DEFAULT_EXPLORE_MODEL = "claude-sonnet-4-6"
 
+# Token / context budgets (character caps approximate input size; output in tokens).
+DEFAULT_REVIEW_MAX_TOOL_STEPS = 15
+DEFAULT_REVIEW_TOOL_READ_MAX_CHARS = 12_000
+DEFAULT_REVIEW_PHASE0_LOG_MAX_CHARS = 8_000
+DEFAULT_REVIEW_EXPLORE_TRANSCRIPT_MAX_CHARS = 8_000
+DEFAULT_REVIEW_TOOL_OUTPUT_MAX_CHARS = 600
+DEFAULT_REVIEW_SCRAPE_PANEL_MAX_CHARS = 2_500
+DEFAULT_REVIEW_FINALIZE_PAYLOAD_MAX_CHARS = 32_000
+DEFAULT_REVIEW_EXPLORE_MAX_OUTPUT_TOKENS = 4_096
+DEFAULT_REVIEW_FINALIZE_MAX_OUTPUT_TOKENS = 8_192
+
 
 @dataclass(frozen=True)
 class ReviewConfig:
@@ -37,6 +48,14 @@ class ReviewConfig:
     review_dry_run: bool
     review_max_tool_steps: int
     review_rubric_max_chars: int
+    review_tool_read_max_chars: int
+    review_phase0_log_max_chars: int
+    review_explore_transcript_max_chars: int
+    review_tool_output_max_chars: int
+    review_scrape_panel_max_chars: int
+    review_finalize_payload_max_chars: int
+    review_explore_max_output_tokens: int
+    review_finalize_max_output_tokens: int
     review_skip_explore_on_phase0_fail: bool
     rubric_path: str
     olympus_min_loc: int
@@ -89,8 +108,58 @@ def get_review_config(*, dry_run_override: bool | None = None) -> ReviewConfig:
             os.getenv("REVIEW_PHASE0_DOCKER_BUILD_TIMEOUT", "600")
         ),
         review_dry_run=dry_run,
-        review_max_tool_steps=int(os.getenv("REVIEW_MAX_TOOL_STEPS", "20")),
+        review_max_tool_steps=int(
+            os.getenv("REVIEW_MAX_TOOL_STEPS", str(DEFAULT_REVIEW_MAX_TOOL_STEPS))
+        ),
         review_rubric_max_chars=int(os.getenv("REVIEW_RUBRIC_MAX_CHARS", "16000")),
+        review_tool_read_max_chars=int(
+            os.getenv(
+                "REVIEW_TOOL_READ_MAX_CHARS",
+                str(DEFAULT_REVIEW_TOOL_READ_MAX_CHARS),
+            )
+        ),
+        review_phase0_log_max_chars=int(
+            os.getenv(
+                "REVIEW_PHASE0_LOG_MAX_CHARS",
+                str(DEFAULT_REVIEW_PHASE0_LOG_MAX_CHARS),
+            )
+        ),
+        review_explore_transcript_max_chars=int(
+            os.getenv(
+                "REVIEW_EXPLORE_TRANSCRIPT_MAX_CHARS",
+                str(DEFAULT_REVIEW_EXPLORE_TRANSCRIPT_MAX_CHARS),
+            )
+        ),
+        review_tool_output_max_chars=int(
+            os.getenv(
+                "REVIEW_TOOL_OUTPUT_MAX_CHARS",
+                str(DEFAULT_REVIEW_TOOL_OUTPUT_MAX_CHARS),
+            )
+        ),
+        review_scrape_panel_max_chars=int(
+            os.getenv(
+                "REVIEW_SCRAPE_PANEL_MAX_CHARS",
+                str(DEFAULT_REVIEW_SCRAPE_PANEL_MAX_CHARS),
+            )
+        ),
+        review_finalize_payload_max_chars=int(
+            os.getenv(
+                "REVIEW_FINALIZE_PAYLOAD_MAX_CHARS",
+                str(DEFAULT_REVIEW_FINALIZE_PAYLOAD_MAX_CHARS),
+            )
+        ),
+        review_explore_max_output_tokens=int(
+            os.getenv(
+                "REVIEW_EXPLORE_MAX_OUTPUT_TOKENS",
+                str(DEFAULT_REVIEW_EXPLORE_MAX_OUTPUT_TOKENS),
+            )
+        ),
+        review_finalize_max_output_tokens=int(
+            os.getenv(
+                "REVIEW_FINALIZE_MAX_OUTPUT_TOKENS",
+                str(DEFAULT_REVIEW_FINALIZE_MAX_OUTPUT_TOKENS),
+            )
+        ),
         # Default off: even when Phase 0 fails, the rubric requires evaluating
         # phases 1-6 so contributor feedback covers the whole submission.
         review_skip_explore_on_phase0_fail=_truthy(

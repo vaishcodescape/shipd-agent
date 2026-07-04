@@ -15,6 +15,7 @@ QUEST="olympus"
 SEPARATE_STEPS=0
 ONCE=0
 SKIP_PROMPT=0
+MAX_RUNS_EXPLICIT=0
 INTERVAL=""
 MAX_RUNS=""
 HEADED=0
@@ -28,6 +29,8 @@ CLONE_DIR=""
 LOG_FILE=""
 EXTRA_ARGS=()
 SHUTDOWN=0
+FRESH=0
+RESUME_BATCH=0
 
 # Terminal UX state (colors/spinners when stdout is a TTY; plain otherwise).
 USE_TTY_UI=0
@@ -37,38 +40,6 @@ CURRENT_REVIEW_TOTAL=0
 
 usage() {
     cat <<'EOF'
-Usage: ./run.sh [options]
-
-Runs the Shipd review automation pipeline with timestamped progress logging.
-
-On start, you are asked: "How many reviews would you like to do today?"
-The full workflow runs that many times, then exit. Each cycle: sign in,
-clock in, reserve, clone, and review. The browser closes between cycles.
-
-Options:
-  --reviews N           Run N reviews without prompting (same as --max-runs)
-  --once                Run exactly 1 review and exit (skips prompt)
-  --max-runs N          Run N reviews without prompting
-  --no-prompt           Require --reviews or --max-runs (non-interactive)
-  --quest NAME          Quest for time logs: olympus or mars (default: olympus)
-  --no-review           Skip the autonomous review step (implies --no-submit)
-  --submit              Submit review on Shipd (default: on; implies review)
-  --no-submit           Review only; do not submit on Shipd
-  --no-clone            Reserve/open review without cloning locally
-  --no-cleanup          Keep cloned repo and Docker artifacts after review
-  --interval SECONDS    Seconds between cycles (default: 60 or WATCH_INTERVAL_SEC)
-  --headed              Show browser window
-  --foreground-priority Do not lower CPU nice level
-  --clone-dir PATH      Where to clone submissions
-  --log-file PATH       Append logs to this file (default: logs/run.log)
-  --separate-steps      Run auth, time_logs, review, review agent per cycle
-  --setup               Install Python deps and Playwright Chromium, then exit
-  -h, --help            Show this help
-
-Environment:
-  SHIPD_NO_COLOR=1      Disable ANSI colors and animations
-  SHIPD_PLAIN=1         Same as SHIPD_NO_COLOR
-
 EOF
 }
 
@@ -548,11 +519,13 @@ while [[ $# -gt 0 ]]; do
         --once)
             ONCE=1
             MAX_RUNS=1
+            MAX_RUNS_EXPLICIT=1
             SKIP_PROMPT=1
             shift
             ;;
         --reviews)
             MAX_RUNS="${2:?--reviews requires a value}"
+            MAX_RUNS_EXPLICIT=1
             SKIP_PROMPT=1
             shift 2
             ;;
@@ -596,6 +569,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --max-runs)
             MAX_RUNS="${2:?--max-runs requires a value}"
+            MAX_RUNS_EXPLICIT=1
             SKIP_PROMPT=1
             shift 2
             ;;
@@ -619,6 +593,10 @@ while [[ $# -gt 0 ]]; do
             SEPARATE_STEPS=1
             shift
             ;;
+        --fresh)
+            FRESH=1
+            shift
+            ;;
         --setup)
             EXTRA_ARGS=(setup)
             shift
@@ -634,6 +612,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 init_ui
+
+if [[ "${SHIPD_FRESH:-0}" == "1" ]]; then
+    FRESH=1
+fi
 
 if [[ -z "${LOG_FILE}" ]]; then
     load_env_file "${ROOT_DIR}/.env"
@@ -761,6 +743,7 @@ build_orchestrator_args() {
     [[ "${SUBMIT}" -eq 1 ]] && ORCH_ARGS+=(--submit)
     [[ "${FOREGROUND}" -eq 1 ]] && ORCH_ARGS+=(--foreground-priority)
     [[ -n "${CLONE_DIR}" ]] && ORCH_ARGS+=(--clone-dir "${CLONE_DIR}")
+    [[ "${FRESH}" -eq 1 ]] && ORCH_ARGS+=(--fresh)
     # No --log-file: shipd.sh tees every streamed line into LOG_FILE itself;
     # passing it would write each orchestrator/activity line twice.
 
@@ -807,6 +790,128 @@ reset_session_stats() {
     log "Session stats reset"
 }
 
+batch_python() {
+    (cd "${AGENT_DIR}" && PYTHONPATH="${AGENT_DIR}" "${PYTHON}" -c "$1")
+}
+
+clear_watch_batch() {
+    batch_python "from stats.watch_batch import clear_batch; clear_batch()"
+    log "Cleared saved batch resume state"
+}
+
+apply_watch_resume() {
+    local info max completed message
+    info="$(batch_python "
+from stats import watch_batch
+batch = watch_batch.get_active_batch()
+if batch is None:
+    raise SystemExit(1)
+print(batch['max_runs'])
+print(batch['completed_runs'])
+print(watch_batch.format_resume_message(batch))
+")" || return 1
+
+    max="$(printf '%s\n' "${info}" | sed -n '1p')"
+    completed="$(printf '%s\n' "${info}" | sed -n '2p')"
+    message="$(printf '%s\n' "${info}" | sed -n '3p')"
+
+    if [[ "${MAX_RUNS_EXPLICIT}" -eq 1 ]] && [[ -n "${MAX_RUNS}" ]] && [[ "${MAX_RUNS}" != "${max}" ]]; then
+        die "Saved batch targets ${max} reviews (${completed} done). Use --fresh to start ${MAX_RUNS} new reviews."
+    fi
+
+    MAX_RUNS="${max}"
+    RESUME_BATCH=1
+    SKIP_PROMPT=1
+    log "${message}"
+}
+
+check_watch_batch_compatible() {
+    local cleanup_arg="None"
+    if [[ "${NO_CLEANUP}" -eq 1 ]]; then
+        cleanup_arg="False"
+    fi
+    batch_python "
+from stats import watch_batch
+batch = watch_batch.get_active_batch()
+if batch is None:
+    raise SystemExit(0)
+options = {
+    'review': ${REVIEW} == 1,
+    'submit': ${SUBMIT} == 1,
+    'clone': $((1 - NO_CLONE)) == 1,
+    'cleanup': ${cleanup_arg},
+    'separate_steps': ${SEPARATE_STEPS} == 1,
+}
+if not watch_batch.options_compatible(
+    batch,
+    quest='${QUEST}',
+    interval_sec=int('${INTERVAL}'),
+    options=options,
+):
+    raise SystemExit(1)
+" || die "Saved batch options differ from current flags — rerun with --fresh or SHIPD_FRESH=1"
+}
+
+prepare_watch_batch_start() {
+    local cleanup_arg="None"
+    if [[ "${NO_CLEANUP}" -eq 1 ]]; then
+        cleanup_arg="False"
+    fi
+    batch_python "
+from stats import watch_batch
+watch_batch.start_batch(
+    max_runs=int('${MAX_RUNS}'),
+    quest='${QUEST}',
+    interval_sec=int('${INTERVAL}'),
+    options={
+        'review': ${REVIEW} == 1,
+        'submit': ${SUBMIT} == 1,
+        'clone': $((1 - NO_CLONE)) == 1,
+        'cleanup': ${cleanup_arg},
+        'separate_steps': ${SEPARATE_STEPS} == 1,
+    },
+)
+"
+}
+
+record_watch_run() {
+    batch_python "from stats.watch_batch import record_run_complete; record_run_complete('${1}')"
+}
+
+next_watch_run_number() {
+    batch_python "
+from stats import watch_batch
+batch = watch_batch.get_active_batch()
+if batch is None:
+    print(0)
+else:
+    print(watch_batch.next_run_number(batch))
+"
+}
+
+watch_batch_is_active() {
+    batch_python "
+from stats import watch_batch
+raise SystemExit(0 if watch_batch.get_active_batch() else 1)
+"
+}
+
+init_batch_session() {
+    if [[ "${FRESH}" -eq 1 ]]; then
+        clear_watch_batch
+        reset_session_stats
+        return
+    fi
+
+    if [[ "${RESUME_BATCH}" -eq 1 ]]; then
+        check_watch_batch_compatible
+        log "Continuing saved batch (session stats preserved)"
+        return
+    fi
+
+    reset_session_stats
+}
+
 record_workflow_failure() {
     (cd "${AGENT_DIR}" && PYTHONPATH="${AGENT_DIR}" "${PYTHON}" -c "from session_stats import record_failure; record_failure()")
 }
@@ -838,7 +943,7 @@ find_latest_submission() {
 }
 
 load_session_review_url() {
-    (cd "${AGENT_DIR}" && PYTHONPATH=. "${PYTHON}" -c "from review.review_io import load_session_meta; print(load_session_meta()['review_url'])")
+    (cd "${AGENT_DIR}" && PYTHONPATH=. "${PYTHON}" -c "from review.review_bundles import load_session_meta; print(load_session_meta()['review_url'])")
 }
 
 run_separate_phase() {
@@ -920,13 +1025,26 @@ run_separate_steps_batch() {
     local cycle=0
     trap on_signal INT TERM
 
+    if [[ "${RESUME_BATCH}" -eq 0 ]]; then
+        prepare_watch_batch_start
+    fi
+
     log "Batch started: ${MAX_RUNS} review(s), interval=${INTERVAL}s between cycles"
 
-    while [[ "${SHUTDOWN}" -eq 0 ]] && [[ "${cycle}" -lt "${MAX_RUNS}" ]]; do
-        cycle=$((cycle + 1))
+    while [[ "${SHUTDOWN}" -eq 0 ]]; do
+        if ! watch_batch_is_active; then
+            break
+        fi
+
+        cycle="$(next_watch_run_number)"
+        if [[ "${cycle}" -le 0 ]] || [[ "${cycle}" -gt "${MAX_RUNS}" ]]; then
+            break
+        fi
+
         ui_review_banner "${cycle}" "${MAX_RUNS}"
 
         if run_separate_steps_cycle; then
+            record_watch_run "done"
             if [[ "${USE_TTY_UI}" -eq 1 ]]; then
                 _emit_terminal "${C_GREEN}${C_BOLD}  ✓ Review ${cycle}/${MAX_RUNS} completed${C_RESET}"
             else
@@ -934,6 +1052,7 @@ run_separate_steps_batch() {
             fi
         else
             record_workflow_failure
+            record_watch_run "fail"
             if [[ "${USE_TTY_UI}" -eq 1 ]]; then
                 _emit_terminal "${C_RED}${C_BOLD}  ✗ Review ${cycle}/${MAX_RUNS} failed; continuing${C_RESET}"
             else
@@ -942,7 +1061,7 @@ run_separate_steps_batch() {
         fi
         log_session_summary
 
-        if [[ "${cycle}" -ge "${MAX_RUNS}" ]] || [[ "${SHUTDOWN}" -eq 1 ]]; then
+        if ! watch_batch_is_active || [[ "${SHUTDOWN}" -eq 1 ]]; then
             break
         fi
 
@@ -950,7 +1069,12 @@ run_separate_steps_batch() {
     done
 
     trap - INT TERM
-    log "Batch finished: ${cycle}/${MAX_RUNS} review(s) attempted"
+    if watch_batch_is_active; then
+        apply_watch_resume >/dev/null 2>&1 || true
+        log "Batch paused; rerun ./run.sh to continue"
+    else
+        log "Batch finished: ${MAX_RUNS} review(s) completed"
+    fi
 }
 
 run_orchestrator_batch() {
@@ -999,12 +1123,19 @@ main() {
         exit 0
     fi
 
+    resolve_python
+    activate_venv
+
     ui_header "Shipd agent"
     log "Log file: ${LOG_FILE}"
 
+    if [[ "${FRESH}" -eq 0 ]] && [[ "${ONCE}" -eq 0 ]]; then
+        apply_watch_resume || true
+    fi
+
     prompt_review_count
     preflight
-    reset_session_stats
+    init_batch_session
 
     if [[ "${ONCE}" -eq 1 ]] || [[ "${MAX_RUNS}" -eq 1 ]]; then
         log "Running 1 review"

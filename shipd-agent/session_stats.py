@@ -1,3 +1,3 @@
-"""Compatibility shim — re-exports stats.session_stats."""
+# Session Stats Entry Point
 
 from stats.session_stats import *  # noqa: F403

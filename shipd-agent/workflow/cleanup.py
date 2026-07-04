@@ -191,7 +191,7 @@ def run_cleanup_from_session_meta(
     log: Callable[[str], None] | None = None,
 ) -> None:
     """Load clone path and pre-review Docker snapshot from session meta."""
-    from review.review_io import SESSION_META_PATH, load_session_meta
+    from review.review_bundles import SESSION_META_PATH, load_session_meta
 
     meta = load_session_meta(session_meta_path or SESSION_META_PATH)
     repo_path_raw = str(meta.get("repo_path", "")).strip()

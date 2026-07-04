@@ -388,7 +388,7 @@ def run_reserve_and_review(
                 clone_dir=clone_dir or (REPO_ROOT / "submissions"),
             )
 
-        from review.review_io import save_session_meta
+        from review.review_bundles import save_session_meta
 
         save_session_meta(
             review_url=page.url,

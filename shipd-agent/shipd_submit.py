@@ -1,3 +1,3 @@
-"""Compatibility shim — re-exports workflow.submit."""
+# Shipd Submit Entry Point
 
 from workflow.submit import *  # noqa: F403

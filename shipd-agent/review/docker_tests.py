@@ -375,7 +375,7 @@ class HostTestRunner:
         *,
         timeout: int,
     ) -> tuple[int, str]:
-        from review.phase0 import _run_test_sh  # noqa: PLC0415
+        from review.review_phases import _run_test_sh  # noqa: PLC0415
 
         return _run_test_sh(
             self.repo_path,

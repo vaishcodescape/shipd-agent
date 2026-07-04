@@ -11,15 +11,17 @@ from typing import Any
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
+from review.config import ReviewConfig, get_review_config
 from review.context import build_submission_summary, discover_artifacts, resolve_repo_path
 from review.loc import compute_effective_loc, format_loc_analysis
-from review.phase0 import Phase0Result, run_phase0
-from review.phase0 import check_patch_apply as git_check_patch_apply
+from review.review_phases import Phase0Result, run_phase0
+from review.review_phases import check_patch_apply as git_check_patch_apply
+from review.token_budget import truncate_text
 
 
 class ReadFileInput(BaseModel):
     path: str = Field(description="Relative path within the submission repo")
-    max_chars: int = Field(default=50_000, ge=1, le=100_000)
+    max_chars: int = Field(default=12_000, ge=1, le=100_000)
 
 
 class ListDirectoryInput(BaseModel):
@@ -67,10 +69,15 @@ def make_review_tools(
     cached_scrape: dict[str, str] | None = None,
     cached_holistic: dict | None = None,
     cached_phase0: Phase0Result | None = None,
+    config: ReviewConfig | None = None,
 ) -> list[StructuredTool]:
     repo_path = resolve_repo_path(repo_path)
+    cfg = config or get_review_config()
+    read_cap = cfg.review_tool_read_max_chars
+    phase0_cap = cfg.review_phase0_log_max_chars
 
-    def read_file(path: str, max_chars: int = 50_000) -> str:
+    def read_file(path: str, max_chars: int = read_cap) -> str:
+        cap = min(max_chars, read_cap)
         target = _safe_path(repo_path, path)
         if not target.is_file():
             return f"Error: not a file: {path}"
@@ -78,8 +85,8 @@ def make_review_tools(
             text = target.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             return f"Error reading {path}: {exc}"
-        if len(text) > max_chars:
-            return text[:max_chars] + f"\n… [truncated at {max_chars} chars]"
+        if len(text) > cap:
+            return truncate_text(text, cap, label=f"read_file {path}")
         return text
 
     def list_directory(path: str = ".", max_depth: int = 2) -> str:
@@ -166,6 +173,14 @@ def make_review_tools(
             lines.append(f"  {name}: {status}")
         return "\n".join(lines)
 
+    def _format_phase0_result(result: Phase0Result) -> str:
+        log = truncate_text(result.phase0_log, phase0_cap, label="phase0 log")
+        return (
+            f"Phase 0 status: {result.status}\n"
+            f"Summary: {result.summary}\n\n"
+            f"{log}"
+        )
+
     def run_phase0_checks() -> str:
         # Docker build + 4 test.sh runs take minutes; the deterministic result
         # from review start is authoritative, so serve it from cache.
@@ -173,14 +188,9 @@ def make_review_tools(
             return (
                 "Phase 0 checks (cached — Docker build and test.sh contract "
                 "already executed deterministically at review start):\n"
-                f"Phase 0 status: {cached_phase0.status}\n"
-                f"Summary: {cached_phase0.summary}\n\n"
-                f"{cached_phase0.phase0_log}"
+                + _format_phase0_result(cached_phase0)
             )
 
-        from review.config import get_review_config
-
-        cfg = get_review_config()
         summary = cached_summary or build_submission_summary(
             repo_path,
             quest=quest,
@@ -194,11 +204,7 @@ def make_review_tools(
             test_timeout=cfg.review_phase0_test_timeout,
             build_timeout=cfg.review_phase0_docker_build_timeout,
         )
-        return (
-            f"Phase 0 status: {result.status}\n"
-            f"Summary: {result.summary}\n\n"
-            f"{result.phase0_log}"
-        )
+        return _format_phase0_result(result)
 
     def check_patch_apply(patch_name: str) -> str:
         artifacts = (
@@ -249,9 +255,6 @@ def make_review_tools(
         return "\n\n".join(parts)
 
     def compute_effective_loc_tool() -> str:
-        from review.config import get_review_config
-
-        cfg = get_review_config()
         info = compute_effective_loc(repo_path)
         analysis = format_loc_analysis(
             info,

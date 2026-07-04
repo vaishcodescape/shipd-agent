@@ -11,7 +11,7 @@ from typing import Any
 from review.config import ReviewConfig, get_review_config
 from review.graph import run_review_graph
 from review.result import is_review_complete, review_failure_reason
-from review.review_io import PENDING_SUBMIT_PATH, save_review_bundle
+from review.review_bundles import PENDING_SUBMIT_PATH, save_review_bundle
 
 
 def run_review_agent(

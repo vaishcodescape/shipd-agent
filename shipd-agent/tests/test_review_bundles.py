@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from review.review_io import load_review_bundle, save_review_bundle
+from review.review_bundles import load_review_bundle, save_review_bundle
 
 
 SAMPLE_REVIEW = {

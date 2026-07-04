@@ -7,14 +7,14 @@ import json
 import sys
 from pathlib import Path
 
-# workflow/review.py shadows the review package when this script is run as
-# `python workflow/debug_submit.py` (sys.path[0] is workflow/).
+# Make the package root importable when this script is run directly as
+# `python tests/debug_submit.py` (sys.path[0] is tests/).
 _PKG_ROOT = Path(__file__).resolve().parent.parent
 if str(_PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(_PKG_ROOT))
 
 from auth import AUTH_STATE_PATH, ensure_signed_in, load_auth_config, managed_browser, goto_page
-from review.review_io import SESSION_META_PATH, load_session_meta
+from review.review_bundles import SESSION_META_PATH, load_session_meta
 from workflow.submit import (
     BAND_HEADINGS,
     DECISION_LABELS,
@@ -22,6 +22,8 @@ from workflow.submit import (
     _click_decision,
     _ensure_submit_review_form,
     _fill_band,
+    _find_band_reason_js,
+    _find_band_reason_playwright,
     submit_review,
 )
 
@@ -127,14 +129,33 @@ def run_probe(*, headless: bool = True) -> int:
 
         for band_key, heading in BAND_HEADINGS.items():
             band = SAMPLE_REVIEW["band_ratings"][band_key]
+            score = int(band["score"])
             try:
                 _fill_band(
                     page,
                     heading,
-                    score=int(band["score"]),
+                    score=score,
                     confidence=str(band["confidence"]),
+                    reasoning=str(band.get("reasoning", "")),
                 )
-                print(f"✓ band {band_key} score={band['score']} conf={band['confidence']}")
+                print(f"✓ band {band_key} score={score} conf={band['confidence']}")
+                if score < 3:
+                    js_info = _find_band_reason_js(page, heading)
+                    pw_field = _find_band_reason_playwright(page, heading)
+                    reason_ok = js_info.get("ok") or pw_field is not None
+                    if reason_ok:
+                        print(f"  ✓ reason field visible for {band_key}")
+                    else:
+                        print(
+                            f"  ✗ reason field NOT found for {band_key}: "
+                            f"{js_info.get('reason', 'unknown')}",
+                            file=sys.stderr,
+                        )
+                        page.screenshot(
+                            path=str(DEBUG_DIR / f"04-band-{band_key}-no-reason.png"),
+                            full_page=True,
+                        )
+                        return 1
             except Exception as exc:
                 print(f"✗ band {band_key} failed: {exc}", file=sys.stderr)
                 page.screenshot(

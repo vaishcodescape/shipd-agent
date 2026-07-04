@@ -1,4 +1,4 @@
-"""Compatibility entry point — delegates to review.agent."""
+# Review Agent Entry Point
 
 from review.agent import main, run_review_agent
 

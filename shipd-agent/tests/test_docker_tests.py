@@ -184,7 +184,7 @@ class MockSubprocessDockerTests(unittest.TestCase):
 
 class Phase0DockerIntegrationTests(unittest.TestCase):
     def test_missing_dockerfile_fails_phase0_tests(self) -> None:
-        from review.phase0 import run_phase0_tests
+        from review.review_phases import run_phase0_tests
 
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)

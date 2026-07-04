@@ -22,7 +22,7 @@ from auth import (
     load_auth_config,
     managed_browser,
 )
-from review.review_io import (
+from review.review_bundles import (
     PENDING_SUBMIT_PATH,
     load_review_bundle,
 )

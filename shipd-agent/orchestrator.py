@@ -1,4 +1,4 @@
-"""Compatibility entry point — delegates to workflow.orchestrator."""
+# Orchestrator for Shipd Agent
 
 from workflow.orchestrator import main
 

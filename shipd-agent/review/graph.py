@@ -1,5 +1,4 @@
-# LangGraph review agent: unified_review → finalize → validate.
-
+# LangGraph review agent 
 from __future__ import annotations
 
 import json
@@ -29,13 +28,14 @@ from review.context import build_submission_summary
 from review.agent_runs_checks import evaluate_agent_runs_phase5
 from review.downgrade import apply_downgrade_logic, evaluate_loc_phase4
 from review.loc import compute_effective_loc, format_loc_analysis
-from review.phase0 import phase0_to_phase_result, run_phase0
-from review.phases import (
+from review.review_phases import (
     any_phase_failed,
     dicts_to_phase_results,
     dry_run_phase_results,
     ensure_all_phase_results,
     merge_deterministic_phase0,
+    phase0_to_phase_result,
+    run_phase0,
 )
 from review.prompts import (
     FINALIZE_PHASE_INSTRUCTIONS,
@@ -62,6 +62,7 @@ from review.scrape import (
     unavailable_scrape_page_context,
 )
 from review.tools import make_review_tools
+from review.token_budget import estimate_tokens, truncate_text
 
 
 class ReviewState(TypedDict, total=False):
@@ -376,11 +377,12 @@ def unified_review_node(state: ReviewState) -> dict:
         cached_scrape=state.get("scrape_context"),
         cached_holistic=state.get("holistic_check"),
         cached_phase0=phase0_result,
+        config=config,
     )
     llm = ChatAnthropic(
         model=config.review_explore_model,
         api_key=config.anthropic_api_key,
-        max_tokens=8192,
+        max_tokens=config.review_explore_max_output_tokens,
     )
     agent = create_react_agent(llm, tools)
 
@@ -391,20 +393,38 @@ def unified_review_node(state: ReviewState) -> dict:
         "status", "UNKNOWN"
     )
     loc_analysis = phase0_updates.get("loc_analysis", "")
+    panel_cap = config.review_scrape_panel_max_chars
+    phase0_log = truncate_text(
+        phase0_updates.get("phase0_log", ""),
+        config.review_phase0_log_max_chars,
+        label="phase0 log",
+    )
     user_prompt = build_unified_review_user_prompt(
         quest=state["quest"],
         repo_path=str(summary.get("repo_path", repo_path)),
         commit=summary.get("commit"),
-        phase0_log=phase0_updates.get("phase0_log", ""),
+        phase0_log=phase0_log,
         phase0_status=phase0_status,
-        agent_runs=scrape.get("agent_runs", "not available"),
-        related_submissions=scrape.get("related_submissions", "not available"),
+        agent_runs=truncate_text(
+            scrape.get("agent_runs", "not available"),
+            panel_cap,
+            label="agent runs",
+        ),
+        related_submissions=truncate_text(
+            scrape.get("related_submissions", "not available"),
+            panel_cap,
+            label="related submissions",
+        ),
         holistic_check=holistic_section,
         loc_analysis=loc_analysis,
         olympus_min_loc=config.olympus_min_loc,
         mars_min_loc=config.mars_min_loc,
         mars_max_loc=config.mars_max_loc,
         max_tool_steps=config.review_max_tool_steps,
+    )
+    log_activity(
+        f"explore prompt ~{estimate_tokens(user_prompt):,} tokens (est.)",
+        category="review",
     )
 
     log_activity(
@@ -446,7 +466,15 @@ def unified_review_node(state: ReviewState) -> dict:
         f"explore agent finished in {elapsed:.1f}s ({tool_calls} tool calls)",
         category="review",
     )
-    notes = _summarize_explore_messages(messages)
+    notes = _summarize_explore_messages(
+        messages,
+        max_chars=config.review_explore_transcript_max_chars,
+        tool_output_max_chars=config.review_tool_output_max_chars,
+    )
+    log_activity(
+        f"explore transcript ~{estimate_tokens(notes):,} tokens (est.)",
+        category="review",
+    )
     return {
         **phase0_updates,
         "explore_messages": messages,
@@ -476,31 +504,43 @@ def finalize_node(state: ReviewState) -> dict:
     scrape = state.get("scrape_context", {})
 
     phase0_result = state.get("phase_results", {}).get("0", {})
-    human_content = json.dumps(
-        {
-            "quest": quest,
-            "review_url": state.get("review_url", ""),
-            "repo_path": summary.get("repo_path"),
-            "commit": summary.get("commit"),
-            "artifacts": summary.get("artifacts"),
-            "phase0_log": state.get("phase0_log", ""),
-            "phase0_result": phase0_result,
-            "phase_results_so_far": state.get("phase_results", {}),
-            "findings_so_far": state.get("findings", []),
-            "explore_notes": state.get("explore_notes", ""),
-            "holistic_ai_check": build_holistic_check_prompt_section(scrape),
-            "agent_runs": scrape.get("agent_runs", "not available"),
-            "related_submissions": scrape.get(
-                "related_submissions", "not available"
-            ),
-            "force_request_changes": state.get("force_request_changes", False),
-            "loc_analysis": state.get("loc_analysis", ""),
-            "loc_info": state.get("loc_info", {}),
-            "olympus_min_loc": config.olympus_min_loc,
-            "mars_min_loc": config.mars_min_loc,
-            "mars_max_loc": config.mars_max_loc,
-        },
-        indent=2,
+    human_payload = {
+        "quest": quest,
+        "review_url": state.get("review_url", ""),
+        "repo_path": summary.get("repo_path"),
+        "commit": summary.get("commit"),
+        "artifacts": summary.get("artifacts"),
+        "phase0_log": truncate_text(
+            state.get("phase0_log", ""),
+            config.review_phase0_log_max_chars,
+            label="phase0 log",
+        ),
+        "phase0_result": phase0_result,
+        "phase_results_so_far": state.get("phase_results", {}),
+        "findings_so_far": state.get("findings", []),
+        "explore_notes": state.get("explore_notes", ""),
+        "holistic_ai_check": build_holistic_check_prompt_section(scrape),
+        "agent_runs": truncate_text(
+            scrape.get("agent_runs", "not available"),
+            config.review_scrape_panel_max_chars,
+            label="agent runs",
+        ),
+        "related_submissions": truncate_text(
+            scrape.get("related_submissions", "not available"),
+            config.review_scrape_panel_max_chars,
+            label="related submissions",
+        ),
+        "force_request_changes": state.get("force_request_changes", False),
+        "loc_analysis": state.get("loc_analysis", ""),
+        "loc_info": state.get("loc_info", {}),
+        "olympus_min_loc": config.olympus_min_loc,
+        "mars_min_loc": config.mars_min_loc,
+        "mars_max_loc": config.mars_max_loc,
+    }
+    human_content = truncate_text(
+        json.dumps(human_payload, indent=2),
+        config.review_finalize_payload_max_chars,
+        label="finalize payload",
     )
 
     system = (
@@ -508,11 +548,15 @@ def finalize_node(state: ReviewState) -> dict:
         "Evaluate all rubric phases 0–6 and output structured ReviewResult fields.\n"
         f"--- rubric excerpt ---\n{rubric}"
     )
+    log_activity(
+        f"finalize input ~{estimate_tokens(system + human_content):,} tokens (est.)",
+        category="review",
+    )
 
     llm = ChatAnthropic(
         model=config.review_model,
         api_key=config.anthropic_api_key,
-        max_tokens=8192,
+        max_tokens=config.review_finalize_max_output_tokens,
     ).with_structured_output(ReviewResult)
 
     log_activity(
@@ -834,7 +878,12 @@ def _log_agent_message(msg: BaseMessage) -> None:
         )
 
 
-def _summarize_explore_messages(messages: list[BaseMessage], *, max_chars: int = 12_000) -> str:
+def _summarize_explore_messages(
+    messages: list[BaseMessage],
+    *,
+    max_chars: int = 8_000,
+    tool_output_max_chars: int = 600,
+) -> str:
     """Condense the explore transcript for the finalize step.
 
     Human prompts are dropped (phase0 log, rubric, and scrape context are
@@ -854,8 +903,8 @@ def _summarize_explore_messages(messages: list[BaseMessage], *, max_chars: int =
                 parts.append(f"Assistant: {text}")
         elif isinstance(msg, ToolMessage):
             content = msg.content if isinstance(msg.content, str) else str(msg.content)
-            if len(content) > 800:
-                content = content[:800] + "… [tool output truncated]"
+            if len(content) > tool_output_max_chars:
+                content = content[:tool_output_max_chars] + "… [tool output truncated]"
             parts.append(f"Tool[{msg.name or 'tool'}]: {content}")
         else:
             parts.append(str(msg.content))

@@ -1,4 +1,4 @@
-"""Compatibility entry point — delegates to workflow.time_logs."""
+# Time Logs Entry Point
 
 from workflow.time_logs import main
 
