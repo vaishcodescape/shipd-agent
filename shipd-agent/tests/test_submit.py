@@ -9,11 +9,14 @@ from workflow.submit import (
     REASON_FIELD_PATTERN,
     _band_section_headings,
     _ensure_all_band_confidences,
+    _field_near_reason_label,
+    _find_band_reason_js,
     _format_validation_diagnostics,
     _form_validation_issues,
     _looks_like_reason_field,
     _normalize_confidence,
     _normalize_decision,
+    _pick_band_reason_candidate,
     _score_cell_patterns,
     _score_targets,
     submit_review,
@@ -248,6 +251,17 @@ class EnsureAllBandConfidencesTests(unittest.TestCase):
         self.assertEqual(click.call_count, 1)
         self.assertEqual(click.call_args.args[1], "Problem Description")
 
+    def test_skips_when_reader_misses_but_visual_selected(self) -> None:
+        page = MagicMock()
+        page.evaluate.return_value = self._state(None, "high", "low")
+        with patch(
+            "workflow.submit._confidence_visually_selected",
+            side_effect=lambda _page, heading, _conf: heading == "Problem Description",
+        ):
+            with patch("workflow.submit._click_band_confidence") as click:
+                _ensure_all_band_confidences(page, self._ratings(), log=lambda _: None)
+        click.assert_not_called()
+
 
 class LooksLikeReasonFieldTests(unittest.TestCase):
     def test_placeholder_match(self) -> None:
@@ -263,6 +277,65 @@ class LooksLikeReasonFieldTests(unittest.TestCase):
         field = MagicMock()
         field.get_attribute.return_value = ""
         self.assertFalse(_looks_like_reason_field(field))
+
+
+class FindBandReasonJsTests(unittest.TestCase):
+    def test_passes_score_patterns_for_scope_detection(self) -> None:
+        page = MagicMock()
+        page.evaluate.return_value = {"ok": True, "via": "scope"}
+        result = _find_band_reason_js(page, "Problem Description")
+        self.assertTrue(result["ok"])
+        args = page.evaluate.call_args.args[1]
+        self.assertIn("scorePatterns", args)
+        self.assertIn("2 | Minor", args["scorePatterns"])
+        self.assertIn("confidenceTargets", args)
+
+
+class PickBandReasonCandidateTests(unittest.TestCase):
+    def test_prefers_field_with_reason_label(self) -> None:
+        other = MagicMock()
+        reason = MagicMock()
+        with patch("workflow.submit._is_other_notes_field", return_value=False):
+            with patch(
+                "workflow.submit._field_near_reason_label",
+                side_effect=lambda f: f is reason,
+            ):
+                picked = _pick_band_reason_candidate([other, reason])
+        self.assertIs(picked, reason)
+
+    def test_picks_last_textarea_when_ambiguous(self) -> None:
+        input_box = MagicMock()
+        ta1 = MagicMock()
+        ta2 = MagicMock()
+        ta1.evaluate.return_value = "textarea"
+        ta2.evaluate.return_value = "textarea"
+        input_box.evaluate.return_value = "input"
+        with patch("workflow.submit._is_other_notes_field", return_value=False):
+            with patch("workflow.submit._field_near_reason_label", return_value=False):
+                picked = _pick_band_reason_candidate([input_box, ta1, ta2])
+        self.assertIs(picked, ta2)
+
+    def test_single_non_other_candidate(self) -> None:
+        only = MagicMock()
+        with patch("workflow.submit._is_other_notes_field", return_value=False):
+            with patch("workflow.submit._field_near_reason_label", return_value=False):
+                only.evaluate.return_value = "div"
+                picked = _pick_band_reason_candidate([only])
+        self.assertIs(picked, only)
+
+
+class FieldNearReasonLabelTests(unittest.TestCase):
+    def test_detects_reason_required_in_ancestor(self) -> None:
+        field = MagicMock()
+        field.get_attribute.return_value = ""
+        field.evaluate.return_value = True
+        self.assertTrue(_field_near_reason_label(field))
+
+    def test_false_when_no_nearby_label(self) -> None:
+        field = MagicMock()
+        field.get_attribute.return_value = ""
+        field.evaluate.return_value = False
+        self.assertFalse(_field_near_reason_label(field))
 
 
 if __name__ == "__main__":

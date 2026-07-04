@@ -13,6 +13,7 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import create_react_agent
@@ -435,6 +436,11 @@ def unified_review_node(state: ReviewState) -> dict:
     )
     started = time.monotonic()
     messages: list[BaseMessage] = []
+    budget_exhausted = False
+    # Each ReAct tool step spends two graph super-steps (agent node + tools
+    # node), plus one final agent turn with no tool calls: 2N + 1 to finish
+    # a full budget. Headroom covers the prebuilt remaining_steps fallback.
+    recursion_limit = 2 * config.review_max_tool_steps + 5
     try:
         for chunk in agent.stream(
             {
@@ -443,18 +449,36 @@ def unified_review_node(state: ReviewState) -> dict:
                     HumanMessage(content=user_prompt),
                 ]
             },
-            config={"recursion_limit": config.review_max_tool_steps + 5},
+            config={"recursion_limit": recursion_limit},
             stream_mode="values",
         ):
             new_messages = chunk.get("messages", [])
             for msg in new_messages[len(messages):]:
                 _log_agent_message(msg)
             messages = new_messages
+    except GraphRecursionError:
+        # Budget exhausted mid-loop: keep the partial transcript and let
+        # finalize score from what was gathered instead of failing the run.
+        budget_exhausted = True
+        log_activity(
+            "explore budget exhausted (recursion limit "
+            f"{recursion_limit}) — salvaging partial transcript",
+            category="review",
+        )
     except Exception as exc:
         return {
             **phase0_updates,
             "error": f"Explore phase failed: {exc}",
             "explore_notes": f"Unified review agent error: {exc}",
+        }
+
+    if budget_exhausted and not any(
+        isinstance(m, AIMessage) for m in messages
+    ):
+        return {
+            **phase0_updates,
+            "error": "Explore phase hit the recursion limit before any agent output.",
+            "explore_notes": "Unified review agent produced no messages.",
         }
 
     elapsed = time.monotonic() - started
@@ -471,6 +495,13 @@ def unified_review_node(state: ReviewState) -> dict:
         max_chars=config.review_explore_transcript_max_chars,
         tool_output_max_chars=config.review_tool_output_max_chars,
     )
+    if budget_exhausted:
+        notes = (
+            "WARNING: the explore agent ran out of its tool-step budget before "
+            "writing final notes; below is a partial transcript. Score phases "
+            "from the evidence present and use lower confidence where coverage "
+            "is missing.\n\n" + notes
+        )
     log_activity(
         f"explore transcript ~{estimate_tokens(notes):,} tokens (est.)",
         category="review",

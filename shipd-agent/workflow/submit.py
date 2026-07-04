@@ -352,9 +352,29 @@ _JS_FIND_BAND_REASON = """
     return { ok: false, reason: 'band label not found: ' + args.heading };
   }
 
-  const scoreCellPatterns = (args.scoreCellPatterns || []).map(norm);
+  const scorePatterns = (args.scorePatterns || []).map(norm);
+  const confidenceTargets = (args.confidenceTargets || []).map(norm);
   const matchesScoreText = (text) =>
-    /^[0-3]\\s*\\|/.test(text) || scoreCellPatterns.includes(text);
+    scorePatterns.some((p) => text === p || text.startsWith(p));
+  const isInteractive = (el) => {
+    if (!el || !el.getAttribute) return false;
+    const tag = el.tagName ? el.tagName.toLowerCase() : '';
+    const role = el.getAttribute('role') || '';
+    if (tag === 'button' || tag === 'a' || tag === 'label' ||
+        ['button', 'radio', 'checkbox', 'tab', 'option'].includes(role)) {
+      return true;
+    }
+    if (el.getAttribute('tabindex') === '0') return true;
+    return window.getComputedStyle(el).cursor === 'pointer';
+  };
+  const closestClickable = (el) => {
+    let node = el;
+    while (node && node !== document.body) {
+      if (isInteractive(node)) return node;
+      node = node.parentElement;
+    }
+    return el;
+  };
   const fieldSelector =
     'textarea, [contenteditable="true"], [role="textbox"], input[type="text"]';
   const isOtherNotesField = (t) => {
@@ -371,52 +391,93 @@ _JS_FIND_BAND_REASON = """
       let node = el.parentElement;
       for (let d = 0; d < 6 && node; d++) {
         const text = (node.innerText || node.textContent || '').toLowerCase();
-        if (text.includes('reason required')) return true;
+        if (text.includes('reason required') || reasonPattern.test(text)) {
+          return true;
+        }
         node = node.parentElement;
       }
       return false;
     });
     if (nearRequired) return nearRequired;
-    return visible.length === 1 ? visible[0] : null;
+    if (visible.length === 1) return visible[0];
+    const textareas = visible.filter(
+      (el) => (el.tagName || '').toLowerCase() === 'textarea'
+    );
+    if (textareas.length === 1) return textareas[0];
+    if (textareas.length > 1) return textareas[textareas.length - 1];
+    return null;
+  };
+  const scopeFromLabel = (label) => {
+    let node = label.parentElement;
+    while (node && node !== document.body) {
+      const scoreLeaves = leafMost(
+        Array.from(node.querySelectorAll('*'))
+          .filter((el) =>
+            isVisible(el) && matchesScoreText(norm(el.innerText))
+          )
+      );
+      const scoreClickables = [];
+      for (const el of scoreLeaves) {
+        const cell = closestClickable(el);
+        if (!scoreClickables.includes(cell)) scoreClickables.push(cell);
+      }
+      if (scoreClickables.length >= 4) {
+        let scope = node;
+        const parent = node.parentElement;
+        if (parent && parent !== document.body) {
+          const parentScoreLeaves = leafMost(
+            Array.from(parent.querySelectorAll('*'))
+              .filter((el) =>
+                isVisible(el) && matchesScoreText(norm(el.innerText))
+              )
+          );
+          const parentScoreClickables = [];
+          for (const el of parentScoreLeaves) {
+            const cell = closestClickable(el);
+            if (!parentScoreClickables.includes(cell)) {
+              parentScoreClickables.push(cell);
+            }
+          }
+          const confInParent = leafMost(
+            Array.from(parent.querySelectorAll('*'))
+              .filter((el) => {
+                if (!isVisible(el)) return false;
+                const t = norm(el.innerText);
+                return confidenceTargets.includes(t) || t === 'medium';
+              })
+          );
+          if (parentScoreClickables.length >= 4 && confInParent.length >= 3) {
+            scope = parent;
+          }
+        }
+        return scope;
+      }
+      node = node.parentElement;
+    }
+    return null;
+  };
+  const findBandScope = () => {
+    for (const label of labels) {
+      const scope = scopeFromLabel(label);
+      if (scope) return scope;
+    }
+    return null;
   };
 
-  const label = labels[0];
-  let scopeNode = label.parentElement;
-  while (scopeNode && scopeNode !== document.body) {
-    const scoreButtons = leafMost(
-      Array.from(scopeNode.querySelectorAll('*'))
-        .filter((el) =>
-          isVisible(el) && matchesScoreText(norm(el.innerText))
-        )
+  const scope = findBandScope();
+  if (scope) {
+    const chosen = pickReasonField(
+      Array.from(scope.querySelectorAll(fieldSelector))
     );
-    if (scoreButtons.length >= 4 && scoreButtons.length <= 6) {
-      let scope = scopeNode;
-      const parent = scopeNode.parentElement;
-      if (parent && parent !== document.body) {
-        const parentScores = leafMost(
-          Array.from(parent.querySelectorAll('*'))
-            .filter((el) =>
-              isVisible(el) && matchesScoreText(norm(el.innerText))
-            )
-        );
-        if (parentScores.length >= 4 && parentScores.length <= 6) {
-          scope = parent;
-        }
-      }
-      const chosen = pickReasonField(
-        Array.from(scope.querySelectorAll(fieldSelector))
-      );
-      if (chosen) {
-        chosen.setAttribute(MARK, '1');
-        return {
-          ok: true,
-          placeholder: chosen.placeholder || chosen.getAttribute('placeholder') || '',
-          tag: chosen.tagName,
-          via: 'scope',
-        };
-      }
+    if (chosen) {
+      chosen.setAttribute(MARK, '1');
+      return {
+        ok: true,
+        placeholder: chosen.placeholder || chosen.getAttribute('placeholder') || '',
+        tag: chosen.tagName,
+        via: 'scope',
+      };
     }
-    scopeNode = scopeNode.parentElement;
   }
 
   const label2 = labels[0];
@@ -706,8 +767,15 @@ _JS_FORM_VALIDATION_STATE = """
     return text.length <= headingNorm.length + 8;
   };
   const scoreCellPatterns = (args.scoreCellPatterns || []).map(norm);
-  const matchesScoreCell = (text) =>
-    /^[0-3]\\s*\\|/.test(text) || scoreCellPatterns.includes(text);
+  // Match _JS_VERIFY_BAND_SCORES: score cells often render digit and label as
+  // separate child elements, so full-cell patterns alone miss the scope row.
+  const matchesScoreText = (text) =>
+    scorePatterns.some((p) => text === p || text.startsWith(p));
+  const normalizeConfidenceText = (text) => {
+    const t = norm(text);
+    if (t === 'med' || t === 'medium') return 'medium';
+    return t;
+  };
   const closestClickable = (el) => {
     let node = el;
     while (node && node !== document.body) {
@@ -758,39 +826,58 @@ _JS_FORM_VALIDATION_STATE = """
         .filter((el) => isVisible(el) && norm(el.innerText) === headingNorm)
     );
     if (!labels.length) return null;
-    const label = labels[0];
-    let node = label.parentElement;
-    while (node && node !== document.body) {
-      const scoreButtons = leafMost(
-        Array.from(node.querySelectorAll('*'))
-          .filter((el) =>
-            isVisible(el) && matchesScoreCell(norm(el.innerText))
-          )
-      );
-      if (scoreButtons.length >= 4 && scoreButtons.length <= 6) {
-        let scope = node;
-        const parent = node.parentElement;
-        if (parent && parent !== document.body) {
-          const parentScores = leafMost(
-            Array.from(parent.querySelectorAll('*'))
-              .filter((el) =>
-                isVisible(el) && matchesScoreCell(norm(el.innerText))
-              )
-          );
-          const confInParent = leafMost(
-            Array.from(parent.querySelectorAll('*'))
-              .filter((el) =>
-                isVisible(el) && confidenceTargets.includes(norm(el.innerText))
-              )
-          );
-          if (parentScores.length >= 4 && parentScores.length <= 6 &&
-              confInParent.length >= 3) {
-            scope = parent;
-          }
+    const scopeFromLabel = (label) => {
+      let node = label.parentElement;
+      while (node && node !== document.body) {
+        const scoreLeaves = leafMost(
+          Array.from(node.querySelectorAll('*'))
+            .filter((el) =>
+              isVisible(el) && matchesScoreText(norm(el.innerText))
+            )
+        );
+        const scoreClickables = [];
+        for (const el of scoreLeaves) {
+          const cell = closestClickable(el);
+          if (!scoreClickables.includes(cell)) scoreClickables.push(cell);
         }
-        return scope;
+        if (scoreClickables.length >= 4) {
+          let scope = node;
+          const parent = node.parentElement;
+          if (parent && parent !== document.body) {
+            const parentScoreLeaves = leafMost(
+              Array.from(parent.querySelectorAll('*'))
+                .filter((el) =>
+                  isVisible(el) && matchesScoreText(norm(el.innerText))
+                )
+            );
+            const parentScoreClickables = [];
+            for (const el of parentScoreLeaves) {
+              const cell = closestClickable(el);
+              if (!parentScoreClickables.includes(cell)) {
+                parentScoreClickables.push(cell);
+              }
+            }
+            const confInParent = leafMost(
+              Array.from(parent.querySelectorAll('*'))
+                .filter((el) => {
+                  if (!isVisible(el)) return false;
+                  const t = norm(el.innerText);
+                  return confidenceTargets.includes(t) || t === 'medium';
+                })
+            );
+            if (parentScoreClickables.length >= 4 && confInParent.length >= 3) {
+              scope = parent;
+            }
+          }
+          return scope;
+        }
+        node = node.parentElement;
       }
-      node = node.parentElement;
+      return null;
+    };
+    for (const label of labels) {
+      const scope = scopeFromLabel(label);
+      if (scope) return scope;
     }
     return null;
   };
@@ -872,7 +959,7 @@ _JS_FORM_VALIDATION_STATE = """
     const scoreNodes = leafMost(
       Array.from(scope.querySelectorAll('*'))
         .filter((el) =>
-          isVisible(el) && matchesScoreCell(norm(el.innerText))
+          isVisible(el) && matchesScoreText(norm(el.innerText))
         )
     );
     for (const el of scoreNodes) {
@@ -895,14 +982,16 @@ _JS_FORM_VALIDATION_STATE = """
     let confidence = null;
     const confNodes = leafMost(
       Array.from(scope.querySelectorAll('*'))
-        .filter((el) =>
-          isVisible(el) && confidenceTargets.includes(norm(el.innerText))
-        )
+        .filter((el) => {
+          if (!isVisible(el)) return false;
+          const t = norm(el.innerText);
+          return confidenceTargets.includes(t) || t === 'medium';
+        })
     );
     for (const el of confNodes) {
       const text = norm(el.innerText);
       if (isNodeSelected(el)) {
-        confidence = text === 'med' ? 'medium' : text;
+        confidence = normalizeConfidenceText(text);
         break;
       }
     }
@@ -914,8 +1003,7 @@ _JS_FORM_VALIDATION_STATE = """
       }
       const outlier = styleOutlier(confCells);
       if (outlier) {
-        const text = norm(outlier.innerText);
-        confidence = text === 'med' ? 'medium' : text;
+        confidence = normalizeConfidenceText(norm(outlier.innerText));
       }
     }
 
@@ -979,8 +1067,13 @@ _JS_FORM_VALIDATION_STATE = """
   const submitButtons = Array.from(document.body.querySelectorAll('button'))
     .filter((el) => isVisible(el) &&
       /^submit(\\s+review)?$/i.test(norm(el.innerText)));
-  if (submitButtons.length) {
-    let node = submitButtons[0].parentElement;
+  // The form opener ("Submit Review") matches this pattern too and sits
+  // above the form; the real in-form Submit renders last in the DOM.
+  const submitButton = submitButtons.length
+    ? submitButtons[submitButtons.length - 1]
+    : null;
+  if (submitButton) {
+    let node = submitButton.parentElement;
     for (let depth = 0; depth < 4 && node; depth++) {
       const text = (node.innerText || '').trim();
       if (/before submitting|add a reason|score all three|confidence|author note/i.test(text)) {
@@ -994,9 +1087,7 @@ _JS_FORM_VALIDATION_STATE = """
     }
   }
 
-  const submitDisabled = submitButtons.length
-    ? !!submitButtons[0].disabled
-    : true;
+  const submitDisabled = submitButton ? !!submitButton.disabled : true;
 
   return { bands, decision, authorNoteLen, submitHint, submitDisabled };
 }
@@ -1609,15 +1700,17 @@ def _click_selectable(
 ) -> None:
     """Click a toggle/segmented control and verify the selection registered.
 
-    Skips the click only when aria/data-state already marks the target selected
-    (score cells behave like toggles — a second click can deselect). Retries
-    until the selected state is observed or attempts are exhausted.
+    Skips the click when aria/data-state or visible styling already marks the
+    target selected (score cells behave like toggles — a second click can
+    deselect). Retries until the selected state is observed or attempts are
+    exhausted.
     """
     info = _find_and_mark(
         page,
         targets,
         scope_heading=scope_heading,
         match=match,
+        check_visual=True,
         require_interactive=require_interactive,
     )
     if not info.get("ok"):
@@ -1723,33 +1816,55 @@ def _find_band_reason_js(page: Page, heading: str) -> dict[str, Any]:
         {
             "heading": heading,
             "sectionHeadings": _band_section_headings(),
-            "scoreCellPatterns": _score_cell_patterns(),
+            "scorePatterns": _score_patterns(),
+            "confidenceTargets": list(CONFIDENCE_UI.values()),
         },
     )
 
 
-def _wait_band_reason_field(page: Page, heading: str) -> Locator | None:
-    """Locate the per-band reason input after scoring below 3."""
-    try:
-        section = _band_section(page, heading)
-    except (RuntimeError, PlaywrightTimeoutError):
-        return None
-    field = section.get_by_placeholder(REASON_FIELD_PATTERN)
-    if field.count():
-        return field.first
-    reason_label = section.get_by_text(REASON_FIELD_PATTERN)
-    if reason_label.count():
-        container = reason_label.first.locator("xpath=ancestor::*[position()<=5]")
-        for i in range(container.count()):
-            block = container.nth(i)
-            for selector in ("textarea", "[contenteditable='true']", "[role='textbox']"):
-                candidate = block.locator(selector)
-                if candidate.count():
-                    try:
-                        if candidate.first.is_visible():
-                            return candidate.first
-                    except PlaywrightTimeoutError:
-                        continue
+def _wait_band_reason_field(
+    page: Page,
+    heading: str,
+    *,
+    timeout_ms: int = 4_000,
+) -> Locator | None:
+    """Wait for the per-band reason input after scoring below 3."""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        field = _find_band_reason_playwright(page, heading)
+        if field is not None:
+            return field
+        try:
+            section = _band_section(page, heading)
+        except (RuntimeError, PlaywrightTimeoutError):
+            page.wait_for_timeout(200)
+            continue
+        field = section.get_by_placeholder(REASON_FIELD_PATTERN)
+        if field.count():
+            try:
+                if field.first.is_visible():
+                    return field.first
+            except PlaywrightTimeoutError:
+                pass
+        reason_label = section.get_by_text(REASON_FIELD_PATTERN)
+        if reason_label.count():
+            container = reason_label.first.locator("xpath=ancestor::*[position()<=5]")
+            for i in range(container.count()):
+                block = container.nth(i)
+                for selector in (
+                    "textarea",
+                    "[contenteditable='true']",
+                    "[role='textbox']",
+                    "input[type='text']",
+                ):
+                    candidate = block.locator(selector)
+                    if candidate.count():
+                        try:
+                            if candidate.first.is_visible():
+                                return candidate.first
+                        except PlaywrightTimeoutError:
+                            continue
+        page.wait_for_timeout(250)
     return None
 
 
@@ -1774,6 +1889,56 @@ def _looks_like_reason_field(field: Locator) -> bool:
     return bool(REASON_FIELD_PATTERN.search(combined))
 
 
+def _field_near_reason_label(field: Locator) -> bool:
+    """True when ancestor/sibling text marks this as the band reason input."""
+    if _looks_like_reason_field(field):
+        return True
+    try:
+        return bool(
+            field.evaluate(
+                """(el) => {
+                  const reasonPattern =
+                    /below\\s*3|what kept it|one line|reason required|reason|explain why|required when|not clean|score.*below/i;
+                  let node = el.parentElement;
+                  for (let d = 0; d < 6 && node; d++) {
+                    const text = (node.innerText || node.textContent || '')
+                      .toLowerCase();
+                    if (text.length > 0 && text.length < 500 &&
+                        (text.includes('reason required') ||
+                         reasonPattern.test(text))) {
+                      return true;
+                    }
+                    node = node.parentElement;
+                  }
+                  return false;
+                }"""
+            )
+        )
+    except PlaywrightTimeoutError:
+        return False
+
+
+def _pick_band_reason_candidate(candidates: list[Locator]) -> Locator | None:
+    """Choose the band reason field from visible inputs in a band section."""
+    non_other = [c for c in candidates if not _is_other_notes_field(c)]
+    for candidate in non_other:
+        if _field_near_reason_label(candidate):
+            return candidate
+    if len(non_other) == 1:
+        return non_other[0]
+    textareas = [
+        c
+        for c in non_other
+        if (c.evaluate("el => (el.tagName || '').toLowerCase()") or "")
+        == "textarea"
+    ]
+    if len(textareas) == 1:
+        return textareas[0]
+    if len(textareas) > 1:
+        return textareas[-1]
+    return None
+
+
 def _find_band_reason_playwright(page: Page, heading: str) -> Locator | None:
     """Playwright fallback when JS band-reason discovery fails."""
     try:
@@ -1781,27 +1946,24 @@ def _find_band_reason_playwright(page: Page, heading: str) -> Locator | None:
     except (RuntimeError, PlaywrightTimeoutError):
         return None
 
-    selectors = ("textarea", "[contenteditable='true']", "[role='textbox']")
+    selectors = (
+        "textarea",
+        "[contenteditable='true']",
+        "[role='textbox']",
+        "input[type='text']",
+    )
     candidates: list[Locator] = []
     for selector in selectors:
-        for i in range(section.locator(selector).count()):
-            candidate = section.locator(selector).nth(i)
+        locator = section.locator(selector)
+        for i in range(locator.count()):
+            candidate = locator.nth(i)
             try:
                 if candidate.is_visible():
                     candidates.append(candidate)
             except PlaywrightTimeoutError:
                 continue
 
-    for candidate in candidates:
-        if _is_other_notes_field(candidate):
-            continue
-        if _looks_like_reason_field(candidate):
-            return candidate
-
-    non_other = [c for c in candidates if not _is_other_notes_field(c)]
-    if len(non_other) == 1:
-        return non_other[0]
-    return None
+    return _pick_band_reason_candidate(candidates)
 
 
 def _band_form_snapshot(
@@ -1926,20 +2088,20 @@ def _fill_band(
     _click_band_confidence(page, heading, str(confidence), log=log)
 
     if score < 3:
-        page.wait_for_timeout(400)
-        for attempt in range(1, 4):
+        page.wait_for_timeout(600)
+        for attempt in range(1, 5):
             info = _find_band_reason_js(page, heading)
             if info.get("ok"):
                 _unmark(page)
                 break
-            if _wait_band_reason_field(page, heading) is not None:
+            if _wait_band_reason_field(page, heading, timeout_ms=1_500) is not None:
                 break
             log(
                 f"submit: {heading} reason field not visible after score {score} "
-                f"(attempt {attempt}/3) — re-clicking score"
+                f"(attempt {attempt}/4) — re-clicking score"
             )
             _click_band_score(page, heading, score, log=log)
-            page.wait_for_timeout(500)
+            page.wait_for_timeout(800)
         _fill_band_reason(
             page,
             heading,
@@ -2014,6 +2176,25 @@ def _fill_band_reason(
     )
 
 
+def _confidence_visually_selected(
+    page: Page,
+    heading: str,
+    confidence: str,
+) -> bool:
+    """True when the band confidence segment looks selected in the DOM."""
+    ui_label = CONFIDENCE_UI[_normalize_confidence(confidence)]
+    info = _find_and_mark(
+        page,
+        [ui_label],
+        scope_heading=heading,
+        check_visual=True,
+        require_interactive=True,
+    )
+    selected = bool(info.get("selected"))
+    _unmark(page)
+    return selected
+
+
 def _ensure_all_band_confidences(
     page: Page,
     band_ratings: dict[str, Any],
@@ -2035,6 +2216,12 @@ def _ensure_all_band_confidences(
         expected = _normalize_confidence(str(confidence))
         snapshot = bands_by_heading.get(heading) or {}
         if snapshot.get("confidence") == expected:
+            continue
+        if _confidence_visually_selected(page, heading, str(confidence)):
+            log(
+                f"submit: {heading} confidence {CONFIDENCE_UI[expected]} "
+                "already selected visually — skipping"
+            )
             continue
         _click_band_confidence(page, heading, str(confidence), log=log)
 
@@ -2083,7 +2270,9 @@ def _fill_band_reasons(
 
         info = _find_band_reason_js(page, heading)
         if not info.get("ok"):
-            field = _find_band_reason_playwright(page, heading)
+            field = _wait_band_reason_field(page, heading, timeout_ms=2_000)
+            if field is None:
+                field = _find_band_reason_playwright(page, heading)
             if field is None:
                 candidates = info.get("candidates")
                 detail = info.get("reason", "unknown")
@@ -2225,8 +2414,55 @@ def _set_downgrade_to_mars(
             log(f"submit: WARNING downgrade-to-Mars control not found: {exc}")
 
 
-def _submit_button(page: Page):
-    return page.get_by_role("button", name=SUBMIT_BUTTON_PATTERN)
+def _submit_button(page: Page) -> Locator | None:
+    """The in-form Submit button, or None when no visible match exists.
+
+    The form opener ("Submit Review") matches SUBMIT_BUTTON_PATTERN too and
+    can stay visible above the open form; the real in-form Submit renders
+    after the form content, so prefer the last visible match over the first.
+    """
+    buttons = page.get_by_role("button", name=SUBMIT_BUTTON_PATTERN)
+    candidate: Locator | None = None
+    for i in range(buttons.count()):
+        button = buttons.nth(i)
+        try:
+            if button.is_visible():
+                candidate = button
+        except PlaywrightTimeoutError:
+            continue
+    return candidate
+
+
+def _submit_form_open(page: Page) -> bool:
+    """True while the submit-review form (decision cards) is on the page."""
+    return any(
+        page.get_by_text(marker, exact=True).count()
+        for marker in SUBMIT_FORM_MARKERS
+    )
+
+
+def _confirm_submit_dialog(page: Page, *, log: LogFn = _noop_log) -> bool:
+    """Click the confirm button if Shipd raised a dialog after Submit."""
+    dialogs = page.locator("[role='dialog'], [role='alertdialog']")
+    for i in range(dialogs.count()):
+        dialog = dialogs.nth(i)
+        try:
+            if not dialog.is_visible():
+                continue
+            confirm = dialog.get_by_role(
+                "button", name=re.compile(r"^(confirm|submit|yes)", re.I)
+            )
+            if (
+                confirm.count()
+                and confirm.first.is_visible()
+                and confirm.first.is_enabled()
+            ):
+                confirm.first.click()
+                log("submit: confirmed submission dialog")
+                return True
+        except PlaywrightTimeoutError:
+            continue
+    return False
 
 
 def _on_review_page(page: Page) -> bool:
@@ -2248,8 +2484,13 @@ def _wait_submit_enabled(
         if not _on_review_page(page):
             log("submit: left review page while waiting for Submit button")
             return False
+        if not _submit_form_open(page):
+            # Only the opener can match now — don't treat it as the form's
+            # Submit button.
+            log("submit: review form closed while waiting for Submit button")
+            return False
         button = _submit_button(page)
-        if button.count() and button.first.is_visible() and button.first.is_enabled():
+        if button is not None and button.is_enabled():
             return True
         if band_ratings is not None and review is not None:
             state = _read_form_state(page)
@@ -2266,7 +2507,12 @@ def _wait_submit_enabled(
     return False
 
 
-def _wait_submit_confirmation(page: Page, *, timeout_sec: float = 20.0) -> str:
+def _wait_submit_confirmation(
+    page: Page,
+    *,
+    timeout_sec: float = 20.0,
+    log: LogFn = _noop_log,
+) -> str:
     """After clicking Submit, wait for evidence the review was accepted.
 
     Returns "confirmed" when the form is gone (navigation or re-render) or a
@@ -2282,12 +2528,17 @@ def _wait_submit_confirmation(page: Page, *, timeout_sec: float = 20.0) -> str:
             return "confirmed"
         if success_text.count():
             return "confirmed"
+        # A confirm dialog keeps the form visible until acknowledged.
+        _confirm_submit_dialog(page, log=log)
+        # Form gone (decision cards unmounted) is the strongest signal the
+        # submission went through — the opener button may still be visible.
+        if not _submit_form_open(page):
+            return "confirmed"
         button = _submit_button(page)
-        if not button.count():
+        if button is None:
             return "confirmed"
         try:
-            first = button.first
-            if not first.is_visible() or not first.is_enabled():
+            if not button.is_enabled():
                 return "confirmed"
         except PlaywrightTimeoutError:
             return "confirmed"
@@ -2320,12 +2571,23 @@ def _finalize_submission(
             + ". Check the failure snapshot in logs/debug-submit."
         )
 
-    button = _submit_button(page).first
+    button = _submit_button(page)
+    if button is None:
+        raise RuntimeError(
+            "Submit Review button disappeared after form validation — "
+            "check the failure snapshot in logs/debug-submit."
+        )
     button.scroll_into_view_if_needed()
-    button.click()
+    try:
+        button.click(timeout=10_000)
+    except PlaywrightTimeoutError:
+        # Sticky footers/toasts can intercept the pointer; force skips the
+        # actionability wait but still sends trusted events.
+        log("submit: click intercepted — retrying with force")
+        button.click(timeout=5_000, force=True)
     log("submit: Submit Review clicked; waiting for confirmation")
 
-    outcome = _wait_submit_confirmation(page)
+    outcome = _wait_submit_confirmation(page, log=log)
     if outcome == "confirmed":
         log("submit: review submission confirmed")
         return True
@@ -2333,6 +2595,7 @@ def _finalize_submission(
         "submit: WARNING could not confirm submission "
         "(Submit button still enabled after 20s)"
     )
+    capture_failure(page, "submit-unconfirmed", log=log)
     return False
 
 
