@@ -156,8 +156,7 @@ activemq-data/
 .venv
 
 # Playwright auth state
-auth/
-auth-session/
+/auth-jwt/
 submissions/
 reviews/
 node_modules/
