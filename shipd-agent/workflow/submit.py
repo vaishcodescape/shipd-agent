@@ -1,10 +1,4 @@
 # Fill and submit the Shipd review form from a structured review dict.
-#
-# Strategy: Shipd's form controls (decision cards, band score cells,
-# confidence segments, tag chips) are custom React components that are not
-# reliably exposed as ARIA buttons. Elements are located in the DOM by
-# normalized innerText with JavaScript, marked with a data attribute, then
-# clicked through Playwright so the app receives trusted pointer events.
 
 from __future__ import annotations
 
@@ -74,7 +68,18 @@ OPEN_SUBMIT_BUTTONS = (
     "Write review",
 )
 
-SUBMIT_BUTTON_PATTERN = re.compile(r"^Submit( Review)?$", re.I)
+SUBMIT_BUTTON_PATTERN = re.compile(r"^Submit( Review| feedback)?$", re.I)
+SUBMIT_MARK_ATTR = "data-shipd-agent-submit"
+SUBMIT_MARK_SELECTOR = f"[{SUBMIT_MARK_ATTR}='1']"
+BAND_SCOPE_ATTR = "data-shipd-agent-band-scope"
+BAND_SCOPE_SELECTOR = f"[{BAND_SCOPE_ATTR}='1']"
+BAND_CELL_ATTR = "data-shipd-agent-cell"
+BAND_CELL_SELECTOR = f"[{BAND_CELL_ATTR}='1']"
+
+# Fixed rubric-band order the form always renders. Positional locators map a
+# band heading to its index in this list.
+BAND_ORDER = ("problem", "tests", "solution")
+CONFIDENCE_INDEX = ("low", "medium", "high")
 
 OTHER_NOTES_PATTERN = re.compile(
     r"outside the rubric|sent to the author|internal note",
@@ -88,6 +93,174 @@ REASON_FIELD_PATTERN = re.compile(
 )
 
 CONFIDENCE_LABELS = ("Low", "Med", "High")
+
+# Shipd review form: bg-card shell > div.p-6.pt-0.space-y-6 (inner content).
+_JS_FORM_ROOT_HELPERS = """
+  const findReviewFormRoot = (formMarkers, submitPattern) => {
+    const markerNorms = (formMarkers || []).map(norm);
+    const submitRe = submitPattern || /^submit(\\s+(review|feedback))?$/i;
+    const hasFormContent = (root) => {
+      if (!root || !isVisible(root)) return false;
+      const text = norm(root.innerText || '');
+      const hasMarker = markerNorms.some((m) => text.includes(m));
+      const hasSubmit = Array.from(root.querySelectorAll('button'))
+        .some((el) => isVisible(el) && submitRe.test(norm(el.innerText)));
+      const hasDecision = Array.from(root.querySelectorAll('*'))
+        .some((el) => isVisible(el) && norm(el.innerText).startsWith('approve'));
+      return hasMarker && hasSubmit && hasDecision;
+    };
+    const cards = Array.from(
+      document.querySelectorAll('div.bg-card.text-card-foreground')
+    );
+    for (const card of cards) {
+      if (!isVisible(card)) continue;
+      const inner =
+        card.querySelector('div.p-6.pt-0.space-y-6') ||
+        card.querySelector('div.space-y-6');
+      if (inner && hasFormContent(inner)) return inner;
+      if (hasFormContent(card)) return card;
+    }
+    for (const marker of markerNorms) {
+      const hits = Array.from(document.body.querySelectorAll('*'))
+        .filter((el) => isVisible(el) && norm(el.innerText) === marker);
+      for (const hit of hits) {
+        let node = hit;
+        while (node && node !== document.body) {
+          if (hasFormContent(node)) return node;
+          node = node.parentElement;
+        }
+      }
+    }
+    return null;
+  };
+"""
+
+# Scope each band by heading-to-next-heading DOM range
+_JS_BAND_RANGE_HELPERS = """
+  const formSearchRoot = () =>
+    (typeof documentRoot !== 'undefined' ? documentRoot : document.body);
+  const isSectionHeading = (el, headingNorm) => {
+    if (!isVisible(el) || norm(el.innerText) !== headingNorm) return false;
+    const tag = el.tagName ? el.tagName.toLowerCase() : '';
+    const role = el.getAttribute('role') || '';
+    if (/^h[1-6]$/.test(tag) || role === 'heading') return true;
+    const text = norm(el.innerText);
+    return text.length <= headingNorm.length + 8;
+  };
+  const bandRangeContext = (headingNorm, sectionHeadings) => {
+    const searchRoot = formSearchRoot();
+    const labels = leafMost(
+      Array.from(searchRoot.querySelectorAll('*'))
+        .filter((el) => isVisible(el) && norm(el.innerText) === headingNorm)
+    );
+    if (!labels.length) {
+      return { label: null, nextSection: null, inBandRange: () => false };
+    }
+    const label = labels[0];
+    const headingList = (sectionHeadings || []).map(norm);
+    const allSections = leafMost(
+      Array.from(searchRoot.querySelectorAll('*'))
+        .filter((el) =>
+          headingList.some((h) => isSectionHeading(el, h))
+        )
+    ).sort((a, b) =>
+      (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1
+    );
+    const startIdx = allSections.findIndex((el) => el === label);
+    const nextSection = startIdx >= 0 ? allSections[startIdx + 1] : null;
+    const inBandRange = (el) => {
+      if (!(label.compareDocumentPosition(el) &
+          Node.DOCUMENT_POSITION_FOLLOWING)) {
+        return false;
+      }
+      if (nextSection && (nextSection.compareDocumentPosition(el) &
+          Node.DOCUMENT_POSITION_FOLLOWING)) {
+        return false;
+      }
+      return true;
+    };
+    return { label, nextSection, inBandRange };
+  };
+  const bandScopeFromRange = (
+    headingNorm,
+    sectionHeadings,
+    scoreCellPatterns,
+    confidenceTargets
+  ) => {
+    const searchRoot = formSearchRoot();
+    const patterns = (scoreCellPatterns || []).map(norm);
+    const confTargets = (confidenceTargets || []).map(norm);
+    const isScoreDigitCell = (text) => /^[0-3]$/.test(text);
+    const matchesScoreText = (text) => {
+      if (!text) return false;
+      if (isScoreDigitCell(text)) return true;
+      return patterns.some((p) => text === p || text.startsWith(p));
+    };
+    const dedupeClickables = (leaves) => {
+      const cells = [];
+      for (const el of leaves) {
+        const cell = closestClickable(el);
+        if (!cells.includes(cell)) cells.push(cell);
+      }
+      return cells;
+    };
+    const scoreCellsIn = (root) =>
+      dedupeClickables(leafMost(
+        Array.from(root.querySelectorAll('*'))
+          .filter((el) => isVisible(el) && matchesScoreText(norm(el.innerText)))
+      ));
+    const confCellsIn = (root) =>
+      dedupeClickables(leafMost(
+        Array.from(root.querySelectorAll('*'))
+          .filter((el) => {
+            if (!isVisible(el)) return false;
+            const t = norm(el.innerText);
+            return confTargets.includes(t) || t === 'medium';
+          })
+      ));
+    // Walk up from each band label to the smallest ancestor holding this
+    // band's four score cells, then expand once to a parent that also holds
+    // its three confidence cells. Containment keeps the scope inside the band
+    // without depending on fragile document-order section boundaries, and
+    // trying every matching label tolerates a duplicate heading elsewhere on
+    // the page (e.g. "Tests" appearing in rendered review text).
+    const scopeFromLabel = (label) => {
+      let node = label.parentElement;
+      while (node && node !== document.body) {
+        const nodeScoreCount = scoreCellsIn(node).length;
+        if (nodeScoreCount >= 4) {
+          let scope = node;
+          // Expand to the parent ONLY to pull in this band's confidence cells
+          // when they live in a sibling of the score row. Never expand once the
+          // node already holds this band's confidence cells, and never when the
+          // parent introduces MORE score cells — a growing count means the
+          // parent spans a neighbouring band, which would collapse every band
+          // onto one shared scope (all bands then read the first band's score).
+          if (confCellsIn(node).length < 3) {
+            const parent = node.parentElement;
+            if (parent && parent !== document.body &&
+                scoreCellsIn(parent).length === nodeScoreCount &&
+                confCellsIn(parent).length >= 3) {
+              scope = parent;
+            }
+          }
+          return scope;
+        }
+        node = node.parentElement;
+      }
+      return null;
+    };
+    const labels = leafMost(
+      Array.from(searchRoot.querySelectorAll('*'))
+        .filter((el) => isVisible(el) && norm(el.innerText) === headingNorm)
+    );
+    for (const label of labels) {
+      const scope = scopeFromLabel(label);
+      if (scope) return scope;
+    }
+    return null;
+  };
+"""
 
 # Find a clickable element by normalized innerText, optionally scoped to the
 # nearest container around a label (band heading), and mark it for Playwright.
@@ -171,34 +344,35 @@ _JS_FIND_AND_MARK = """
     return false;
   };
 
+  const leafMost = (elements) =>
+    elements.filter(
+      (el) => !elements.some((o) => o !== el && el.contains(o))
+    );
+  const closestClickable = (el) => {
+    let node = el;
+    while (node && node !== document.body) {
+      if (isInteractive(node)) return node;
+      node = node.parentElement;
+    }
+    return el;
+  };
+""" + _JS_BAND_RANGE_HELPERS + """
+  const findBandScope = (headingNorm) =>
+    bandScopeFromRange(
+      headingNorm,
+      args.sectionHeadings || [],
+      args.scoreCellPatterns || [],
+      args.confidenceTargets || []
+    );
+
   let scopes = [document.body];
   if (args.scopeHeading) {
     const headingNorm = norm(args.scopeHeading);
-    let labels = Array.from(document.body.querySelectorAll('*'))
-      .filter((el) => isVisible(el) && norm(el.innerText) === headingNorm);
-    labels = labels.filter(
-      (el) => !labels.some((o) => o !== el && el.contains(o))
-    );
-    if (!labels.length) {
-      return { ok: false, reason: 'label not found: ' + args.scopeHeading };
+    const scope = findBandScope(headingNorm);
+    if (!scope) {
+      return { ok: false, reason: 'band scope not found: ' + args.scopeHeading };
     }
-    scopes = [];
-    for (const label of labels) {
-      let node = label.parentElement;
-      while (node && node !== document.body) {
-        const found = Array.from(node.querySelectorAll('*'))
-          .some((el) => isVisible(el) && matches(el));
-        if (found) { scopes.push(node); break; }
-        node = node.parentElement;
-      }
-    }
-    if (!scopes.length) {
-      return {
-        ok: false,
-        reason: 'no container near "' + args.scopeHeading + '" contains ' +
-          JSON.stringify(args.targets),
-      };
-    }
+    scopes = [scope];
   }
 
   for (const scope of scopes) {
@@ -256,7 +430,125 @@ _JS_FIND_AND_MARK = """
 """
 
 
-# Locate the per-band reason field revealed when a band scores below 3.
+_JS_MARK_BAND_SCOPE = """
+(args) => {
+  const MARK = args.markAttr;
+  document.querySelectorAll('[' + MARK + ']')
+    .forEach((el) => el.removeAttribute(MARK));
+
+  const norm = (t) => (t || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+  const isVisible = (el) => {
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 1 || rect.height < 1) return false;
+    const style = window.getComputedStyle(el);
+    return style.visibility !== 'hidden' && style.display !== 'none';
+  };
+  const isInteractive = (el) => {
+    if (!el || !el.getAttribute) return false;
+    const tag = el.tagName ? el.tagName.toLowerCase() : '';
+    const role = el.getAttribute('role') || '';
+    if (tag === 'button' || tag === 'a' ||
+        ['button', 'radio', 'checkbox', 'tab', 'option'].includes(role)) {
+      return true;
+    }
+    if (el.getAttribute('tabindex') === '0') return true;
+    return window.getComputedStyle(el).cursor === 'pointer';
+  };
+  const leafMost = (elements) =>
+    elements.filter(
+      (el) => !elements.some((o) => o !== el && el.contains(o))
+    );
+  const closestClickable = (el) => {
+    let node = el;
+    while (node && node !== document.body) {
+      if (isInteractive(node)) return node;
+      node = node.parentElement;
+    }
+    return el;
+  };
+""" + _JS_BAND_RANGE_HELPERS + """
+  const headingNorm = norm(args.heading);
+  const bestScope = bandScopeFromRange(
+    headingNorm,
+    args.sectionHeadings || [],
+    args.scoreCellPatterns || [],
+    args.confidenceTargets || []
+  );
+  if (!bestScope) {
+    return { ok: false, reason: 'band scope not found: ' + args.heading };
+  }
+  bestScope.setAttribute(MARK, '1');
+  return { ok: true, scoreCells: 4 };
+}
+"""
+
+# Positional band-cell locator. Groups the score/confidence buttons and the
+# per-band reason textareas by document order (bands render Problem → Tests →
+# Solution, each with 4 score + 3 confidence cells) and marks the requested
+# cell for a trusted Playwright click — no heading-scope heuristics.
+_JS_MARK_BAND_CELL = """
+(args) => {
+  const MARK = args.markAttr;
+  document.querySelectorAll('[' + MARK + ']')
+    .forEach((el) => el.removeAttribute(MARK));
+
+  const norm = (t) => (t || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+  const isVisible = (el) => {
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 1 || rect.height < 1) return false;
+    const style = window.getComputedStyle(el);
+    return style.visibility !== 'hidden' && style.display !== 'none';
+  };
+  const scoreLabelRe = /^([0-3])[\\s|]*(failing|weak|minor|clean)$/;
+  const isConfBtnText = (t) =>
+    t === 'low' || t === 'med' || t === 'medium' || t === 'high';
+  const followsInDoc = (a, b) =>
+    !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+
+  const buttons = Array.from(document.querySelectorAll('button')).filter(isVisible);
+  const scoreButtons = buttons.filter((el) => scoreLabelRe.test(norm(el.innerText)));
+  const confButtons = buttons.filter((el) => isConfBtnText(norm(el.innerText)));
+  const i = args.bandIndex;
+
+  let target = null;
+  if (args.kind === 'score') {
+    target = scoreButtons.slice(i * 4, i * 4 + 4)[args.cellIndex];
+  } else if (args.kind === 'confidence') {
+    target = confButtons.slice(i * 3, i * 3 + 3)[args.cellIndex];
+  } else if (args.kind === 'reason') {
+    const scoreCells = scoreButtons.slice(i * 4, i * 4 + 4);
+    if (scoreCells.length === 4) {
+      const nextStart = scoreButtons[(i + 1) * 4];
+      const fields = Array.from(document.querySelectorAll('textarea'))
+        .filter((el) => {
+          if (!isVisible(el)) return false;
+          const ph = norm(el.placeholder || el.getAttribute('placeholder') || '');
+          return !/outside the rubric|sent to the author|internal note/.test(ph);
+        });
+      target = fields.find(
+        (f) => followsInDoc(scoreCells[0], f) &&
+          (!nextStart || followsInDoc(f, nextStart))
+      ) || null;
+    }
+  }
+
+  if (!target) {
+    return {
+      ok: false,
+      reason: args.kind + ' cell not found for band ' + i +
+        ' (scoreButtons=' + scoreButtons.length +
+        ', confButtons=' + confButtons.length + ')',
+    };
+  }
+  target.setAttribute(MARK, '1');
+  return {
+    ok: true,
+    tag: target.tagName,
+    text: norm(target.innerText).slice(0, 40),
+  };
+}
+"""
+
 # Search between this band heading and the next section heading so we do not
 # accidentally grab the author-note textarea further down the form.
 _JS_FIND_BAND_REASON = """
@@ -327,16 +619,6 @@ _JS_FIND_BAND_REASON = """
     }
     return nearbyReasonText(t);
   };
-  const isSectionHeading = (el, headingNorm) => {
-    if (!isVisible(el) || norm(el.innerText) !== headingNorm) return false;
-    const tag = el.tagName ? el.tagName.toLowerCase() : '';
-    const role = el.getAttribute('role') || '';
-    if (/^h[1-6]$/.test(tag) || role === 'heading') return true;
-    // Prefer compact labels; skip large containers whose innerText includes
-    // score/confidence controls.
-    const text = norm(el.innerText);
-    return text.length <= headingNorm.length + 8;
-  };
   const leafMost = (elements) =>
     elements.filter(
       (el) => !elements.some((o) => o !== el && el.contains(o))
@@ -352,10 +634,13 @@ _JS_FIND_BAND_REASON = """
     return { ok: false, reason: 'band label not found: ' + args.heading };
   }
 
-  const scorePatterns = (args.scorePatterns || []).map(norm);
+  const scoreCellPatterns = (args.scoreCellPatterns || []).map(norm);
+  const isScoreDigitCell = (text) => /^[0-3]$/.test(text);
+  const matchesScoreText = (text) => {
+    if (isScoreDigitCell(text)) return true;
+    return scoreCellPatterns.some((p) => text === p || text.startsWith(p));
+  };
   const confidenceTargets = (args.confidenceTargets || []).map(norm);
-  const matchesScoreText = (text) =>
-    scorePatterns.some((p) => text === p || text.startsWith(p));
   const isInteractive = (el) => {
     if (!el || !el.getAttribute) return false;
     const tag = el.tagName ? el.tagName.toLowerCase() : '';
@@ -407,62 +692,14 @@ _JS_FIND_BAND_REASON = """
     if (textareas.length > 1) return textareas[textareas.length - 1];
     return null;
   };
-  const scopeFromLabel = (label) => {
-    let node = label.parentElement;
-    while (node && node !== document.body) {
-      const scoreLeaves = leafMost(
-        Array.from(node.querySelectorAll('*'))
-          .filter((el) =>
-            isVisible(el) && matchesScoreText(norm(el.innerText))
-          )
-      );
-      const scoreClickables = [];
-      for (const el of scoreLeaves) {
-        const cell = closestClickable(el);
-        if (!scoreClickables.includes(cell)) scoreClickables.push(cell);
-      }
-      if (scoreClickables.length >= 4) {
-        let scope = node;
-        const parent = node.parentElement;
-        if (parent && parent !== document.body) {
-          const parentScoreLeaves = leafMost(
-            Array.from(parent.querySelectorAll('*'))
-              .filter((el) =>
-                isVisible(el) && matchesScoreText(norm(el.innerText))
-              )
-          );
-          const parentScoreClickables = [];
-          for (const el of parentScoreLeaves) {
-            const cell = closestClickable(el);
-            if (!parentScoreClickables.includes(cell)) {
-              parentScoreClickables.push(cell);
-            }
-          }
-          const confInParent = leafMost(
-            Array.from(parent.querySelectorAll('*'))
-              .filter((el) => {
-                if (!isVisible(el)) return false;
-                const t = norm(el.innerText);
-                return confidenceTargets.includes(t) || t === 'medium';
-              })
-          );
-          if (parentScoreClickables.length >= 4 && confInParent.length >= 3) {
-            scope = parent;
-          }
-        }
-        return scope;
-      }
-      node = node.parentElement;
-    }
-    return null;
-  };
-  const findBandScope = () => {
-    for (const label of labels) {
-      const scope = scopeFromLabel(label);
-      if (scope) return scope;
-    }
-    return null;
-  };
+""" + _JS_BAND_RANGE_HELPERS + """
+  const findBandScope = () =>
+    bandScopeFromRange(
+      headingNorm,
+      sectionHeadings,
+      scoreCellPatterns,
+      confidenceTargets
+    );
 
   const scope = findBandScope();
   if (scope) {
@@ -517,6 +754,27 @@ _JS_FIND_BAND_REASON = """
       via: 'range',
     };
   }
+
+  for (const label of labels) {
+    let node = label.parentElement;
+    for (let depth = 0; depth < 10 && node && node !== document.body; depth++) {
+      const inputs = Array.from(node.querySelectorAll(fieldSelector))
+        .filter((el) => isVisible(el) && !isOtherNotesField(el));
+      const ancestorPick = pickReasonField(inputs);
+      if (ancestorPick) {
+        ancestorPick.setAttribute(MARK, '1');
+        return {
+          ok: true,
+          placeholder: ancestorPick.placeholder ||
+            ancestorPick.getAttribute('placeholder') || '',
+          tag: ancestorPick.tagName,
+          via: 'ancestor',
+        };
+      }
+      node = node.parentElement;
+    }
+  }
+
   return {
     ok: false,
     reason: 'no reason textarea between "' + args.heading + '" and next section',
@@ -579,57 +837,59 @@ _JS_VERIFY_BAND_SCORES = """
     }
     return false;
   };
-  const scorePatterns = (args.scorePatterns || []).map(norm);
+  const scoreCellPatterns = (args.scoreCellPatterns || []).map(norm);
+  const confidenceTargets = (args.confidenceTargets || []).map(norm);
+  const isScoreDigitCell = (text) => /^[0-3]$/.test(text);
+  const matchesScoreText = (text) => {
+    if (isScoreDigitCell(text)) return true;
+    return scoreCellPatterns.some((p) => text === p || text.startsWith(p));
+  };
+  const leafMost = (elements) =>
+    elements.filter(
+      (el) => !elements.some((o) => o !== el && el.contains(o))
+    );
+  const closestClickable = (el) => {
+    let node = el;
+    while (node && node !== document.body) {
+      if (isInteractive(node)) return node;
+      node = node.parentElement;
+    }
+    return el;
+  };
+""" + _JS_BAND_RANGE_HELPERS + """
+  const findBandScope = (headingNorm) =>
+    bandScopeFromRange(
+      headingNorm,
+      args.sectionHeadings || [],
+      args.scoreCellPatterns || [],
+      args.confidenceTargets || []
+    );
   const missing = [];
 
   for (const heading of args.headings) {
     const headingNorm = norm(heading);
-    let labels = Array.from(document.body.querySelectorAll('*'))
-      .filter((el) => isVisible(el) && norm(el.innerText) === headingNorm);
-    labels = labels.filter(
-      (el) => !labels.some((o) => o !== el && el.contains(o))
-    );
-    if (!labels.length) {
-      missing.push(heading + ': heading not found');
+    const scope = findBandScope(headingNorm);
+    if (!scope) {
+      const hasLabel = Array.from(document.body.querySelectorAll('*'))
+        .some((el) => isVisible(el) && norm(el.innerText) === headingNorm);
+      missing.push(
+        heading + (hasLabel ? ': score row not found' : ': heading not found')
+      );
       continue;
     }
-    const label = labels[0];
-    let scoped = false;
-    let node = label.parentElement;
-    while (node && node !== document.body) {
-      const scoreButtons = Array.from(node.querySelectorAll('*'))
-        .filter((el) => {
-          if (!isVisible(el)) return false;
-          const text = norm(el.innerText);
-          return scorePatterns.some((p) => text === p || text.startsWith(p));
-        })
-        .filter((el) => !Array.from(node.querySelectorAll('*'))
-          .some((o) => o !== el && el.contains(o) && isVisible(o) &&
-            scorePatterns.some((p) =>
-              norm(o.innerText) === p || norm(o.innerText).startsWith(p)
-            )
-          )
-        );
-      if (scoreButtons.length >= 4) {
-        scoped = true;
-        const interactive = scoreButtons.filter((el) => {
-          let node = el;
-          while (node && node !== label.parentElement) {
-            if (isInteractive(node)) return true;
-            node = node.parentElement;
-          }
-          return false;
-        });
-        const cells = interactive.length >= 4 ? interactive : scoreButtons;
-        if (!cells.some(isNodeOrAncestorSelected)) {
-          missing.push(heading + ': no score selected');
-        }
-        break;
-      }
-      node = node.parentElement;
+    const scoreNodes = leafMost(
+      Array.from(scope.querySelectorAll('*'))
+        .filter((el) =>
+          isVisible(el) && matchesScoreText(norm(el.innerText))
+        )
+    );
+    const scoreCells = [];
+    for (const el of scoreNodes) {
+      const cell = closestClickable(el);
+      if (!scoreCells.includes(cell)) scoreCells.push(cell);
     }
-    if (!scoped) {
-      missing.push(heading + ': score row not found');
+    if (!scoreCells.some(isNodeOrAncestorSelected)) {
+      missing.push(heading + ': no score selected');
     }
   }
   return { ok: missing.length === 0, missing };
@@ -694,6 +954,11 @@ _JS_FORM_VALIDATION_STATE = """
     if (el.getAttribute('tabindex') === '0') return true;
     return window.getComputedStyle(el).cursor === 'pointer';
   };
+""" + _JS_FORM_ROOT_HELPERS + """
+  const submitPattern = /^submit(\\s+(review|feedback))?$/i;
+  const formRoot = findReviewFormRoot(args.formMarkers || [], submitPattern);
+  const documentRoot = formRoot || document.body;
+  const searchRoot = documentRoot;
   const isNodeSelected = (el) => {
     let node = el;
     while (node && node !== document.body) {
@@ -758,19 +1023,13 @@ _JS_FORM_VALIDATION_STATE = """
     elements.filter(
       (el) => !elements.some((o) => o !== el && el.contains(o))
     );
-  const isSectionHeading = (el, headingNorm) => {
-    if (!isVisible(el) || norm(el.innerText) !== headingNorm) return false;
-    const tag = el.tagName ? el.tagName.toLowerCase() : '';
-    const role = el.getAttribute('role') || '';
-    if (/^h[1-6]$/.test(tag) || role === 'heading') return true;
-    const text = norm(el.innerText);
-    return text.length <= headingNorm.length + 8;
-  };
   const scoreCellPatterns = (args.scoreCellPatterns || []).map(norm);
-  // Match _JS_VERIFY_BAND_SCORES: score cells often render digit and label as
-  // separate child elements, so full-cell patterns alone miss the scope row.
-  const matchesScoreText = (text) =>
-    scorePatterns.some((p) => text === p || text.startsWith(p));
+  const isScoreDigitCell = (text) => /^[0-3]$/.test(text);
+  // Score cells often render digit and label as separate child elements.
+  const matchesScoreText = (text) => {
+    if (isScoreDigitCell(text)) return true;
+    return scoreCellPatterns.some((p) => text === p || text.startsWith(p));
+  };
   const normalizeConfidenceText = (text) => {
     const t = norm(text);
     if (t === 'med' || t === 'medium') return 'medium';
@@ -784,6 +1043,7 @@ _JS_FORM_VALIDATION_STATE = """
     }
     return el;
   };
+""" + _JS_BAND_RANGE_HELPERS + """
   const styleSignature = (el) => {
     const s = window.getComputedStyle(el);
     return [s.backgroundColor, s.borderTopColor, s.boxShadow].join('|');
@@ -820,67 +1080,13 @@ _JS_FORM_VALIDATION_STATE = """
     if (leading) return parseInt(leading[1], 10);
     return null;
   };
-  const findBandScope = (headingNorm) => {
-    const labels = leafMost(
-      Array.from(document.body.querySelectorAll('*'))
-        .filter((el) => isVisible(el) && norm(el.innerText) === headingNorm)
+  const findBandScope = (headingNorm) =>
+    bandScopeFromRange(
+      headingNorm,
+      sectionHeadings,
+      args.scoreCellPatterns || [],
+      args.confidenceTargets || []
     );
-    if (!labels.length) return null;
-    const scopeFromLabel = (label) => {
-      let node = label.parentElement;
-      while (node && node !== document.body) {
-        const scoreLeaves = leafMost(
-          Array.from(node.querySelectorAll('*'))
-            .filter((el) =>
-              isVisible(el) && matchesScoreText(norm(el.innerText))
-            )
-        );
-        const scoreClickables = [];
-        for (const el of scoreLeaves) {
-          const cell = closestClickable(el);
-          if (!scoreClickables.includes(cell)) scoreClickables.push(cell);
-        }
-        if (scoreClickables.length >= 4) {
-          let scope = node;
-          const parent = node.parentElement;
-          if (parent && parent !== document.body) {
-            const parentScoreLeaves = leafMost(
-              Array.from(parent.querySelectorAll('*'))
-                .filter((el) =>
-                  isVisible(el) && matchesScoreText(norm(el.innerText))
-                )
-            );
-            const parentScoreClickables = [];
-            for (const el of parentScoreLeaves) {
-              const cell = closestClickable(el);
-              if (!parentScoreClickables.includes(cell)) {
-                parentScoreClickables.push(cell);
-              }
-            }
-            const confInParent = leafMost(
-              Array.from(parent.querySelectorAll('*'))
-                .filter((el) => {
-                  if (!isVisible(el)) return false;
-                  const t = norm(el.innerText);
-                  return confidenceTargets.includes(t) || t === 'medium';
-                })
-            );
-            if (parentScoreClickables.length >= 4 && confInParent.length >= 3) {
-              scope = parent;
-            }
-          }
-          return scope;
-        }
-        node = node.parentElement;
-      }
-      return null;
-    };
-    for (const label of labels) {
-      const scope = scopeFromLabel(label);
-      if (scope) return scope;
-    }
-    return null;
-  };
   const findBandReasonLen = (heading) => {
     const headingNorm = norm(heading);
     const labels = leafMost(
@@ -940,102 +1146,83 @@ _JS_FORM_VALIDATION_STATE = """
     return reasonField ? readField(reasonField).length : 0;
   };
 
-  const bandState = (heading) => {
-    const headingNorm = norm(heading);
-    const scope = findBandScope(headingNorm);
-    if (!scope) {
-      const hasLabel = Array.from(document.body.querySelectorAll('*'))
-        .some((el) => isVisible(el) && norm(el.innerText) === headingNorm);
-      return {
-        heading,
-        found: hasLabel,
-        score: null,
-        confidence: null,
-        reasonLen: 0,
-      };
+  // Positional band read. The form always renders the rubric bands in a fixed
+  // order (Problem Description, Tests, Solution & Code), each with exactly four
+  // score cells (0..3) and three confidence segments (Low/Med/High). Grouping
+  // the score/confidence buttons by document order — rather than resolving a
+  // per-band DOM scope from the heading — removes the fragile scope detection
+  // that previously collapsed neighbouring bands onto one shared scope (every
+  // band then read the first band's values, leaving Submit disabled).
+  const scoreLabelRe = /^([0-3])[\\s|]*(failing|weak|minor|clean)$/;
+  const isConfBtnText = (t) =>
+    t === 'low' || t === 'med' || t === 'medium' || t === 'high';
+  const confIndexNames = ['low', 'medium', 'high'];
+  // Explicit selection lives on the cell itself (aria/data-state). Walking up
+  // to ancestors — as the old reader did — invited false positives, so restrict
+  // attribute checks to the cell and let styleOutlier settle style-only cases.
+  const cellSelected = (el) => {
+    for (const attr of ['aria-pressed', 'aria-checked', 'aria-selected']) {
+      if (el.getAttribute && el.getAttribute(attr) === 'true') return true;
     }
-
-    let score = null;
-    const scoreNodes = leafMost(
-      Array.from(scope.querySelectorAll('*'))
-        .filter((el) =>
-          isVisible(el) && matchesScoreText(norm(el.innerText))
-        )
-    );
-    for (const el of scoreNodes) {
-      const scoreVal = parseScoreFromText(norm(el.innerText));
-      if (scoreVal !== null && isNodeSelected(el)) {
-        score = scoreVal;
-        break;
-      }
+    const state = el.getAttribute ? el.getAttribute('data-state') : '';
+    return !!state && ['on', 'active', 'checked', 'selected'].includes(state);
+  };
+  const selectedCellIndex = (cells) => {
+    for (let i = 0; i < cells.length; i++) {
+      if (cellSelected(cells[i])) return i;
     }
-    if (score === null) {
-      const scoreCells = [];
-      for (const el of scoreNodes) {
-        const cell = closestClickable(el);
-        if (!scoreCells.includes(cell)) scoreCells.push(cell);
-      }
-      const outlier = styleOutlier(scoreCells);
-      if (outlier) score = parseScoreFromText(norm(outlier.innerText));
-    }
-
-    let confidence = null;
-    const confNodes = leafMost(
-      Array.from(scope.querySelectorAll('*'))
-        .filter((el) => {
-          if (!isVisible(el)) return false;
-          const t = norm(el.innerText);
-          return confidenceTargets.includes(t) || t === 'medium';
-        })
-    );
-    for (const el of confNodes) {
-      const text = norm(el.innerText);
-      if (isNodeSelected(el)) {
-        confidence = normalizeConfidenceText(text);
-        break;
-      }
-    }
-    if (confidence === null) {
-      const confCells = [];
-      for (const el of confNodes) {
-        const cell = closestClickable(el);
-        if (!confCells.includes(cell)) confCells.push(cell);
-      }
-      const outlier = styleOutlier(confCells);
-      if (outlier) {
-        confidence = normalizeConfidenceText(norm(outlier.innerText));
-      }
-    }
-
-    const reasonFields = Array.from(
-      scope.querySelectorAll(
-        'textarea, [contenteditable="true"], [role="textbox"]'
-      )
-    ).filter((el) => {
+    const outlier = styleOutlier(cells);
+    return outlier ? cells.indexOf(outlier) : -1;
+  };
+  const orderedButtons = Array.from(searchRoot.querySelectorAll('button'))
+    .filter(isVisible);
+  const scoreButtons = orderedButtons.filter(
+    (el) => scoreLabelRe.test(norm(el.innerText))
+  );
+  const confButtons = orderedButtons.filter(
+    (el) => isConfBtnText(norm(el.innerText))
+  );
+  const bandReasonFields = Array.from(searchRoot.querySelectorAll('textarea'))
+    .filter((el) => {
       if (!isVisible(el)) return false;
-      const ph = el.placeholder || el.getAttribute('placeholder') || '';
-      const ariaLabel = el.getAttribute('aria-label') || '';
-      if (/outside the rubric|sent to the author|internal note/i.test(ph) ||
-          /outside the rubric|sent to the author|internal note/i.test(ariaLabel)) {
+      const ph = norm(el.placeholder || el.getAttribute('placeholder') || '');
+      if (/outside the rubric|sent to the author|internal note/.test(ph)) {
         return false;
       }
       return true;
     });
-    let reasonLen = 0;
-    const reasonField = reasonFields.find(isReasonField) ||
-      (reasonFields.length === 1 ? reasonFields[0] : null);
-    if (reasonField) reasonLen = readField(reasonField).length;
-    if (reasonLen < 5) {
-      reasonLen = findBandReasonLen(heading);
+  const followsInDoc = (a, b) =>
+    !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+  const computeBand = (heading, i) => {
+    const scoreCells = scoreButtons.slice(i * 4, i * 4 + 4);
+    const confCells = confButtons.slice(i * 3, i * 3 + 3);
+    if (scoreCells.length < 4) {
+      return { heading, found: false, score: null, confidence: null, reasonLen: 0 };
     }
-
+    const scoreIdx = selectedCellIndex(scoreCells);
+    const score = scoreIdx >= 0 ? scoreIdx : null;
+    let confidence = null;
+    if (confCells.length === 3) {
+      const confIdx = selectedCellIndex(confCells);
+      if (confIdx >= 0) confidence = confIndexNames[confIdx];
+    }
+    // The per-band reason textarea sits between this band's score row and the
+    // next band's score row — order-independent, so repair passes that fill
+    // out of order still map each reason to the right band.
+    let reasonLen = 0;
+    const nextBandStart = scoreButtons[(i + 1) * 4];
+    const reasonField = bandReasonFields.find(
+      (rf) => followsInDoc(scoreCells[0], rf) &&
+        (!nextBandStart || followsInDoc(rf, nextBandStart))
+    );
+    if (reasonField) reasonLen = readField(reasonField).length;
     return { heading, found: true, score, confidence, reasonLen };
   };
 
-  const bands = (args.headings || []).map(bandState);
+  const bands = (args.headings || []).map(computeBand);
   let decision = null;
   for (const label of decisionLabels) {
-    const nodes = Array.from(document.body.querySelectorAll('*'))
+    const nodes = Array.from(searchRoot.querySelectorAll('*'))
       .filter((el) => isVisible(el) && norm(el.innerText).startsWith(label));
     if (nodes.some(isNodeSelected)) {
       decision = label;
@@ -1046,7 +1233,7 @@ _JS_FORM_VALIDATION_STATE = """
   let authorNoteLen = 0;
   for (const hint of args.authorNoteHints || []) {
     const hintNorm = norm(hint);
-    const labels = Array.from(document.body.querySelectorAll('*'))
+    const labels = Array.from(searchRoot.querySelectorAll('*'))
       .filter((el) => isVisible(el) && norm(el.innerText).startsWith(hintNorm));
     for (const label of labels) {
       let node = label.parentElement;
@@ -1064,11 +1251,11 @@ _JS_FORM_VALIDATION_STATE = """
   }
 
   let submitHint = '';
-  const submitButtons = Array.from(document.body.querySelectorAll('button'))
+  const submitButtons = Array.from(searchRoot.querySelectorAll('button'))
     .filter((el) => isVisible(el) &&
-      /^submit(\\s+review)?$/i.test(norm(el.innerText)));
+      /^submit(\\s+(review|feedback))?$/i.test(norm(el.innerText)));
   // The form opener ("Submit Review") matches this pattern too and sits
-  // above the form; the real in-form Submit renders last in the DOM.
+  // above the form; scoping to the card content avoids it.
   const submitButton = submitButtons.length
     ? submitButtons[submitButtons.length - 1]
     : null;
@@ -1093,9 +1280,89 @@ _JS_FORM_VALIDATION_STATE = """
 }
 """
 
+# Mark the in-form Submit button (not the page opener in the sticky header).
+_JS_MARK_IN_FORM_SUBMIT = """
+(args) => {
+  const MARK = args.markAttr;
+  document.querySelectorAll('[' + MARK + ']')
+    .forEach((el) => el.removeAttribute(MARK));
+
+  const norm = (t) => (t || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+  const isVisible = (el) => {
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 1 || rect.height < 1) return false;
+    const style = window.getComputedStyle(el);
+    return style.visibility !== 'hidden' && style.display !== 'none';
+  };
+""" + _JS_FORM_ROOT_HELPERS + """
+  const submitPattern = /^submit(\\s+(review|feedback))?$/i;
+  const formRoot = findReviewFormRoot(args.formMarkers || [], submitPattern);
+  const searchRoot = formRoot || document.body;
+  const candidates = Array.from(searchRoot.querySelectorAll('button'))
+    .filter((el) => isVisible(el) && submitPattern.test(norm(el.innerText)));
+  const button = candidates.length ? candidates[candidates.length - 1] : null;
+  if (!button) return { ok: false, reason: 'no submit button found' };
+
+  button.setAttribute(MARK, '1');
+  const rect = button.getBoundingClientRect();
+  return {
+    ok: true,
+    text: (button.innerText || '').trim().replace(/\\s+/g, ' '),
+    disabled: !!button.disabled,
+    box: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
+    formRoot: formRoot ? formRoot.className.slice(0, 120) : null,
+  };
+}
+"""
+
+_JS_CLICK_MARKED_SUBMIT = """
+(args) => {
+  const btn = document.querySelector('[' + args.markAttr + '="1"]');
+  if (!btn) return { ok: false, reason: 'marked submit button missing' };
+  btn.scrollIntoView({ block: 'center', inline: 'nearest' });
+  window.scrollBy(0, -80);
+  btn.focus();
+  const fire = (type) => {
+    const rect = btn.getBoundingClientRect();
+    const opts = {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2,
+    };
+    if (type.startsWith('pointer')) {
+      btn.dispatchEvent(new PointerEvent(type, { ...opts, pointerId: 1 }));
+    } else {
+      btn.dispatchEvent(new MouseEvent(type, opts));
+    }
+  };
+  for (const type of ['pointerdown', 'mousedown', 'mouseup', 'pointerup', 'click']) {
+    fire(type);
+  }
+  if (typeof btn.click === 'function') btn.click();
+  return {
+    ok: true,
+    disabled: !!btn.disabled,
+    ariaDisabled: btn.getAttribute('aria-disabled') === 'true',
+  };
+}
+"""
+
 
 def _noop_log(message: str) -> None:
     print(f"[submit] {message}", flush=True)
+
+
+def _norm_text(text: str) -> str:
+    """Whitespace-collapse and lowercase, mirroring the in-page JS ``norm``.
+
+    The form-state JS reports selected decisions/labels through ``norm`` (see
+    ``_JS_FORM_VALIDATION_STATE``), so Python-side comparisons must normalize
+    the same way to avoid case/whitespace mismatches (e.g. the reported
+    ``"request changes"`` vs. the display label ``"Request Changes"``).
+    """
+    return re.sub(r"\s+", " ", text or "").strip().lower()
 
 
 def _normalize_decision(decision: str) -> str:
@@ -1161,6 +1428,7 @@ def _form_state_eval_args() -> dict[str, Any]:
         "confidenceTargets": list(CONFIDENCE_UI.values()),
         "decisionLabels": list(DECISION_LABELS.values()),
         "authorNoteHints": list(AUTHOR_NOTE_LABELS),
+        "formMarkers": list(SUBMIT_FORM_MARKERS),
     }
 
 
@@ -1446,8 +1714,30 @@ def _pick_tightest_band_section(candidates: list[Locator]) -> Locator | None:
     return best
 
 
+def _mark_band_scope(page: Page, heading: str) -> dict[str, Any]:
+    """Mark the tight per-band container (4 score + 3 confidence cells)."""
+    return page.evaluate(
+        _JS_MARK_BAND_SCOPE,
+        {
+            "heading": heading,
+            "markAttr": BAND_SCOPE_ATTR,
+            **_band_scope_eval_args(),
+        },
+    )
+
+
 def _band_section(page: Page, heading: str) -> Locator:
     """Locate the band rating block by its section heading."""
+    result = _mark_band_scope(page, heading)
+    if result.get("ok"):
+        scope = page.locator(BAND_SCOPE_SELECTOR).first
+        try:
+            if scope.count() and scope.is_visible():
+                scope.scroll_into_view_if_needed()
+                return scope
+        except PlaywrightTimeoutError:
+            pass
+
     heading_loc = page.get_by_role("heading", name=heading)
     if not heading_loc.count():
         heading_loc = page.get_by_text(heading, exact=True)
@@ -1480,7 +1770,11 @@ def _click_band_score_playwright(page: Page, heading: str, score: int) -> bool:
     if score not in SCORE_LABELS:
         raise ValueError(f"Band score must be 0-3, got {score!r}")
 
-    idx = _band_index(heading)
+    try:
+        section = _band_section(page, heading)
+    except (RuntimeError, PlaywrightTimeoutError):
+        return False
+
     label = SCORE_LABELS[score]
     candidates = (
         f"{score} | {label}",
@@ -1491,18 +1785,24 @@ def _click_band_score_playwright(page: Page, heading: str, score: int) -> bool:
         f"{score}\n| {label}",
     )
     for name in candidates:
-        button = page.get_by_role("button", name=name)
-        if button.count() > idx and button.nth(idx).is_visible():
-            button.nth(idx).scroll_into_view_if_needed()
-            button.nth(idx).click()
-            return True
+        button = section.get_by_role("button", name=name)
+        if button.count() and button.first.is_visible():
+            button.first.scroll_into_view_if_needed()
+            button.first.click()
+            page.wait_for_timeout(350)
+            band = _band_form_snapshot(page, heading)
+            if band.get("score") == score:
+                return True
 
     pattern = re.compile(rf"^{score}\b")
-    button = page.get_by_role("button", name=pattern)
-    if button.count() > idx and button.nth(idx).is_visible():
-        button.nth(idx).scroll_into_view_if_needed()
-        button.nth(idx).click()
-        return True
+    button = section.get_by_role("button", name=pattern)
+    if button.count() and button.first.is_visible():
+        button.first.scroll_into_view_if_needed()
+        button.first.click()
+        page.wait_for_timeout(350)
+        band = _band_form_snapshot(page, heading)
+        if band.get("score") == score:
+            return True
     return False
 
 
@@ -1517,23 +1817,28 @@ def _band_index(heading: str) -> int:
 def _click_band_confidence_playwright(page: Page, heading: str, confidence: str) -> bool:
     """Click confidence within the band card anchored by heading."""
     ui_label = CONFIDENCE_UI[_normalize_confidence(confidence)]
-    idx = _band_index(heading)
-    buttons = page.get_by_role("button", name=ui_label, exact=True)
-    if buttons.count() <= idx:
-        buttons = page.get_by_role(
+    try:
+        section = _band_section(page, heading)
+    except (RuntimeError, PlaywrightTimeoutError):
+        return False
+
+    buttons = section.get_by_role("button", name=ui_label, exact=True)
+    if not buttons.count():
+        buttons = section.get_by_role(
             "button",
             name=re.compile(rf"^{re.escape(ui_label)}$", re.I),
         )
-    if buttons.count() <= idx:
+    if not buttons.count():
         return False
-    button = buttons.nth(idx)
+    button = buttons.first
     if not button.is_visible():
         return False
     button.scroll_into_view_if_needed()
     button.click()
-    page.wait_for_timeout(250)
-    cls = button.get_attribute("class") or ""
-    return "bg-primary" in cls or "text-primary-foreground" in cls
+    page.wait_for_timeout(350)
+    expected = _normalize_confidence(confidence)
+    band = _band_form_snapshot(page, heading)
+    return band.get("confidence") == expected
 
 
 def capture_failure(page: Page, label: str, *, log: LogFn = _noop_log) -> None:
@@ -1556,6 +1861,10 @@ def capture_failure(page: Page, label: str, *, log: LogFn = _noop_log) -> None:
             dump["formState"] = _read_form_state(page)
         except Exception as exc:
             dump["formStateError"] = str(exc)
+        try:
+            dump["submitButton"] = _submit_button_diagnostics(page)
+        except Exception as exc:
+            dump["submitButtonError"] = str(exc)
         (DEBUG_DIR / f"{stamp}-{label}.json").write_text(
             json.dumps(dump, indent=2), encoding="utf-8"
         )
@@ -1620,6 +1929,14 @@ def _collect_band_textarea_dump(page: Page) -> dict[str, Any]:
         return {"error": str(exc)}
 
 
+def _band_scope_eval_args() -> dict[str, Any]:
+    return {
+        "sectionHeadings": _band_section_headings(),
+        "scoreCellPatterns": _score_cell_patterns(),
+        "confidenceTargets": list(CONFIDENCE_UI.values()),
+    }
+
+
 def _find_and_mark(
     page: Page,
     targets: list[str],
@@ -1639,6 +1956,7 @@ def _find_and_mark(
             "checkVisual": check_visual,
             "requireInteractive": require_interactive,
             "requireButton": require_button,
+            **_band_scope_eval_args(),
         },
     )
 
@@ -1768,7 +2086,9 @@ def _verify_band_scores(page: Page, *, log: LogFn = _noop_log) -> None:
         _JS_VERIFY_BAND_SCORES,
         {
             "headings": list(BAND_HEADINGS.values()),
-            "scorePatterns": _score_patterns(),
+            "sectionHeadings": _band_section_headings(),
+            "scoreCellPatterns": _score_cell_patterns(),
+            "confidenceTargets": list(CONFIDENCE_UI.values()),
         },
     )
     if result.get("ok"):
@@ -1816,7 +2136,7 @@ def _find_band_reason_js(page: Page, heading: str) -> dict[str, Any]:
         {
             "heading": heading,
             "sectionHeadings": _band_section_headings(),
-            "scorePatterns": _score_patterns(),
+            "scoreCellPatterns": _score_cell_patterns(),
             "confidenceTargets": list(CONFIDENCE_UI.values()),
         },
     )
@@ -1976,6 +2296,79 @@ def _band_form_snapshot(
     )
 
 
+def _mark_band_cell(
+    page: Page,
+    kind: str,
+    band_index: int,
+    cell_index: int = 0,
+) -> dict[str, Any]:
+    """Mark a band's score/confidence/reason cell by document-order position."""
+    return page.evaluate(
+        _JS_MARK_BAND_CELL,
+        {
+            "kind": kind,
+            "bandIndex": band_index,
+            "cellIndex": cell_index,
+            "markAttr": BAND_CELL_ATTR,
+        },
+    )
+
+
+def _unmark_band_cell(page: Page) -> None:
+    page.evaluate(
+        f"document.querySelectorAll('[{BAND_CELL_ATTR}]')"
+        f".forEach((el) => el.removeAttribute('{BAND_CELL_ATTR}'))"
+    )
+
+
+def _click_band_cell_positional(
+    page: Page,
+    heading: str,
+    *,
+    kind: str,
+    cell_index: int,
+    state_key: str,
+    expected: Any,
+    description: str,
+    attempts: int = 3,
+    log: LogFn = _noop_log,
+) -> None:
+    """Click a positionally-located band cell and confirm the read-back matches.
+
+    The cell is located by document-order position (band index + cell index),
+    then clicked through Playwright with trusted events. Selection is verified
+    against the positional form-state read, retrying on a click that a React
+    re-render swallowed.
+    """
+    band_index = _band_index(heading)
+    for attempt in range(1, attempts + 1):
+        result = _mark_band_cell(page, kind, band_index, cell_index)
+        if not result.get("ok"):
+            _unmark_band_cell(page)
+            raise RuntimeError(
+                f"submit: could not locate {description}: "
+                f"{result.get('reason', 'unknown')}"
+            )
+        element = page.locator(BAND_CELL_SELECTOR).first
+        element.scroll_into_view_if_needed(timeout=5_000)
+        element.click(timeout=5_000)
+        page.wait_for_timeout(350)
+        _unmark_band_cell(page)
+
+        band = _band_form_snapshot(page, heading)
+        if band.get(state_key) == expected:
+            log(f"submit: {description} selected (attempt {attempt})")
+            return
+        log(
+            f"submit: {description} click did not register "
+            f"(attempt {attempt}/{attempts}) — retrying"
+        )
+
+    raise RuntimeError(
+        f"submit: {description} never registered after {attempts} clicks."
+    )
+
+
 def _click_band_score(
     page: Page,
     heading: str,
@@ -1983,38 +2376,22 @@ def _click_band_score(
     *,
     log: LogFn = _noop_log,
 ) -> None:
-    """Select a band score via Playwright locators, falling back to text match."""
+    """Select a band score by its fixed 0..3 position within the band."""
+    if score not in SCORE_LABELS:
+        raise ValueError(f"Band score must be 0-3, got {score!r}")
     band = _band_form_snapshot(page, heading)
     if band.get("score") == score:
         log(f"submit: {heading} score {score} already selected — skipping")
         return
-    try:
-        if _click_band_score_playwright(page, heading, score):
-            page.wait_for_timeout(350)
-            band = _band_form_snapshot(page, heading)
-            if band.get("score") == score:
-                log(
-                    f"submit: {heading} score {score} ({SCORE_LABELS[score]}) "
-                    "via Playwright"
-                )
-                return
-            log(
-                f"submit: Playwright score click for {heading!r} did not "
-                "register — using text-match fallback"
-            )
-    except (RuntimeError, PlaywrightTimeoutError, ValueError) as exc:
-        log(
-            f"submit: Playwright score click failed for {heading!r} "
-            f"({exc}); using text-match fallback"
-        )
-
-    _click_selectable(
+    _click_band_cell_positional(
         page,
-        _score_targets(score),
-        scope_heading=heading,
-        log=log,
+        heading,
+        kind="score",
+        cell_index=score,
+        state_key="score",
+        expected=score,
         description=f"{heading} score {score} ({SCORE_LABELS[score]})",
-        require_interactive=True,
+        log=log,
     )
 
 
@@ -2023,38 +2400,28 @@ def _click_band_confidence(
     heading: str,
     confidence: str,
     *,
+    force: bool = False,
     log: LogFn = _noop_log,
 ) -> None:
-    """Select band confidence via Playwright locators, falling back to text match."""
+    """Select band confidence by its fixed Low/Med/High position within the band."""
+    # ``force`` is retained for call-site compatibility, but positional reading
+    # is reliable enough that we always honour the snapshot: clicking an already
+    # selected segment would toggle it OFF, so never re-click a correct cell.
     expected_conf = _normalize_confidence(confidence)
     ui_label = CONFIDENCE_UI[expected_conf]
     band = _band_form_snapshot(page, heading)
     if band.get("confidence") == expected_conf:
         log(f"submit: {heading} confidence {ui_label} already selected — skipping")
         return
-    try:
-        if _click_band_confidence_playwright(page, heading, str(confidence)):
-            band = _band_form_snapshot(page, heading)
-            if band.get("confidence") == _normalize_confidence(confidence):
-                log(f"submit: {heading} confidence {ui_label} via Playwright")
-                return
-            log(
-                f"submit: Playwright confidence click for {heading!r} did not "
-                "register — using text-match fallback"
-            )
-    except (RuntimeError, PlaywrightTimeoutError, ValueError) as exc:
-        log(
-            f"submit: Playwright confidence click failed for {heading!r} "
-            f"({exc}); using text-match fallback"
-        )
-
-    _click_selectable(
+    _click_band_cell_positional(
         page,
-        [ui_label],
-        scope_heading=heading,
-        log=log,
+        heading,
+        kind="confidence",
+        cell_index=CONFIDENCE_INDEX.index(expected_conf),
+        state_key="confidence",
+        expected=expected_conf,
         description=f"{heading} confidence {ui_label}",
-        require_interactive=True,
+        log=log,
     )
 
 
@@ -2070,6 +2437,138 @@ def _click_decision(page: Page, decision: str, *, log: LogFn = _noop_log) -> Non
     )
 
 
+def _verify_decision_selected(
+    page: Page,
+    decision: str,
+    *,
+    log: LogFn = _noop_log,
+) -> None:
+    expected = DECISION_LABELS[_normalize_decision(decision)]
+    # The form-state JS reports the selected decision via ``norm`` (lowercase,
+    # whitespace-collapsed), so compare against the normalized display label
+    # rather than the mixed-case ``DECISION_LABELS`` value.
+    expected_norm = _norm_text(expected)
+    deadline = time.monotonic() + 2.5
+    last_decision: Any = None
+    while True:
+        state = _read_form_state(page)
+        last_decision = state.get("decision")
+        if last_decision and _norm_text(str(last_decision)) == expected_norm:
+            log(f"submit: decision {expected!r} verified on form")
+            return
+        if time.monotonic() >= deadline:
+            break
+        page.wait_for_timeout(250)
+    raise RuntimeError(
+        f"submit: decision {expected!r} not registered on form "
+        f"(got {last_decision!r})."
+    )
+
+
+def _scroll_band_into_view(
+    page: Page,
+    heading: str,
+    *,
+    log: LogFn = _noop_log,
+) -> None:
+    band_index = _band_index(heading)
+    if _mark_band_cell(page, "score", band_index, 0).get("ok"):
+        page.locator(BAND_CELL_SELECTOR).first.scroll_into_view_if_needed()
+        _unmark_band_cell(page)
+    log(f"submit: {heading} scrolled into view")
+
+
+def _wait_and_verify_band_reason_field(
+    page: Page,
+    heading: str,
+    score: int,
+    *,
+    log: LogFn = _noop_log,
+    timeout_ms: int = 6_000,
+) -> None:
+    """Wait for the per-band reason input after scoring below 3."""
+    log(f"submit: {heading} waiting for reason field (score {score} < 3)")
+    band_index = _band_index(heading)
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        if _mark_band_cell(page, "reason", band_index).get("ok"):
+            _unmark_band_cell(page)
+            log(f"submit: {heading} reason field visible")
+            return
+        page.wait_for_timeout(250)
+    raise RuntimeError(
+        f"submit: {heading} reason field did not appear after score {score} (<3)."
+    )
+
+
+def _fill_band_sequential(
+    page: Page,
+    heading: str,
+    *,
+    score: int,
+    confidence: str,
+    reasoning: str = "",
+    log: LogFn = _noop_log,
+) -> None:
+    """Fill one band in order: score → verify → confidence → verify → reason → verify."""
+    if score not in SCORE_LABELS:
+        raise ValueError(f"Band score must be 0-3, got {score!r}")
+
+    _scroll_band_into_view(page, heading, log=log)
+
+    log(f"submit: {heading} — selecting score {score}")
+    _click_band_score(page, heading, score, log=log)
+    _verify_band_filled(
+        page,
+        heading,
+        score=score,
+        confidence=str(confidence),
+        require_reason=False,
+        check_confidence=False,
+        log=log,
+    )
+
+    if score < 3:
+        _wait_and_verify_band_reason_field(page, heading, score, log=log)
+
+    log(f"submit: {heading} — selecting confidence {confidence}")
+    _click_band_confidence(page, heading, str(confidence), log=log)
+    _verify_band_filled(
+        page,
+        heading,
+        score=score,
+        confidence=str(confidence),
+        require_reason=False,
+        check_score=False,
+        log=log,
+    )
+
+    if score < 3:
+        log(f"submit: {heading} — filling reason")
+        _fill_band_reason(
+            page,
+            heading,
+            reasoning=reasoning,
+            score=score,
+            log=log,
+        )
+        _verify_band_filled(
+            page,
+            heading,
+            score=score,
+            confidence=str(confidence),
+            require_reason=True,
+            log=log,
+        )
+
+    snapshot = _band_form_snapshot(page, heading)
+    log(
+        f"submit: {heading} complete — "
+        f"score={snapshot.get('score')}, conf={snapshot.get('confidence')}, "
+        f"reasonLen={snapshot.get('reasonLen', 0)}"
+    )
+
+
 def _fill_band(
     page: Page,
     heading: str,
@@ -2079,36 +2578,15 @@ def _fill_band(
     reasoning: str = "",
     log: LogFn = _noop_log,
 ) -> None:
-    if score not in SCORE_LABELS:
-        raise ValueError(f"Band score must be 0-3, got {score!r}")
-
-    _click_band_score(page, heading, score, log=log)
-    page.wait_for_timeout(200)
-
-    _click_band_confidence(page, heading, str(confidence), log=log)
-
-    if score < 3:
-        page.wait_for_timeout(600)
-        for attempt in range(1, 5):
-            info = _find_band_reason_js(page, heading)
-            if info.get("ok"):
-                _unmark(page)
-                break
-            if _wait_band_reason_field(page, heading, timeout_ms=1_500) is not None:
-                break
-            log(
-                f"submit: {heading} reason field not visible after score {score} "
-                f"(attempt {attempt}/4) — re-clicking score"
-            )
-            _click_band_score(page, heading, score, log=log)
-            page.wait_for_timeout(800)
-        _fill_band_reason(
-            page,
-            heading,
-            reasoning=reasoning,
-            score=score,
-            log=log,
-        )
+    """Fill one band rating block (alias for _fill_band_sequential)."""
+    _fill_band_sequential(
+        page,
+        heading,
+        score=score,
+        confidence=confidence,
+        reasoning=reasoning,
+        log=log,
+    )
 
 
 def _fill_band_reason(
@@ -2124,55 +2602,44 @@ def _fill_band_reason(
     if not text:
         text = f"Scored {score}/3 — see author note for details."
 
-    deadline = time.monotonic() + 12.0
-    info: dict[str, Any] = {}
+    band_index = _band_index(heading)
+    deadline = time.monotonic() + 15.0
     field: Locator | None = None
+    last_reason = "reason textarea not found"
     while time.monotonic() < deadline:
-        info = _find_band_reason_js(page, heading)
-        if info.get("ok"):
-            candidate = page.locator(MARK_SELECTOR).first
+        result = _mark_band_cell(page, "reason", band_index)
+        if result.get("ok"):
+            candidate = page.locator(BAND_CELL_SELECTOR).first
             try:
                 candidate.wait_for(state="visible", timeout=1_500)
                 field = candidate
                 break
             except PlaywrightTimeoutError:
-                _unmark(page)
+                _unmark_band_cell(page)
         else:
-            field = _wait_band_reason_field(page, heading)
-            if field is not None:
-                info = {"ok": True, "via": "placeholder"}
-                break
-            field = _find_band_reason_playwright(page, heading)
-            if field is not None:
-                info = {"ok": True, "via": "playwright"}
-                break
+            last_reason = str(result.get("reason") or last_reason)
         page.wait_for_timeout(300)
 
     if field is None:
-        candidates = info.get("candidates")
-        detail = info.get("reason", "unknown")
-        if candidates:
-            detail = f"{detail}; candidates={json.dumps(candidates)[:400]}"
         raise RuntimeError(
             f"submit: {heading} scored {score} (<3) but its reason "
-            f"textarea was not found: {detail}. "
+            f"textarea was not found: {last_reason}. "
             "Shipd will not enable Submit without it."
         )
 
     field.scroll_into_view_if_needed(timeout=5_000)
     field.click()
-    field.fill(text)
+    persisted = _write_field_text(page, field, text)
     read_back = _read_field_text(page, field)
-    _unmark(page)
-    if len(read_back.strip()) < 5:
+    _unmark_band_cell(page)
+    if len(read_back.strip()) < 5 and persisted < 5:
         raise RuntimeError(
             f"submit: reason for {heading} did not persist after fill "
             f"({len(read_back.strip())} chars)."
         )
-    via = info.get("via") or ("playwright" if info.get("soleCandidate") else "js")
     log(
         f"submit: {heading} reason filled ({len(read_back.strip())} chars, "
-        f"score {score} < 3, via {via})"
+        f"score {score} < 3)"
     )
 
 
@@ -2199,13 +2666,30 @@ def _ensure_all_band_confidences(
     page: Page,
     band_ratings: dict[str, Any],
     *,
+    force: bool = False,
     log: LogFn = _noop_log,
 ) -> None:
-    """Re-assert confidence only for bands the form shows as unset or wrong.
+    """Re-assert confidence for bands that are unset or wrong.
 
-    Never blind-clicks: the segments are toggles, so re-clicking an
-    already-correct confidence would deselect it.
+    When ``force`` is True (Shipd still shows a Confidence hint), click every
+    band's confidence without trusting the DOM snapshot — the snapshot can
+    false-positive when band scope was wrong.
     """
+    if force:
+        for band_key, heading in BAND_HEADINGS.items():
+            band = band_ratings.get(band_key) or {}
+            confidence = band.get("confidence")
+            if confidence is None:
+                continue
+            _click_band_confidence(
+                page,
+                heading,
+                str(confidence),
+                force=True,
+                log=log,
+            )
+        return
+
     state = _read_form_state(page)
     bands_by_heading = {b.get("heading"): b for b in state.get("bands") or []}
     for band_key, heading in BAND_HEADINGS.items():
@@ -2243,60 +2727,12 @@ def _fill_band_ratings(
             raise ValueError(
                 f"band_ratings[{band_key!r}] requires score and confidence."
             )
-        _fill_band(
+        _fill_band_sequential(
             page,
             heading,
             score=int(score),
             confidence=str(confidence),
             reasoning=str(band.get("reasoning", "")),
-            log=log,
-        )
-
-    _verify_band_scores(page, log=log)
-
-
-def _fill_band_reasons(
-    page: Page,
-    band_ratings: dict[str, Any],
-    *,
-    log: LogFn = _noop_log,
-) -> None:
-    """Backfill any band reason fields that were not filled during scoring."""
-    for band_key, heading in BAND_HEADINGS.items():
-        band = band_ratings.get(band_key) or {}
-        score = int(band.get("score", 3))
-        if score >= 3:
-            continue
-
-        info = _find_band_reason_js(page, heading)
-        if not info.get("ok"):
-            field = _wait_band_reason_field(page, heading, timeout_ms=2_000)
-            if field is None:
-                field = _find_band_reason_playwright(page, heading)
-            if field is None:
-                candidates = info.get("candidates")
-                detail = info.get("reason", "unknown")
-                if candidates:
-                    detail = f"{detail}; candidates={json.dumps(candidates)[:400]}"
-                raise RuntimeError(
-                    f"submit: {heading} scored {score} (<3) but its reason "
-                    f"textarea was not found: {detail}. "
-                    "Shipd will not enable Submit without it."
-                )
-            existing = _read_field_text(page, field)
-        else:
-            field = page.locator(MARK_SELECTOR).first
-            existing = _read_field_text(page, field)
-            _unmark(page)
-        if len(existing.strip()) >= 5:
-            log(f"submit: {heading} reason already filled — skipping")
-            continue
-
-        _fill_band_reason(
-            page,
-            heading,
-            reasoning=str(band.get("reasoning", "")),
-            score=score,
             log=log,
         )
 
@@ -2346,16 +2782,40 @@ def _fill_author_note(
     field = _author_note_field(page)
     field.wait_for(state="visible", timeout=15_000)
     field.scroll_into_view_if_needed()
-    field.click()
-    field.fill(note)
-
-    filled = field.input_value()
-    if filled.strip() != note.strip():
+    persisted = _write_field_text(page, field, note)
+    read_back = _read_field_text(page, field)
+    if len(read_back.strip()) < 5 and persisted < 5:
         raise RuntimeError(
             "submit: author note did not persist after fill "
-            f"(expected {len(note)} chars, field has {len(filled)})."
+            f"(expected {len(note)} chars, field has {len(read_back.strip())})."
         )
-    log(f"submit: author note filled ({len(note)} chars)")
+    log(f"submit: author note filled ({len(read_back.strip())} chars)")
+
+
+def _verify_author_note(
+    page: Page,
+    review: dict[str, Any],
+    *,
+    log: LogFn = _noop_log,
+) -> None:
+    note = format_compact_author_note(review)
+    if not note:
+        log("submit: author note verification skipped (empty)")
+        return
+    deadline = time.monotonic() + 2.5
+    length = 0
+    while True:
+        state = _read_form_state(page)
+        length = int(state.get("authorNoteLen") or 0)
+        if length >= 5:
+            log(f"submit: author note verified ({length} chars on form)")
+            return
+        if time.monotonic() >= deadline:
+            break
+        page.wait_for_timeout(250)
+    raise RuntimeError(
+        f"submit: author note not registered on form ({length} chars)."
+    )
 
 
 def _click_suggested_tags(
@@ -2414,23 +2874,133 @@ def _set_downgrade_to_mars(
             log(f"submit: WARNING downgrade-to-Mars control not found: {exc}")
 
 
-def _submit_button(page: Page) -> Locator | None:
-    """The in-form Submit button, or None when no visible match exists.
+def _mark_in_form_submit(page: Page) -> dict[str, Any]:
+    """Locate the in-form Submit button and mark it for Playwright."""
+    return page.evaluate(
+        _JS_MARK_IN_FORM_SUBMIT,
+        {
+            "markAttr": SUBMIT_MARK_ATTR,
+            "formMarkers": list(SUBMIT_FORM_MARKERS),
+        },
+    )
 
-    The form opener ("Submit Review") matches SUBMIT_BUTTON_PATTERN too and
-    can stay visible above the open form; the real in-form Submit renders
-    after the form content, so prefer the last visible match over the first.
-    """
-    buttons = page.get_by_role("button", name=SUBMIT_BUTTON_PATTERN)
-    candidate: Locator | None = None
-    for i in range(buttons.count()):
-        button = buttons.nth(i)
+
+def _submit_button(page: Page) -> Locator | None:
+    """The in-form Submit button, or None when no visible match exists."""
+    result = _mark_in_form_submit(page)
+    if not result.get("ok"):
+        return None
+    button = page.locator(SUBMIT_MARK_SELECTOR).first
+    try:
+        if button.is_visible():
+            return button
+    except PlaywrightTimeoutError:
+        pass
+    return None
+
+
+def _submit_button_actually_enabled(page: Page) -> tuple[bool, dict[str, Any]]:
+    """True only when Playwright and Shipd both agree the Submit button is ready."""
+    diag = _submit_button_diagnostics(page)
+    if not diag.get("found"):
+        return False, diag
+    if diag.get("disabled"):
+        return False, diag
+    button = page.locator(SUBMIT_MARK_SELECTOR).first
+    try:
+        if not button.is_enabled():
+            return False, diag
+    except PlaywrightTimeoutError:
+        return False, diag
+    state = _read_form_state(page)
+    if state.get("submitDisabled"):
+        return False, {**diag, "submitDisabled": True, "submitHint": state.get("submitHint")}
+    return True, diag
+
+
+def _submit_button_diagnostics(page: Page) -> dict[str, Any]:
+    """Return text/disabled/bounding-box for the in-form Submit button."""
+    result = _mark_in_form_submit(page)
+    if not result.get("ok"):
+        return {"found": False, "reason": result.get("reason", "unknown")}
+    button = page.locator(SUBMIT_MARK_SELECTOR).first
+    try:
+        box = button.bounding_box()
+    except PlaywrightTimeoutError:
+        box = None
+    try:
+        aria_disabled = button.get_attribute("aria-disabled") == "true"
+    except PlaywrightTimeoutError:
+        aria_disabled = False
+    try:
+        enabled = button.is_enabled() and not aria_disabled
+    except PlaywrightTimeoutError:
+        enabled = not result.get("disabled", True) and not aria_disabled
+    return {
+        "found": True,
+        "text": result.get("text", ""),
+        "disabled": not enabled,
+        "ariaDisabled": aria_disabled,
+        "box": box or result.get("box"),
+    }
+
+
+def _click_in_form_submit(page: Page, *, log: LogFn = _noop_log) -> None:
+    """Click the marked in-form Submit with Playwright + JS fallbacks."""
+    diag = _submit_button_diagnostics(page)
+    if not diag.get("found"):
+        raise RuntimeError(
+            "Submit button not found in review form — "
+            f"{diag.get('reason', 'unknown')}"
+        )
+    log(
+        "submit: clicking in-form Submit "
+        f"{diag.get('text')!r} disabled={diag.get('disabled')} "
+        f"ariaDisabled={diag.get('ariaDisabled')} box={diag.get('box')}"
+    )
+    button = page.locator(SUBMIT_MARK_SELECTOR).first
+    page.evaluate(
+        """(sel) => {
+          const btn = document.querySelector(sel);
+          if (!btn) return;
+          btn.scrollIntoView({ block: 'center', inline: 'nearest' });
+          window.scrollBy(0, -100);
+        }""",
+        SUBMIT_MARK_SELECTOR,
+    )
+    button.scroll_into_view_if_needed()
+    strategies = (
+        ("playwright", lambda: button.click(timeout=10_000)),
+        ("force", lambda: button.click(timeout=5_000, force=True)),
+        (
+            "dispatch",
+            lambda: button.dispatch_event("click"),
+        ),
+    )
+    for name, action in strategies:
         try:
-            if button.is_visible():
-                candidate = button
+            action()
+            log(f"submit: click strategy {name!r} succeeded")
+            _confirm_submit_dialog(page, log=log)
+            return
         except PlaywrightTimeoutError:
-            continue
-    return candidate
+            log(f"submit: click strategy {name!r} failed — trying next")
+    js_result = page.evaluate(
+        _JS_CLICK_MARKED_SUBMIT,
+        {"markAttr": SUBMIT_MARK_ATTR},
+    )
+    if js_result.get("ok"):
+        log(
+            "submit: click strategy 'js' succeeded "
+            f"(disabled={js_result.get('disabled')}, "
+            f"ariaDisabled={js_result.get('ariaDisabled')})"
+        )
+        _confirm_submit_dialog(page, log=log)
+        return
+    raise RuntimeError(
+        "Submit button click failed after Playwright and JS attempts — "
+        f"{js_result.get('reason', 'unknown')}"
+    )
 
 
 def _submit_form_open(page: Page) -> bool:
@@ -2489,8 +3059,8 @@ def _wait_submit_enabled(
             # Submit button.
             log("submit: review form closed while waiting for Submit button")
             return False
-        button = _submit_button(page)
-        if button is not None and button.is_enabled():
+        ready, diag = _submit_button_actually_enabled(page)
+        if ready:
             return True
         if band_ratings is not None and review is not None:
             state = _read_form_state(page)
@@ -2498,8 +3068,11 @@ def _wait_submit_enabled(
             last_diag = _format_validation_diagnostics(state, issues)
         else:
             state = _read_form_state(page)
-            hint = str(state.get("submitHint") or "").strip()
-            last_diag = f"submitDisabled={state.get('submitDisabled')}"
+            hint = str(state.get("submitHint") or diag.get("submitHint") or "").strip()
+            last_diag = (
+                f"submitDisabled={state.get('submitDisabled')} "
+                f"buttonDisabled={diag.get('disabled')}"
+            )
             if hint:
                 last_diag += f" — Shipd hint: {hint!r}"
         page.wait_for_timeout(300)
@@ -2571,21 +3144,16 @@ def _finalize_submission(
             + ". Check the failure snapshot in logs/debug-submit."
         )
 
-    button = _submit_button(page)
-    if button is None:
+    ready, diag = _submit_button_actually_enabled(page)
+    if not ready:
         raise RuntimeError(
-            "Submit Review button disappeared after form validation — "
-            "check the failure snapshot in logs/debug-submit."
+            "Submit Review button still disabled at finalize — "
+            f"text={diag.get('text')!r} box={diag.get('box')} "
+            f"hint={diag.get('submitHint')!r}"
         )
-    button.scroll_into_view_if_needed()
-    try:
-        button.click(timeout=10_000)
-    except PlaywrightTimeoutError:
-        # Sticky footers/toasts can intercept the pointer; force skips the
-        # actionability wait but still sends trusted events.
-        log("submit: click intercepted — retrying with force")
-        button.click(timeout=5_000, force=True)
-    log("submit: Submit Review clicked; waiting for confirmation")
+    log("submit: Step 9/9 — click Submit Review")
+    _click_in_form_submit(page, log=log)
+    log("submit: Step 9/9 — waiting for submission confirmation")
 
     outcome = _wait_submit_confirmation(page, log=log)
     if outcome == "confirmed":
@@ -2599,6 +3167,103 @@ def _finalize_submission(
     return False
 
 
+def _repair_form_gaps(
+    page: Page,
+    band_ratings: dict[str, Any],
+    review: dict[str, Any],
+    *,
+    log: LogFn = _noop_log,
+    max_rounds: int = 4,
+) -> None:
+    """Fill only what _read_form_state shows as missing — never blind re-clicks."""
+    for round_num in range(1, max_rounds + 1):
+        state = _read_form_state(page)
+        issues = _form_validation_issues(state, band_ratings, review)
+        if not issues and not state.get("submitDisabled"):
+            if round_num > 1:
+                log(f"submit: form repair pass {round_num - 1} cleared all gaps")
+            return
+        if not issues and state.get("submitDisabled"):
+            log(
+                "submit: validation passed but Shipd still disables Submit "
+                f"(hint={state.get('submitHint')!r}) — forcing repair"
+            )
+            hint = str(state.get("submitHint") or "").lower()
+            if "confidence" in hint:
+                _ensure_all_band_confidences(
+                    page, band_ratings, force=True, log=log
+                )
+                page.wait_for_timeout(500)
+                continue
+            if "score" in hint:
+                for band_key, heading in BAND_HEADINGS.items():
+                    band = band_ratings.get(band_key) or {}
+                    if isinstance(band, dict) and band.get("score") is not None:
+                        _click_band_score(
+                            page, heading, int(band["score"]), log=log
+                        )
+                        page.wait_for_timeout(300)
+                page.wait_for_timeout(500)
+                continue
+            issues = ["Submit button still disabled"]
+
+        log(
+            f"submit: repair pass {round_num}/{max_rounds} — "
+            f"{len(issues)} gap(s): {'; '.join(issues[:4])}"
+            + (" …" if len(issues) > 4 else "")
+        )
+        bands_by_heading = {b.get("heading"): b for b in state.get("bands") or []}
+        fixed_any = False
+
+        expected_decision = DECISION_LABELS.get(
+            _normalize_decision(str(review["decision"]))
+        )
+        if not state.get("decision") and expected_decision:
+            _click_decision(page, str(review["decision"]), log=log)
+            fixed_any = True
+            page.wait_for_timeout(400)
+
+        for band_key, heading in BAND_HEADINGS.items():
+            band = band_ratings.get(band_key) or {}
+            if not isinstance(band, dict):
+                continue
+            expected_score = int(band.get("score", 3))
+            expected_conf = _normalize_confidence(str(band.get("confidence", "medium")))
+            snapshot = bands_by_heading.get(heading) or {}
+
+            if snapshot.get("score") != expected_score:
+                _click_band_score(page, heading, expected_score, log=log)
+                fixed_any = True
+                page.wait_for_timeout(400)
+                if expected_score < 3:
+                    _wait_band_reason_field(page, heading, timeout_ms=2_000)
+
+            if snapshot.get("confidence") != expected_conf:
+                _click_band_confidence(page, heading, str(band.get("confidence")), log=log)
+                fixed_any = True
+                page.wait_for_timeout(300)
+
+            if expected_score < 3 and int(snapshot.get("reasonLen") or 0) < 5:
+                _fill_band_reason(
+                    page,
+                    heading,
+                    reasoning=str(band.get("reasoning", "")),
+                    score=expected_score,
+                    log=log,
+                )
+                fixed_any = True
+
+        note = format_compact_author_note(review)
+        if note and int(state.get("authorNoteLen") or 0) < 5:
+            _fill_author_note(page, review, log=log)
+            fixed_any = True
+
+        if not fixed_any:
+            log("submit: repair pass made no progress — stopping")
+            break
+        page.wait_for_timeout(500)
+
+
 def _fill_submit_form(
     page: Page,
     review: dict[str, Any],
@@ -2607,17 +3272,68 @@ def _fill_submit_form(
     quest: str,
     log: LogFn,
 ) -> None:
+    log("submit: Step 1/9 — open review form")
     _ensure_submit_review_form(page, log=log)
-    _click_decision(page, str(review["decision"]), log=log)
-    _fill_band_ratings(page, band_ratings, log=log)
-    _fill_band_reasons(page, band_ratings, log=log)
-    _fill_author_note(page, review, log=log)
-    _click_suggested_tags(page, list(review.get("suggested_tags") or []), log=log)
-    _ensure_all_band_confidences(page, band_ratings, log=log)
+    for marker in SUBMIT_FORM_MARKERS:
+        if page.get_by_text(marker, exact=True).count():
+            log("submit: Step 1/9 complete — decision cards visible")
+            break
+    else:
+        raise RuntimeError(
+            "submit: decision cards not visible after opening review form."
+        )
 
+    log("submit: Step 2/9 — select decision")
+    _click_decision(page, str(review["decision"]), log=log)
+    _verify_decision_selected(page, str(review["decision"]), log=log)
+
+    log("submit: Step 3/9 — fill band ratings sequentially")
+    for band_key, heading in BAND_HEADINGS.items():
+        band = band_ratings.get(band_key)
+        if not isinstance(band, dict):
+            raise ValueError(f"Missing band_ratings[{band_key!r}]")
+        score = band.get("score")
+        confidence = band.get("confidence")
+        if score is None or confidence is None:
+            raise ValueError(
+                f"band_ratings[{band_key!r}] requires score and confidence."
+            )
+        log(f"submit: Step 3/9 — band {heading!r}")
+        _fill_band_sequential(
+            page,
+            heading,
+            score=int(score),
+            confidence=str(confidence),
+            reasoning=str(band.get("reasoning", "")),
+            log=log,
+        )
+
+    log("submit: Step 4/9 — fill author note")
+    _fill_author_note(page, review, log=log)
+    _verify_author_note(page, review, log=log)
+
+    log("submit: Step 5/9 — click suggested tags")
+    _click_suggested_tags(page, list(review.get("suggested_tags") or []), log=log)
+
+    log("submit: Step 6/9 — downgrade to Mars (if applicable)")
     if review.get("downgrade_to_mars") and quest == "olympus":
         _set_downgrade_to_mars(page, enabled=True, log=log)
+    else:
+        log("submit: Step 6/9 skipped — no Mars downgrade")
 
+    log("submit: Step 7/9 — final validation")
+    issues = _validate_submit_form(page, band_ratings, review, log=log)
+    if issues:
+        state = _read_form_state(page)
+        raise RuntimeError(
+            "submit: form incomplete before submit — "
+            + _format_validation_diagnostics(state, issues)
+        )
+
+    log("submit: Step 7.5/9 — ensure all band confidences")
+    _ensure_all_band_confidences(page, band_ratings, log=log)
+
+    log("submit: Step 8/9 — wait for Submit button enabled")
     if _wait_submit_enabled(
         page,
         timeout_sec=15.0,
@@ -2625,7 +3341,19 @@ def _fill_submit_form(
         review=review,
         log=log,
     ):
-        log("submit: form ready — Submit Review button enabled")
+        log("submit: Step 8/9 complete — Submit Review button enabled")
+        return
+
+    log("submit: Step 8/9 — repair safety net (Submit still disabled)")
+    _repair_form_gaps(page, band_ratings, review, log=log)
+    if _wait_submit_enabled(
+        page,
+        timeout_sec=10.0,
+        band_ratings=band_ratings,
+        review=review,
+        log=log,
+    ):
+        log("submit: Step 8/9 complete after repair — Submit Review button enabled")
         return
 
     state = _read_form_state(page)
