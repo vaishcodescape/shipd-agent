@@ -81,10 +81,8 @@ def run_submit_from_json(
             if confirmed:
                 print("Review submitted on Shipd.")
             else:
-                print(
-                    "WARNING: Submit clicked but confirmation not observed — "
-                    "verify on Shipd.",
-                    file=sys.stderr,
+                raise RuntimeError(
+                    "Submit clicked but confirmation not observed — verify on Shipd."
                 )
         else:
             print("Form filled (--no-finalize); not clicking final Submit.")

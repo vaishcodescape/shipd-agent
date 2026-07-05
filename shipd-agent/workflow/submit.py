@@ -2958,8 +2958,18 @@ def _submit_button_diagnostics(page: Page) -> dict[str, Any]:
     }
 
 
-def _click_in_form_submit(page: Page, *, log: LogFn = _noop_log) -> None:
-    """Click the marked in-form Submit with Playwright + JS fallbacks."""
+def _click_in_form_submit(
+    page: Page,
+    *,
+    log: LogFn = _noop_log,
+) -> None:
+    """Click the marked in-form Submit with Playwright + JS fallbacks.
+
+    Only clicks the button. Any confirmation modal Shipd raises afterwards
+    (a generic "are you sure?" dialog or the Olympus tier dialog) is driven
+    separately by _wait_submit_confirmation, which scopes its lookups to the
+    live dialog so it can never hit the form's own controls.
+    """
     diag = _submit_button_diagnostics(page)
     if not diag.get("found"):
         raise RuntimeError(
@@ -2983,7 +2993,10 @@ def _click_in_form_submit(page: Page, *, log: LogFn = _noop_log) -> None:
     )
     button.scroll_into_view_if_needed()
     strategies = (
-        ("playwright", lambda: button.click(timeout=10_000)),
+        # A short first timeout: on the Mars path the tier modal can render over
+        # the button mid-click, so we fall through to force/dispatch quickly
+        # instead of burning 10s on actionability retries.
+        ("playwright", lambda: button.click(timeout=4_000)),
         ("force", lambda: button.click(timeout=5_000, force=True)),
         (
             "dispatch",
@@ -2994,7 +3007,6 @@ def _click_in_form_submit(page: Page, *, log: LogFn = _noop_log) -> None:
         try:
             action()
             log(f"submit: click strategy {name!r} succeeded")
-            _confirm_submit_dialog(page, log=log)
             return
         except PlaywrightTimeoutError:
             log(f"submit: click strategy {name!r} failed — trying next")
@@ -3008,7 +3020,6 @@ def _click_in_form_submit(page: Page, *, log: LogFn = _noop_log) -> None:
             f"(disabled={js_result.get('disabled')}, "
             f"ariaDisabled={js_result.get('ariaDisabled')})"
         )
-        _confirm_submit_dialog(page, log=log)
         return
     raise RuntimeError(
         "Submit button click failed after Playwright and JS attempts — "
@@ -3024,28 +3035,160 @@ def _submit_form_open(page: Page) -> bool:
     )
 
 
-def _confirm_submit_dialog(page: Page, *, log: LogFn = _noop_log) -> bool:
-    """Click the confirm button if Shipd raised a dialog after Submit."""
+# Post-Submit confirmation modals. Shipd interrupts submission in two known
+# shapes: a generic "are you sure?" dialog, and the Olympus tier dialog
+# ("Downgrade this submission to Mars?") whose buttons restate the choice
+# ("Keep current tier" / "Downgrade to Mars") rather than using a generic
+# confirm label.
+#
+# Every lookup here is scoped to the *live dialog element*, never the whole
+# page: the form itself exposes a "Downgrade to Mars" control (a <button> in the
+# fallback of _set_downgrade_to_mars), so a page-wide role=button lookup is
+# ambiguous and can click the form toggle instead of the modal — which left the
+# modal up and stalled submission ("could not confirm submission").
+DOWNGRADE_CONFIRM_PATTERN = re.compile(r"downgrade.*mars", re.I)
+KEEP_TIER_PATTERN = re.compile(r"keep.*tier", re.I)
+# Any button that advances/finalizes a confirmation step. Broadened beyond the
+# earlier "yes"/"confirm" guess because we never verified Shipd's real labels;
+# "downgrade" and "submit"/"finalize" are all legitimate affirmatives here.
+AFFIRMATIVE_PATTERN = re.compile(
+    r"^(downgrade|yes|confirm|submit|finalize|continue|got it|ok)\b", re.I
+)
+# Buttons that cancel / back out — never click these when we mean to proceed.
+DECLINE_PATTERN = re.compile(r"keep.*tier|cancel|go back|dismiss|not now", re.I)
+
+
+def _visible_dialog(page: Page) -> Locator | None:
+    """The top-most visible modal dialog, or None.
+
+    Prefers the last visible dialog in DOM order (stacked prompts render later),
+    so a second-step confirmation on top of the tier modal wins.
+    """
     dialogs = page.locator("[role='dialog'], [role='alertdialog']")
-    for i in range(dialogs.count()):
+    try:
+        count = dialogs.count()
+    except PlaywrightTimeoutError:
+        return None
+    found: Locator | None = None
+    for i in range(count):
         dialog = dialogs.nth(i)
         try:
-            if not dialog.is_visible():
-                continue
-            confirm = dialog.get_by_role(
-                "button", name=re.compile(r"^(confirm|submit|yes)", re.I)
-            )
-            if (
-                confirm.count()
-                and confirm.first.is_visible()
-                and confirm.first.is_enabled()
-            ):
-                confirm.first.click()
-                log("submit: confirmed submission dialog")
-                return True
+            if dialog.is_visible():
+                found = dialog
         except PlaywrightTimeoutError:
             continue
-    return False
+    return found
+
+
+def _is_tier_modal(dialog: Locator) -> bool:
+    """True when a dialog restates the Olympus tier choice (keep vs downgrade)."""
+    try:
+        keep = dialog.get_by_role("button", name=KEEP_TIER_PATTERN)
+        down = dialog.get_by_role("button", name=DOWNGRADE_CONFIRM_PATTERN)
+        return bool(keep.count()) and bool(down.count())
+    except PlaywrightTimeoutError:
+        return False
+
+
+def _dialog_affirmative_button(
+    dialog: Locator,
+    *,
+    downgrade_to_mars: bool | None,
+) -> tuple[Locator | None, str]:
+    """Pick the button inside `dialog` that advances submission, honoring intent.
+
+    Downgrade intent => prefer "Downgrade to Mars"; otherwise prefer "Keep
+    current tier" so we never silently change the author's payout tier. Falls
+    back to a generic affirmative (yes/confirm/submit/…) for non-tier dialogs.
+    Only visible + enabled buttons are considered.
+    """
+    buttons = dialog.get_by_role("button")
+    candidates: list[tuple[Locator, str]] = []
+    try:
+        count = buttons.count()
+    except PlaywrightTimeoutError:
+        return None, ""
+    for i in range(count):
+        button = buttons.nth(i)
+        try:
+            if not (button.is_visible() and button.is_enabled()):
+                continue
+            label = (button.inner_text(timeout=500) or "").strip()
+        except PlaywrightTimeoutError:
+            continue
+        candidates.append((button, label))
+
+    intent_pattern = (
+        DOWNGRADE_CONFIRM_PATTERN if downgrade_to_mars else KEEP_TIER_PATTERN
+    )
+    for button, label in candidates:
+        if intent_pattern.search(label):
+            return button, label
+    # Generic affirmative for non-tier dialogs; never a decline/cancel button.
+    for button, label in candidates:
+        if AFFIRMATIVE_PATTERN.search(label) and not DECLINE_PATTERN.search(label):
+            return button, label
+    return None, ""
+
+
+def _confirm_submit_dialog(
+    page: Page,
+    *,
+    downgrade_to_mars: bool | None = None,
+    log: LogFn = _noop_log,
+) -> bool:
+    """Advance one step of any confirmation modal Shipd raised after Submit.
+
+    Returns True when a button was clicked (a step advanced), False when no
+    actionable dialog is up. All lookups are scoped to the live dialog element,
+    so the form's own "Downgrade to Mars" control can never be hit by mistake.
+    Caller loops this until the form unmounts / URL changes.
+    """
+    dialog = _visible_dialog(page)
+    if dialog is None:
+        return False
+    button, label = _dialog_affirmative_button(
+        dialog, downgrade_to_mars=downgrade_to_mars
+    )
+    if button is None:
+        return False
+    try:
+        button.click(timeout=5_000)
+        log(f"submit: confirmation dialog — clicked {label!r}")
+        return True
+    except PlaywrightTimeoutError:
+        log(f"submit: WARNING could not click {label!r} on confirmation dialog")
+        return False
+
+
+def _dump_open_dialogs(page: Page, label: str, *, log: LogFn = _noop_log) -> None:
+    """Record the live modal (screenshot + in-dialog button labels).
+
+    Ground-truth instrumentation for the tier modal we had never captured — the
+    old failure snapshot fired 20s later, after the modal was gone. Fires only on
+    the Mars path, so it is cheap. Never raises.
+    """
+    try:
+        dialog = _visible_dialog(page)
+        buttons: list[dict[str, Any]] = []
+        if dialog is not None:
+            btns = dialog.get_by_role("button")
+            for i in range(btns.count()):
+                candidate = btns.nth(i)
+                try:
+                    buttons.append(
+                        {
+                            "text": (candidate.inner_text(timeout=500) or "").strip(),
+                            "visible": candidate.is_visible(),
+                            "enabled": candidate.is_enabled(),
+                        }
+                    )
+                except PlaywrightTimeoutError:
+                    continue
+        log(f"submit: {label} dialog buttons = {buttons}")
+    except Exception as exc:  # instrumentation must never break submission
+        log(f"submit: WARNING could not dump {label} dialog: {exc}")
+    capture_failure(page, label, log=log)
 
 
 def _on_review_page(page: Page) -> bool:
@@ -3097,6 +3240,7 @@ def _wait_submit_confirmation(
     page: Page,
     *,
     timeout_sec: float = 20.0,
+    downgrade_to_mars: bool | None = None,
     log: LogFn = _noop_log,
 ) -> str:
     """After clicking Submit, wait for evidence the review was accepted.
@@ -3109,13 +3253,20 @@ def _wait_submit_confirmation(
         re.compile(r"review (submitted|received)|thank(s| you)", re.I)
     )
     deadline = time.monotonic() + timeout_sec
+    dumped = False
     while time.monotonic() < deadline:
         if page.url != start_url:
             return "confirmed"
         if success_text.count():
             return "confirmed"
+        dialog = _visible_dialog(page)
+        if dialog is not None and _is_tier_modal(dialog) and not dumped:
+            _dump_open_dialogs(page, "tier-modal", log=log)
+            dumped = True
         # A confirm dialog keeps the form visible until acknowledged.
-        _confirm_submit_dialog(page, log=log)
+        _confirm_submit_dialog(
+            page, downgrade_to_mars=downgrade_to_mars, log=log
+        )
         # Form gone (decision cards unmounted) is the strongest signal the
         # submission went through — the opener button may still be visible.
         if not _submit_form_open(page):
@@ -3165,10 +3316,26 @@ def _finalize_submission(
             f"hint={diag.get('submitHint')!r}"
         )
     log("submit: Step 9/9 — click Submit Review")
+    # We ticked the "Downgrade to Mars" box in Step 6 when the review chose to
+    # downgrade; Shipd then guards Submit with a tier-confirmation modal that
+    # must be acknowledged with the matching button, or submission stalls.
+    downgrade = bool(review and review.get("downgrade_to_mars"))
     _click_in_form_submit(page, log=log)
     log("submit: Step 9/9 — waiting for submission confirmation")
 
-    outcome = _wait_submit_confirmation(page, log=log)
+    outcome = _wait_submit_confirmation(
+        page, downgrade_to_mars=downgrade, log=log
+    )
+    if outcome == "unconfirmed":
+        # The tier modal may only lock the choice — Submit must be clicked again.
+        if _submit_form_open(page):
+            ready, _diag = _submit_button_actually_enabled(page)
+            if ready:
+                log("submit: retrying Submit after unconfirmed confirmation wait")
+                _click_in_form_submit(page, log=log)
+                outcome = _wait_submit_confirmation(
+                    page, downgrade_to_mars=downgrade, log=log
+                )
     if outcome == "confirmed":
         log("submit: review submission confirmed")
         return True

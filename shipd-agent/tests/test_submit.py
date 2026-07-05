@@ -3,20 +3,28 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 from workflow.submit import (
+    DOWNGRADE_CONFIRM_PATTERN,
+    KEEP_TIER_PATTERN,
     REASON_FIELD_PATTERN,
     SUBMIT_BUTTON_PATTERN,
+    SUBMIT_FORM_MARKERS,
+    SUBMIT_MARK_SELECTOR,
     _band_section_headings,
     _click_in_form_submit,
+    _confirm_submit_dialog,
+    _dialog_affirmative_button,
     _ensure_all_band_confidences,
+    _finalize_submission,
     _field_near_reason_label,
     _fill_band_sequential,
     _fill_submit_form,
     _find_band_reason_js,
     _format_validation_diagnostics,
     _form_validation_issues,
+    _is_tier_modal,
     _looks_like_reason_field,
     _mark_band_scope,
     _mark_in_form_submit,
@@ -29,8 +37,11 @@ from workflow.submit import (
     _submit_button_actually_enabled,
     _submit_button_diagnostics,
     _verify_decision_selected,
+    _visible_dialog,
+    _wait_submit_confirmation,
     submit_review,
 )
+from workflow.submit_from_json import main as submit_from_json_main
 
 
 class NormalizeDecisionTests(unittest.TestCase):
@@ -502,7 +513,7 @@ class SubmitButtonDiagnosticsTests(unittest.TestCase):
 
 
 class ClickInFormSubmitTests(unittest.TestCase):
-    def test_click_logs_strategy_and_confirms_dialog(self) -> None:
+    def test_click_logs_strategy(self) -> None:
         page = MagicMock()
         logs: list[str] = []
         button = page.locator.return_value.first
@@ -516,11 +527,320 @@ class ClickInFormSubmitTests(unittest.TestCase):
                 "box": {"x": 1, "y": 2},
             },
         ):
-            with patch("workflow.submit._confirm_submit_dialog", return_value=True) as confirm:
-                _click_in_form_submit(page, log=logs.append)
+            _click_in_form_submit(page, log=logs.append)
         button.click.assert_called_once()
-        confirm.assert_called_once()
         self.assertTrue(any("playwright" in line for line in logs))
+
+
+class FakeButton:
+    """Minimal Playwright button locator for dialog-scoping tests."""
+
+    def __init__(self, label: str, *, visible: bool = True, enabled: bool = True) -> None:
+        self.label = label
+        self._visible = visible
+        self._enabled = enabled
+        self.click_count = 0
+
+    def is_visible(self) -> bool:
+        return self._visible
+
+    def is_enabled(self) -> bool:
+        return self._enabled
+
+    def inner_text(self, timeout: float = 500) -> str:
+        return self.label
+
+    def click(self, timeout: float = 5000) -> None:
+        self.click_count += 1
+
+
+class FakeButtonLocator:
+    """get_by_role('button', name=pattern) within a dialog or page scope."""
+
+    def __init__(self, buttons: list[FakeButton], *, name=None) -> None:
+        self._buttons = buttons
+        self._name = name
+
+    def _matches(self, button: FakeButton) -> bool:
+        if self._name is None:
+            return True
+        return bool(self._name.search(button.label))
+
+    def count(self) -> int:
+        return sum(1 for button in self._buttons if self._matches(button))
+
+    def nth(self, index: int) -> FakeButton:
+        return [button for button in self._buttons if self._matches(button)][index]
+
+    @property
+    def first(self) -> FakeButton:
+        return self.nth(0)
+
+
+class FakeDialog:
+    def __init__(self, buttons: list[FakeButton], *, visible: bool = True) -> None:
+        self._buttons = buttons
+        self._visible = visible
+
+    def is_visible(self) -> bool:
+        return self._visible
+
+    def get_by_role(self, role: str, name=None) -> FakeButtonLocator:
+        if role != "button":
+            return FakeButtonLocator([])
+        return FakeButtonLocator(self._buttons, name=name)
+
+
+class FakeDialogLocator:
+    def __init__(self, dialogs: list[FakeDialog]) -> None:
+        self._dialogs = dialogs
+
+    def count(self) -> int:
+        return len(self._dialogs)
+
+    def nth(self, index: int) -> FakeDialog:
+        return self._dialogs[index]
+
+
+class FakeSubmitButtonLocator:
+    def __init__(self, button: FakeButton) -> None:
+        self.first = button
+
+    def is_visible(self) -> bool:
+        return self.first.is_visible()
+
+    def is_enabled(self) -> bool:
+        return self.first.is_enabled()
+
+
+class FakeTextLocator:
+    def __init__(self, *, count: int = 0) -> None:
+        self._count = count
+
+    def count(self) -> int:
+        return self._count
+
+
+class FakeConfirmationPage:
+    """Page stub exposing dialog + button structure for confirmation helpers."""
+
+    def __init__(
+        self,
+        *,
+        dialogs: list[FakeDialog] | None = None,
+        form_buttons: list[FakeButton] | None = None,
+        form_open: bool = True,
+        url: str = "https://shipd.ai/challenges/abc/review",
+        submit_enabled: bool = True,
+        success_visible: bool = False,
+    ) -> None:
+        self.url = url
+        self._dialogs = dialogs or []
+        self._form_buttons = form_buttons or []
+        self._form_open = form_open
+        self._submit_button = FakeButton("Submit Review", enabled=submit_enabled)
+        self._success_visible = success_visible
+        self.wait_for_timeout_calls = 0
+
+    def locator(self, selector: str):
+        if "dialog" in selector or "alertdialog" in selector:
+            return FakeDialogLocator(self._dialogs)
+        if selector == SUBMIT_MARK_SELECTOR:
+            return FakeSubmitButtonLocator(self._submit_button)
+        return FakeDialogLocator([])
+
+    def get_by_role(self, role: str, name=None) -> FakeButtonLocator:
+        if role == "button":
+            return FakeButtonLocator(self._form_buttons, name=name)
+        return FakeButtonLocator([])
+
+    def get_by_text(self, pattern, exact: bool = False) -> FakeTextLocator:
+        if hasattr(pattern, "search"):
+            if pattern.search("review submitted") and self._success_visible:
+                return FakeTextLocator(count=1)
+            return FakeTextLocator(count=0)
+        if exact and self._form_open and pattern in SUBMIT_FORM_MARKERS:
+            return FakeTextLocator(count=1)
+        return FakeTextLocator(count=0)
+
+    def wait_for_timeout(self, _ms: int) -> None:
+        self.wait_for_timeout_calls += 1
+
+
+class ConfirmSubmitDialogTests(unittest.TestCase):
+    """Tier-modal confirmation must scope to the dialog, not the form toggle."""
+
+    def _tier_modal_page(self) -> tuple[FakeConfirmationPage, FakeButton, FakeButton, FakeButton]:
+        form_toggle = FakeButton("Downgrade to Mars")
+        keep = FakeButton("Keep current tier")
+        downgrade = FakeButton("Downgrade to Mars")
+        dialog = FakeDialog([keep, downgrade])
+        page = FakeConfirmationPage(
+            dialogs=[dialog],
+            form_buttons=[form_toggle],
+        )
+        return page, form_toggle, keep, downgrade
+
+    def test_dialog_scoped_lookup_skips_form_toggle(self) -> None:
+        page, form_toggle, keep, downgrade = self._tier_modal_page()
+        self.assertTrue(
+            _confirm_submit_dialog(page, downgrade_to_mars=True, log=lambda _m: None)
+        )
+        self.assertEqual(downgrade.click_count, 1)
+        self.assertEqual(keep.click_count, 0)
+        self.assertEqual(form_toggle.click_count, 0)
+
+    def test_no_downgrade_intent_clicks_keep_current_tier(self) -> None:
+        page, form_toggle, keep, downgrade = self._tier_modal_page()
+        self.assertTrue(
+            _confirm_submit_dialog(page, downgrade_to_mars=False, log=lambda _m: None)
+        )
+        self.assertEqual(keep.click_count, 1)
+        self.assertEqual(downgrade.click_count, 0)
+        self.assertEqual(form_toggle.click_count, 0)
+
+    def test_tier_modal_needs_both_buttons(self) -> None:
+        # Only the form toggle — no paired "Keep current tier" in a dialog.
+        form_toggle = FakeButton("Downgrade to Mars")
+        page = FakeConfirmationPage(form_buttons=[form_toggle], dialogs=[])
+        self.assertFalse(
+            _confirm_submit_dialog(page, downgrade_to_mars=True, log=lambda _m: None)
+        )
+        self.assertEqual(form_toggle.click_count, 0)
+
+    def test_is_tier_modal_requires_keep_and_downgrade_in_dialog(self) -> None:
+        dialog = FakeDialog(
+            [FakeButton("Keep current tier"), FakeButton("Downgrade to Mars")]
+        )
+        self.assertTrue(_is_tier_modal(dialog))
+        partial = FakeDialog([FakeButton("Downgrade to Mars")])
+        self.assertFalse(_is_tier_modal(partial))
+
+    def test_dialog_affirmative_respects_downgrade_intent(self) -> None:
+        dialog = FakeDialog(
+            [FakeButton("Keep current tier"), FakeButton("Downgrade to Mars")]
+        )
+        button, label = _dialog_affirmative_button(dialog, downgrade_to_mars=True)
+        self.assertIsNotNone(button)
+        self.assertRegex(label, DOWNGRADE_CONFIRM_PATTERN)
+        button, label = _dialog_affirmative_button(dialog, downgrade_to_mars=False)
+        self.assertIsNotNone(button)
+        self.assertRegex(label, KEEP_TIER_PATTERN)
+
+    def test_visible_dialog_returns_topmost_visible(self) -> None:
+        hidden = FakeDialog([], visible=False)
+        top = FakeDialog([FakeButton("OK")], visible=True)
+        page = FakeConfirmationPage(dialogs=[hidden, top])
+        found = _visible_dialog(page)
+        self.assertIs(found, top)
+
+
+class WaitSubmitConfirmationTests(unittest.TestCase):
+    def test_single_step_downgrade_confirms_when_form_closes(self) -> None:
+        keep = FakeButton("Keep current tier")
+        downgrade = FakeButton("Downgrade to Mars")
+        dialog = FakeDialog([keep, downgrade])
+        page = FakeConfirmationPage(dialogs=[dialog], form_open=True)
+
+        def click_downgrade(timeout: float = 5000) -> None:
+            downgrade.click_count += 1
+            page._form_open = False
+
+        downgrade.click = click_downgrade
+
+        with patch(
+            "workflow.submit.time.monotonic",
+            side_effect=[0.0, 0.1, 100.0],
+        ):
+            outcome = _wait_submit_confirmation(
+                page, downgrade_to_mars=True, log=lambda _m: None
+            )
+        self.assertEqual(outcome, "confirmed")
+        self.assertEqual(downgrade.click_count, 1)
+
+    def test_dumps_tier_modal_once(self) -> None:
+        dialog = FakeDialog(
+            [FakeButton("Keep current tier"), FakeButton("Downgrade to Mars")]
+        )
+        page = FakeConfirmationPage(dialogs=[dialog], form_open=True)
+        enabled_submit = MagicMock()
+        enabled_submit.is_enabled.return_value = True
+        with patch("workflow.submit._dump_open_dialogs") as dump, patch(
+            "workflow.submit._confirm_submit_dialog", return_value=False
+        ), patch(
+            "workflow.submit._submit_button", return_value=enabled_submit
+        ), patch(
+            "workflow.submit.time.monotonic",
+            side_effect=[0.0, 0.1, 0.2, 100.0],
+        ):
+            outcome = _wait_submit_confirmation(
+                page, downgrade_to_mars=True, log=lambda _m: None
+            )
+        self.assertEqual(outcome, "unconfirmed")
+        dump.assert_called_once()
+        self.assertEqual(dump.call_args.args[1], "tier-modal")
+
+
+class FinalizeSubmissionTests(unittest.TestCase):
+    def test_finalize_retries_submit_when_modal_locks_tier(self) -> None:
+        page = MagicMock()
+        review = {"downgrade_to_mars": True}
+        with patch("workflow.submit._wait_submit_enabled", return_value=True), patch(
+            "workflow.submit._submit_button_actually_enabled",
+            return_value=(True, {}),
+        ), patch("workflow.submit._click_in_form_submit") as click, patch(
+            "workflow.submit._wait_submit_confirmation",
+            side_effect=["unconfirmed", "confirmed"],
+        ) as wait, patch(
+            "workflow.submit._submit_form_open", side_effect=[True, True]
+        ), patch(
+            "workflow.submit._submit_button_actually_enabled",
+            side_effect=[(True, {}), (True, {})],
+        ):
+            ok = _finalize_submission(
+                page, band_ratings={}, review=review, log=lambda _m: None
+            )
+        self.assertTrue(ok)
+        self.assertEqual(click.call_count, 2)
+        self.assertEqual(wait.call_count, 2)
+        self.assertTrue(wait.call_args.kwargs.get("downgrade_to_mars"))
+
+    def test_finalize_retry_once_then_fails(self) -> None:
+        page = MagicMock()
+        review = {"downgrade_to_mars": True}
+        with patch("workflow.submit._wait_submit_enabled", return_value=True), patch(
+            "workflow.submit._submit_button_actually_enabled",
+            return_value=(True, {}),
+        ), patch("workflow.submit._click_in_form_submit") as click, patch(
+            "workflow.submit._wait_submit_confirmation", return_value="unconfirmed"
+        ), patch("workflow.submit._submit_form_open", return_value=True), patch(
+            "workflow.submit.capture_failure"
+        ) as capture:
+            ok = _finalize_submission(
+                page, band_ratings={}, review=review, log=lambda _m: None
+            )
+        self.assertFalse(ok)
+        self.assertEqual(click.call_count, 2)
+        capture.assert_called_once_with(page, "submit-unconfirmed", log=ANY)
+
+
+class SubmitFromJsonFailureTests(unittest.TestCase):
+    def test_main_returns_nonzero_when_finalize_unconfirmed(self) -> None:
+        with patch(
+            "workflow.submit_from_json.run_submit_from_json",
+            side_effect=RuntimeError(
+                "Submit clicked but confirmation not observed — verify on Shipd."
+            ),
+        ), patch("workflow.submit_from_json.parse_args") as parse_args:
+            parse_args.return_value = MagicMock(
+                review_json=MagicMock(),
+                quest=None,
+                review_url=None,
+                headed=False,
+                auth_state=MagicMock(),
+                no_finalize=False,
+            )
+            self.assertEqual(submit_from_json_main(), 1)
 
 
 class BandScopeTests(unittest.TestCase):

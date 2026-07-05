@@ -15,7 +15,7 @@ VENV_DIR="${ROOT_DIR}/.venv"
 ENV_FILE="${ROOT_DIR}/.env"
 LOG_DIR="${ROOT_DIR}/logs"
 DEFAULT_LOG_FILE="${LOG_DIR}/run.log"
-DEFAULT_INTERVAL=10
+DEFAULT_INTERVAL=1800
 
 QUEST="olympus"
 SEPARATE_STEPS=0
@@ -1030,6 +1030,7 @@ run_separate_steps_cycle() {
 run_separate_steps_batch() {
     local cycle=0
     trap on_signal INT TERM
+    trap '' TSTP
 
     if [[ "${RESUME_BATCH}" -eq 0 ]]; then
         prepare_watch_batch_start
@@ -1085,6 +1086,7 @@ run_separate_steps_batch() {
 
 run_orchestrator_batch() {
     trap on_signal INT TERM
+    trap '' TSTP
     build_orchestrator_args
 
     log "Batch started: ${MAX_RUNS} review(s) via orchestrator"
