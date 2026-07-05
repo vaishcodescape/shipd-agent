@@ -50,6 +50,7 @@ Rules:
 - Phase 0 mechanical results (artifact checks, patch apply, Docker build, test.sh base/new contract) were **already executed deterministically** and appear in the user prompt; `run_phase0_checks` returns the same cached results. Do not try to re-run Docker builds.
 - **Phase 0 test contract (Docker):** tests run inside the submission container with `--network none` — base PASS and new FAIL without solution; both PASS with solution. Cite `phase0_log` outputs; do not invent results.
 - **Work fast:** issue multiple independent tool calls in a single turn (e.g. read problem description + test.patch + solution.patch + Dockerfile together). Avoid redundant reads.
+- **Mandatory reads before summarizing:** you MUST inspect the problem description, test.patch, solution.patch, test.sh, and Dockerfile (batch them in one turn). Never mark a phase SKIP when its artifact exists in the repo — SKIP is only for data that genuinely does not exist (e.g. no agent runs on the page). Running low on budget is never a reason to SKIP.
 - Tag every issue with phase number (0–6) and severity (BLOCKER, MAJOR, MINOR, QUESTION).
 - Do not invent paths, line numbers, or command results — verify with tools.
 - Do not approve anything; your job is evidence collection for the finalize step.
@@ -68,8 +69,10 @@ Rules:
 
 When done, end with a structured summary:
 
-## Phase summaries
-For each phase 0–6: PASS / FAIL / SKIP and one-line rationale.
+## Phase coverage
+Output exactly one line per phase, format `Phase N: PASS|FAIL|SKIP — rationale`,
+for every N from 0 to 6. Never omit a phase. Use SKIP only when the underlying
+data does not exist (never because you ran low on tool budget).
 
 ## Findings
 List BLOCKER/MAJOR/MINOR/QUESTION items with phase, file:line evidence, suggested fix.
@@ -200,6 +203,11 @@ FINALIZE_PHASE_INSTRUCTIONS = f"""
 **band_ratings:** problem ← phase 1; tests ← phases 2–3; solution ← phase 4.
 - Scores 0–3: {_BAND_SCORE_GUIDE}
 - Approve requires each band score ≥ {APPROVE_MIN_BAND_SCORE}; none at 0 or 1.
+- Band scores MUST reflect the deterministic phase verdicts: if phase 4 (LOC) is
+  FAIL the solution band is at most 1; if phase 1 is FAIL the problem band is at
+  most 1; if phase 2 or 3 is FAIL the tests band is at most 1. A guard lowers any
+  score that contradicts a FAIL phase or an open BLOCKER/MAJOR finding, so set
+  them consistently rather than relying on the guard.
 
 **Effective LOC (Phase 4 — deterministic):**
 - `loc_analysis` and `loc_info` are precomputed from `solution.patch` at review start.

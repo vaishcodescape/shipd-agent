@@ -330,7 +330,7 @@ _JS_FIND_AND_MARK = """
         if (/(^|\\s)(bg-(primary|accent|secondary|amber|orange|yellow|emerald|green|blue|destructive))/.test(cls)) {
           return true;
         }
-        if (/(^|\\s)(ring-2|ring-primary|border-primary|border-amber|border-orange)/.test(cls)) {
+        if (/(^|\\s)(ring-2|ring-primary|border-primary)/.test(cls)) {
           return true;
         }
         if (/(^|\\s)text-foreground/.test(cls) &&
@@ -825,7 +825,7 @@ _JS_VERIFY_BAND_SCORES = """
       if (/(^|\\s)(bg-(primary|accent|secondary|amber|orange|yellow|emerald|green|blue|destructive))/.test(cls)) {
         return true;
       }
-      if (/(^|\\s)(ring-2|ring-primary|border-primary|border-amber|border-orange)/.test(cls)) {
+      if (/(^|\\s)(ring-2|ring-primary|border-primary)/.test(cls)) {
         return true;
       }
       if (/(^|\\s)text-foreground/.test(cls) &&
@@ -970,10 +970,16 @@ _JS_FORM_VALIDATION_STATE = """
         return true;
       }
       const cls = String(node.className || '');
+      // Selection shows as a filled background or ring. Do NOT treat amber/
+      // orange/green/red BORDERS as selected: the decision cards (Approve /
+      // Request Changes / Reject) carry those semantic outline colours
+      // permanently, so border-amber/border-orange made the Request Changes
+      // card read as selected even when nothing was chosen — which skipped the
+      // decision click and left Submit disabled ("Select a decision to submit").
       if (/(^|\\s)(bg-(primary|accent|secondary|amber|orange|yellow|emerald|green|blue|destructive))/.test(cls)) {
         return true;
       }
-      if (/(^|\\s)(ring-2|ring-primary|border-primary|border-amber|border-orange)/.test(cls)) {
+      if (/(^|\\s)(ring-2|ring-primary|border-primary)/.test(cls)) {
         return true;
       }
       if (/(^|\\s)text-foreground/.test(cls) &&
@@ -1260,17 +1266,24 @@ _JS_FORM_VALIDATION_STATE = """
     ? submitButtons[submitButtons.length - 1]
     : null;
   if (submitButton) {
-    let node = submitButton.parentElement;
-    for (let depth = 0; depth < 4 && node; depth++) {
-      const text = (node.innerText || '').trim();
-      if (/before submitting|add a reason|score all three|confidence|author note/i.test(text)) {
-        const lines = text.split('\\n').map((l) => l.trim()).filter(Boolean);
-        submitHint = lines.find((l) =>
-          /before submitting|add a reason|score all three|confidence|author note/i.test(l)
-        ) || '';
-        if (submitHint) break;
-      }
-      node = node.parentElement;
+    // Shipd renders the reason Submit is disabled as a caption directly below
+    // the button (e.g. "Select a decision to submit"). Read that verbatim.
+    // The old ancestor-innerText + keyword scan matched the static "Confidence"
+    // band label first and masked the true caption on every failure.
+    const collapse = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+    const isSubmitLabel = (s) => /^submit(\\s+(review|feedback))?$/i.test(norm(s));
+    let sib = submitButton.nextElementSibling;
+    while (sib && !submitHint) {
+      const t = collapse(sib.innerText || sib.textContent || '');
+      if (t && !isSubmitLabel(t)) submitHint = t;
+      sib = sib.nextElementSibling;
+    }
+    if (!submitHint) {
+      const parent = submitButton.parentElement;
+      const lines = (parent ? (parent.innerText || '') : '')
+        .split('\\n').map((l) => l.trim())
+        .filter((l) => l && !isSubmitLabel(l));
+      if (lines.length) submitHint = collapse(lines[lines.length - 1]);
     }
   }
 
@@ -3189,6 +3202,10 @@ def _repair_form_gaps(
                 f"(hint={state.get('submitHint')!r}) — forcing repair"
             )
             hint = str(state.get("submitHint") or "").lower()
+            if "decision" in hint:
+                _click_decision(page, str(review["decision"]), log=log)
+                page.wait_for_timeout(500)
+                continue
             if "confidence" in hint:
                 _ensure_all_band_confidences(
                     page, band_ratings, force=True, log=log

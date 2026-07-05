@@ -1,6 +1,12 @@
-# Run the Shipd agent  
+# Run the Shipd agent
 
 set -euo pipefail
+
+# macOS libmalloc otherwise prints "MallocStackLogging: can't turn off malloc
+# stack logging because it was not enabled" from every child process (python,
+# git, docker, bash, chromium) that inherits these debug vars. Drop them so the
+# run log stays clean; harmless no-op when they are already unset or on Linux.
+unset MallocStackLogging MallocStackLoggingNoCompact MallocStackLoggingDirectory
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"

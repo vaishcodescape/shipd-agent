@@ -36,6 +36,12 @@ DEFAULT_REVIEW_FINALIZE_PAYLOAD_MAX_CHARS = 32_000
 DEFAULT_REVIEW_EXPLORE_MAX_OUTPUT_TOKENS = 4_096
 DEFAULT_REVIEW_FINALIZE_MAX_OUTPUT_TOKENS = 8_192
 
+# Coverage recheck: after the main explore pass, re-prompt the same agent to
+# gather evidence for any rubric phase it skipped (bounded, conditional, and
+# only fires when a required phase has no evidence).
+DEFAULT_REVIEW_COVERAGE_RECHECK = True
+DEFAULT_REVIEW_COVERAGE_RECHECK_MAX_STEPS = 6
+
 
 @dataclass(frozen=True)
 class ReviewConfig:
@@ -56,6 +62,8 @@ class ReviewConfig:
     review_finalize_payload_max_chars: int
     review_explore_max_output_tokens: int
     review_finalize_max_output_tokens: int
+    review_coverage_recheck: bool
+    review_coverage_recheck_max_steps: int
     review_skip_explore_on_phase0_fail: bool
     rubric_path: str
     olympus_min_loc: int
@@ -158,6 +166,18 @@ def get_review_config(*, dry_run_override: bool | None = None) -> ReviewConfig:
             os.getenv(
                 "REVIEW_FINALIZE_MAX_OUTPUT_TOKENS",
                 str(DEFAULT_REVIEW_FINALIZE_MAX_OUTPUT_TOKENS),
+            )
+        ),
+        review_coverage_recheck=_truthy(
+            os.getenv(
+                "REVIEW_COVERAGE_RECHECK",
+                "1" if DEFAULT_REVIEW_COVERAGE_RECHECK else "0",
+            )
+        ),
+        review_coverage_recheck_max_steps=int(
+            os.getenv(
+                "REVIEW_COVERAGE_RECHECK_MAX_STEPS",
+                str(DEFAULT_REVIEW_COVERAGE_RECHECK_MAX_STEPS),
             )
         ),
         # Default off: even when Phase 0 fails, the rubric requires evaluating

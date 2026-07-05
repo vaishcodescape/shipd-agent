@@ -1,7 +1,8 @@
-# LangGraph review agent 
+# LangGraph review agent
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Annotated, Any, TypedDict
 
@@ -129,6 +130,143 @@ def _load_rubric_excerpt(rubric_path: str, *, max_chars: int = 16_000) -> str:
 
 def _default_band(score: int = 1, *, confidence: str = "high", reasoning: str) -> BandRating:
     return BandRating(score=score, confidence=confidence, reasoning=reasoning)  # type: ignore[arg-type]
+
+
+# --- Phase coverage detection (keeps the explore agent from skipping phases) ---
+
+_PHASE_LABELS: dict[str, str] = {
+    "0": "setup / ground truth",
+    "1": "problem description",
+    "2": "harness (Dockerfile/test.sh)",
+    "3": "tests",
+    "4": "solution / LOC",
+    "5": "agent runs",
+    "6": "platform / related",
+}
+
+# Phases always evaluable from the cloned repo (their artifacts are local).
+_ARTIFACT_PHASES: tuple[str, ...] = ("1", "2", "3")
+
+_PHASE_STATUS_RE = re.compile(
+    r"(?:phase\s*)?([0-6])\b[^\n]*?\b(PASS|FAIL|SKIP)\b", re.IGNORECASE
+)
+
+
+def _scrape_value_present(value: Any) -> bool:
+    """True when a scraped panel string carries real data (not a placeholder)."""
+    text = str(value or "").strip().lower()
+    return bool(text) and text not in {"not available", "none", "n/a", ""}
+
+
+def _agent_runs_available(scrape: dict[str, str]) -> bool:
+    return _scrape_value_present(scrape.get("agent_runs"))
+
+
+def _platform_data_available(scrape: dict[str, str]) -> bool:
+    return (
+        _scrape_value_present(scrape.get("related_submissions"))
+        or scrape.get("holistic_check_available") == "true"
+    )
+
+
+def _required_coverage_phases(scrape: dict[str, str]) -> set[str]:
+    """Phases the agent must have evidence for, given what data is available."""
+    required = set(_ARTIFACT_PHASES)
+    if _agent_runs_available(scrape):
+        required.add("5")
+    if _platform_data_available(scrape):
+        required.add("6")
+    return required
+
+
+def _final_assistant_text(messages: list[BaseMessage]) -> str:
+    """Text of the last assistant message without tool calls (the summary)."""
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and not msg.tool_calls:
+            text = msg.content if isinstance(msg.content, str) else str(msg.content)
+            if text.strip():
+                return text.strip()
+    return ""
+
+
+def _parse_phase_verdicts(summary: str) -> dict[str, str]:
+    """Map phase number -> PASS/FAIL/SKIP from the agent's coverage block."""
+    verdicts: dict[str, str] = {}
+    for line in summary.splitlines():
+        match = _PHASE_STATUS_RE.search(line)
+        if match:
+            verdicts.setdefault(match.group(1), match.group(2).upper())
+    return verdicts
+
+
+def _explore_tool_phase_evidence(messages: list[BaseMessage]) -> set[str]:
+    """Phases the agent gathered tool evidence for (independent of its summary)."""
+    evidence: set[str] = set()
+    for msg in messages:
+        if not (isinstance(msg, AIMessage) and msg.tool_calls):
+            continue
+        for call in msg.tool_calls:
+            name = call.get("name", "")
+            args = call.get("args", {}) or {}
+            path = str(args.get("path", "")).lower()
+            if name == "get_submission_summary":
+                evidence.add("1")
+            elif name == "compute_effective_loc":
+                evidence.add("4")
+            elif name in ("read_holistic_check", "read_shipd_review_panel"):
+                evidence.update({"5", "6"})
+            elif name in ("run_phase0_checks", "check_patch_apply", "get_git_info"):
+                evidence.add("0")
+            elif name == "read_file":
+                if any(k in path for k in ("problem", "prompt", "statement", "readme")):
+                    evidence.add("1")
+                if "dockerfile" in path or "test.sh" in path:
+                    evidence.add("2")
+                if "test" in path and "patch" in path:
+                    evidence.update({"2", "3"})
+                elif "test" in path:
+                    evidence.add("3")
+                if "solution" in path:
+                    evidence.add("4")
+    return evidence
+
+
+def _explore_coverage_gaps(
+    messages: list[BaseMessage], scrape: dict[str, str]
+) -> list[str]:
+    """Required phases with neither a PASS/FAIL verdict nor tool evidence."""
+    required = _required_coverage_phases(scrape)
+    verdicts = _parse_phase_verdicts(_final_assistant_text(messages))
+    evidence = _explore_tool_phase_evidence(messages)
+    gaps = []
+    for phase in sorted(required):
+        covered = verdicts.get(phase) in ("PASS", "FAIL") or phase in evidence
+        if not covered:
+            gaps.append(phase)
+    return gaps
+
+
+_COVERAGE_PHASE_INSTRUCTIONS: dict[str, str] = {
+    "1": "Phase 1 (problem description): read the problem statement and judge clarity, repo fit, and AI-slop.",
+    "2": "Phase 2 (harness): read the Dockerfile and test.sh; check minimal image and the base/new split.",
+    "3": "Phase 3 (tests): read test.patch; check coverage, determinism, no network, and behaviour-not-implementation.",
+    "5": "Phase 5 (agent runs): call read_holistic_check and read_shipd_review_panel('Agent Runs'); cite pass rate and medians.",
+    "6": "Phase 6 (platform): call read_shipd_review_panel('Related Submissions') and read_holistic_check; note duplicate/overlap and Mars-vs-Olympus fit.",
+}
+
+
+def _build_coverage_followup_prompt(gaps: list[str]) -> str:
+    steps = "\n".join(
+        f"- {_COVERAGE_PHASE_INSTRUCTIONS.get(p, f'Phase {p}: inspect the relevant artifacts.')}"
+        for p in gaps
+    )
+    return (
+        "Coverage check: you have not gathered evidence for rubric phase(s) "
+        f"{', '.join(gaps)}. Do not skip a phase whose data exists. Inspect them now:\n"
+        f"{steps}\n\n"
+        "Use tools to read the artifacts, then re-emit the '## Phase coverage' block "
+        "with a `Phase N: PASS|FAIL|SKIP` line for every phase 0–6."
+    )
 
 
 def scrape_node(state: ReviewState) -> dict:
@@ -481,6 +619,54 @@ def unified_review_node(state: ReviewState) -> dict:
             "explore_notes": "Unified review agent produced no messages.",
         }
 
+    # Coverage recheck: if the agent skipped a phase whose data exists, re-prompt
+    # the SAME conversation to gather that evidence before finalize scores it.
+    # Only runs when budget remained (a fresh exhaustion would just re-trip) and
+    # is bounded by its own small step budget.
+    if (
+        config.review_coverage_recheck
+        and not budget_exhausted
+        and any(isinstance(m, AIMessage) for m in messages)
+    ):
+        gaps = _explore_coverage_gaps(messages, scrape)
+        if gaps:
+            log_activity(
+                "coverage recheck: no evidence for phase(s) "
+                f"{', '.join(gaps)} — re-exploring "
+                f"(≤{config.review_coverage_recheck_max_steps} steps)",
+                category="review",
+            )
+            recheck_limit = 2 * config.review_coverage_recheck_max_steps + 3
+            try:
+                for chunk in agent.stream(
+                    {"messages": messages + [HumanMessage(content=_build_coverage_followup_prompt(gaps))]},
+                    config={"recursion_limit": recheck_limit},
+                    stream_mode="values",
+                ):
+                    new_messages = chunk.get("messages", [])
+                    for msg in new_messages[len(messages):]:
+                        _log_agent_message(msg)
+                    messages = new_messages
+                remaining = _explore_coverage_gaps(messages, scrape)
+                if remaining:
+                    log_activity(
+                        "coverage recheck: phase(s) "
+                        f"{', '.join(remaining)} still uncovered — validate will flag",
+                        category="review",
+                    )
+            except GraphRecursionError:
+                log_activity(
+                    "coverage recheck hit its step limit — using best-effort evidence",
+                    category="review",
+                )
+            except Exception as exc:
+                log_activity(f"coverage recheck failed: {exc}", category="review")
+        else:
+            log_activity(
+                "coverage recheck: all required phases have evidence",
+                category="review",
+            )
+
     elapsed = time.monotonic() - started
     tool_calls = sum(
         len(m.tool_calls) for m in messages
@@ -726,6 +912,43 @@ def finalize_node(state: ReviewState) -> dict:
     return {"review_result": mark_review_complete(review.to_submit_dict())}
 
 
+def _flag_coverage_gaps(review: ReviewResult, gap_phases: list[str]) -> ReviewResult:
+    """Flag phases that could not be evaluated and force request_changes.
+
+    Policy (chosen with the user): never block a submit on a coverage gap —
+    submit a review that admits the gap and asks for changes, rather than
+    silently skipping the factor or discarding the whole review.
+    """
+    names = ", ".join(f"Phase {p} ({_PHASE_LABELS.get(p, p)})" for p in gap_phases)
+    note = (
+        f"Coverage gap — not evaluated: {names}. "
+        "Treated as request_changes (flagged, not silently skipped)."
+    )
+    updates: dict[str, Any] = {}
+    # A gap can never support approve; escalate approve → request_changes but
+    # leave an existing reject alone (reject is the stronger verdict).
+    if review.decision == "approve":
+        updates["decision"] = "request_changes"
+
+    internal = review.internal_notes.strip()
+    updates["internal_notes"] = f"{internal}\n{note}".strip() if internal else note
+
+    feedback_line = (
+        f"Note: {names} could not be fully evaluated automatically — "
+        "please double-check before relying on this review."
+    )
+    feedback = review.contributor_feedback.strip()
+    if feedback_line not in feedback:
+        updates["contributor_feedback"] = (
+            f"{feedback}\n{feedback_line}".strip() if feedback else feedback_line
+        )
+
+    updates["recommendation_summary"] = (
+        f"Coverage gap ({names}). {review.recommendation_summary}".strip()
+    )
+    return review.model_copy(update=updates)
+
+
 def validate_node(state: ReviewState) -> dict:
     raw = state.get("review_result")
     if not raw:
@@ -769,23 +992,89 @@ def validate_node(state: ReviewState) -> dict:
             "review_result": mark_review_incomplete(result_dict, error=error),
         }
 
-    # Phases 1-3 (problem, harness, tests) always have material to review;
-    # SKIP there means the agent never actually evaluated the submission.
-    skipped_core = [
+    # Coverage gaps: a phase whose data exists must not come back SKIP. Phases
+    # 1-3 (problem, harness, tests) and 4 (solution/LOC) are always evaluable
+    # from the cloned repo; 5/6 only when their panels were scraped. Rather than
+    # blocking, flag the gap and force request_changes so a review still ships.
+    scrape = state.get("scrape_context", {})
+    evaluable = set(_ARTIFACT_PHASES) | {"4"}
+    if _agent_runs_available(scrape):
+        evaluable.add("5")
+    if _platform_data_available(scrape):
+        evaluable.add("6")
+    phase_status = result_dict.get("phase_results", {})
+    gap_phases = [
         key
-        for key in ("1", "2", "3")
-        if result_dict.get("phase_results", {}).get(key, {}).get("status") == "SKIP"
+        for key in sorted(evaluable)
+        if phase_status.get(key, {}).get("status") == "SKIP"
     ]
-    if skipped_core:
-        error = (
-            f"Rubric phases {', '.join(skipped_core)} were not evaluated "
-            "(status SKIP) — review is incomplete and must not be submitted. "
-            "Check REVIEW_SKIP_EXPLORE_ON_PHASE0_FAIL=0 and explore agent output."
+    if gap_phases:
+        review = _flag_coverage_gaps(review, gap_phases)
+        result_dict = review.to_submit_dict()
+        log_activity(
+            "validate: coverage gap on phase(s) "
+            f"{', '.join(gap_phases)} — forcing request_changes and flagging",
+            category="review",
         )
-        log_activity(f"validate: {error}", category="review")
-        return {"review_result": mark_review_incomplete(result_dict, error=error)}
 
     return {"review_result": mark_review_complete(result_dict)}
+
+
+# Band ← governing rubric phase(s): a FAIL there caps the band score.
+_BAND_GOVERNING_PHASES: dict[str, tuple[str, ...]] = {
+    "problem": ("1",),
+    "tests": ("2", "3"),
+    "solution": ("4",),
+}
+
+
+def _augment_reasoning(existing: str, note: str) -> str:
+    existing = (existing or "").strip()
+    if not existing:
+        return note
+    if note in existing:
+        return existing
+    return f"{existing} {note}"
+
+
+def _cap_bands_to_deterministic(
+    review: ReviewResult, phase_results: dict[str, PhaseResult]
+) -> tuple[BandRatings | None, list[str]]:
+    """Lower band scores that contradict a FAIL phase or a blocking finding.
+
+    Deterministic verdicts (LOC/Phase 4, agent runs, Phase 0 test contract) must
+    show up in the visible band score — not just internal notes — so a LOC FAIL
+    can't sit next to a "Solution 3/Clean" band. Only ever lowers, never raises.
+    """
+    failed = set(any_phase_failed(phase_results))
+    blocking_by_phase: dict[str, set[str]] = {}
+    for finding in review.findings:
+        if finding.severity in SEVERITY_BLOCK_APPROVE:
+            blocking_by_phase.setdefault(str(finding.phase), set()).add(finding.severity)
+
+    band_updates: dict[str, BandRating] = {}
+    reasons: list[str] = []
+    for band_name, phases in _BAND_GOVERNING_PHASES.items():
+        band = getattr(review.band_ratings, band_name)
+        if band.score <= 1:
+            continue
+        fail_hit = [p for p in phases if p in failed]
+        block_hit = sorted({s for p in phases for s in blocking_by_phase.get(p, set())})
+        if fail_hit:
+            cause = f"phase {'/'.join(fail_hit)} FAIL"
+        elif block_hit:
+            cause = f"open {'/'.join(block_hit)} finding"
+        else:
+            continue
+        reason = _augment_reasoning(
+            band.reasoning, f"Score capped at 1 — {cause} (deterministic)."
+        )
+        band_updates[band_name] = band.model_copy(update={"score": 1, "reasoning": reason})
+        reasons.append(f"{band_name} band capped to 1 ({cause})")
+
+    if not band_updates:
+        return None, []
+    return review.band_ratings.model_copy(update=band_updates), reasons
 
 
 def _apply_rubric_guards(review: ReviewResult, state: ReviewState) -> ReviewResult:
@@ -794,6 +1083,13 @@ def _apply_rubric_guards(review: ReviewResult, state: ReviewState) -> ReviewResu
 
     phase_results = dicts_to_phase_results(ensure_all_phase_results(review.phase_results))
     updates["phase_results"] = phase_results
+
+    # Force deterministic FAIL/blocking verdicts into the visible band scores
+    # before the decision checks below read them.
+    capped_bands, band_reasons = _cap_bands_to_deterministic(review, phase_results)
+    if capped_bands is not None:
+        review = review.model_copy(update={"band_ratings": capped_bands})
+        reasons.extend(band_reasons)
 
     failed_phases = any_phase_failed(phase_results)
     if failed_phases and review.decision == "approve":
@@ -919,11 +1215,31 @@ def _summarize_explore_messages(
 
     Human prompts are dropped (phase0 log, rubric, and scrape context are
     passed to finalize separately) and tool outputs are truncated so the
-    finalize call stays small and fast.
+    finalize call stays small and fast. The agent's final phase-by-phase
+    summary is preserved verbatim — it is emitted last, so a naive
+    whole-transcript truncation would drop exactly the conclusions finalize
+    needs and phases would read back as SKIP.
     """
+    # Locate the final assistant summary (last AIMessage without tool calls).
+    final_idx: int | None = None
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if isinstance(msg, AIMessage) and not msg.tool_calls:
+            text = msg.content if isinstance(msg.content, str) else str(msg.content)
+            if text.strip():
+                final_idx = i
+                break
+
+    final_summary = ""
+    if final_idx is not None:
+        fmsg = messages[final_idx]
+        final_summary = (
+            fmsg.content if isinstance(fmsg.content, str) else str(fmsg.content)
+        ).strip()
+
     parts: list[str] = []
-    for msg in messages:
-        if isinstance(msg, HumanMessage):
+    for i, msg in enumerate(messages):
+        if i == final_idx or isinstance(msg, HumanMessage):
             continue
         if isinstance(msg, AIMessage):
             text = msg.content if isinstance(msg.content, str) else str(msg.content)
@@ -939,10 +1255,23 @@ def _summarize_explore_messages(
             parts.append(f"Tool[{msg.name or 'tool'}]: {content}")
         else:
             parts.append(str(msg.content))
-    joined = "\n".join(parts)
-    if len(joined) > max_chars:
-        return joined[:max_chars] + "\n… [explore transcript truncated]"
-    return joined
+
+    prefix = "\n".join(parts)
+
+    if not final_summary:
+        if len(prefix) > max_chars:
+            return prefix[:max_chars] + "\n… [explore transcript truncated]"
+        return prefix
+
+    summary_block = "## Final phase summary (verbatim)\n" + final_summary
+    # If the summary alone fills the budget, keep it (head+tail) over the chatter.
+    if len(summary_block) >= max_chars:
+        return truncate_text(summary_block, max_chars, label="final summary")
+
+    prefix_budget = max_chars - len(summary_block) - 2
+    if len(prefix) > prefix_budget:
+        prefix = prefix[:prefix_budget] + "\n… [earlier explore steps truncated]"
+    return f"{prefix}\n\n{summary_block}" if prefix else summary_block
 
 
 def build_review_graph():
