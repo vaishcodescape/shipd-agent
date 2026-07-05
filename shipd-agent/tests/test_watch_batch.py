@@ -72,6 +72,47 @@ class WatchBatchTests(unittest.TestCase):
                 )
             )
 
+    def test_load_legacy_options_backfills_cooldown_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "watch-batch.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": watch_batch.VERSION,
+                        "max_runs": 80,
+                        "completed_runs": 6,
+                        "quest": "olympus",
+                        "interval_sec": 0,
+                        "options": {
+                            "review": True,
+                            "submit": True,
+                            "clone": True,
+                            "cleanup": None,
+                            "separate_steps": False,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            batch = watch_batch.load_batch(path)
+            assert batch is not None
+            self.assertTrue(
+                watch_batch.options_compatible(
+                    batch,
+                    quest="olympus",
+                    interval_sec=0,
+                    options={
+                        "review": True,
+                        "submit": True,
+                        "clone": True,
+                        "cleanup": None,
+                        "separate_steps": False,
+                        "cooldown_every": 5,
+                        "cooldown_sec": 3600,
+                    },
+                )
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

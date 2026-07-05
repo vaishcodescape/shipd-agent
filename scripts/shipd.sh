@@ -16,6 +16,8 @@ ENV_FILE="${ROOT_DIR}/.env"
 LOG_DIR="${ROOT_DIR}/logs"
 DEFAULT_LOG_FILE="${LOG_DIR}/run.log"
 DEFAULT_INTERVAL=0
+DEFAULT_COOLDOWN_EVERY=5
+DEFAULT_COOLDOWN_SEC=3600
 
 QUEST="olympus"
 SEPARATE_STEPS=0
@@ -23,6 +25,8 @@ ONCE=0
 SKIP_PROMPT=0
 MAX_RUNS_EXPLICIT=0
 INTERVAL=""
+COOLDOWN_EVERY=""
+COOLDOWN_SEC=""
 MAX_RUNS=""
 HEADED=0
 NO_CLONE=0
@@ -551,6 +555,22 @@ sleep_interruptible() {
     fi
 }
 
+cooldown_interruptible() {
+    local seconds="$1"
+    local elapsed=0
+    if [[ "${USE_TTY_UI}" -eq 0 ]]; then
+        log "Cooldown started for ${seconds}s"
+    fi
+    while [[ "${elapsed}" -lt "${seconds}" ]] && [[ "${SHUTDOWN}" -eq 0 ]]; do
+        ui_cooldown_tick "${elapsed}" "${seconds}"
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    if [[ "${USE_TTY_UI}" -eq 1 ]]; then
+        ui_cooldown_tick "${elapsed}" "${seconds}"
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --once)
@@ -672,6 +692,12 @@ export -n LOG_FILE 2>/dev/null || true
 if [[ -z "${INTERVAL}" ]]; then
     INTERVAL="${WATCH_INTERVAL_SEC:-${DEFAULT_INTERVAL}}"
 fi
+if [[ -z "${COOLDOWN_EVERY}" ]]; then
+    COOLDOWN_EVERY="${WATCH_COOLDOWN_EVERY_COMPLETED:-${DEFAULT_COOLDOWN_EVERY}}"
+fi
+if [[ -z "${COOLDOWN_SEC}" ]]; then
+    COOLDOWN_SEC="${WATCH_COOLDOWN_SEC:-${DEFAULT_COOLDOWN_SEC}}"
+fi
 
 mkdir -p "$(dirname "${LOG_FILE}")" "${LOG_DIR}" "${ROOT_DIR}/reviews" "${ROOT_DIR}/submissions"
 
@@ -768,7 +794,7 @@ preflight() {
         die "--no-review is required when using --no-clone (review needs a cloned repo)"
     fi
 
-    log "Preflight passed (reviews=${MAX_RUNS:-prompt}, quest=${QUEST}, review=${REVIEW}, submit=${SUBMIT}, interval=${INTERVAL}s)"
+    log "Preflight passed (reviews=${MAX_RUNS:-prompt}, quest=${QUEST}, review=${REVIEW}, submit=${SUBMIT}, interval=${INTERVAL}s, cooldown_every=${COOLDOWN_EVERY}, cooldown_sec=${COOLDOWN_SEC}s)"
 }
 
 build_orchestrator_args() {
@@ -785,7 +811,13 @@ build_orchestrator_args() {
     # passing it would write each orchestrator/activity line twice.
 
     if [[ -n "${MAX_RUNS}" ]]; then
-        ORCH_ARGS+=(--watch --max-runs "${MAX_RUNS}" --interval "${INTERVAL}")
+        ORCH_ARGS+=(
+            --watch
+            --max-runs "${MAX_RUNS}"
+            --interval "${INTERVAL}"
+            --cooldown-every "${COOLDOWN_EVERY}"
+            --cooldown-sec "${COOLDOWN_SEC}"
+        )
     fi
 }
 
@@ -878,6 +910,8 @@ options = {
     'clone': $((1 - NO_CLONE)) == 1,
     'cleanup': ${cleanup_arg},
     'separate_steps': ${SEPARATE_STEPS} == 1,
+    'cooldown_every': int('${COOLDOWN_EVERY}'),
+    'cooldown_sec': int('${COOLDOWN_SEC}'),
 }
 if not watch_batch.options_compatible(
     batch,
@@ -906,6 +940,8 @@ watch_batch.start_batch(
         'clone': $((1 - NO_CLONE)) == 1,
         'cleanup': ${cleanup_arg},
         'separate_steps': ${SEPARATE_STEPS} == 1,
+        'cooldown_every': int('${COOLDOWN_EVERY}'),
+        'cooldown_sec': int('${COOLDOWN_SEC}'),
     },
 )
 "
@@ -930,6 +966,13 @@ watch_batch_is_active() {
     batch_python "
 from stats import watch_batch
 raise SystemExit(0 if watch_batch.get_active_batch() else 1)
+"
+}
+
+completed_review_count() {
+    batch_python "
+from session_stats import get_summary
+print(int(get_summary().get('total_completed', 0)))
 "
 }
 
@@ -1067,7 +1110,7 @@ run_separate_steps_batch() {
         prepare_watch_batch_start
     fi
 
-    log "Batch started: ${MAX_RUNS} review(s), interval=${INTERVAL}s between cycles"
+    log "Batch started: ${MAX_RUNS} review(s), interval=${INTERVAL}s between cycles, cooldown every ${COOLDOWN_EVERY} completed review(s) for ${COOLDOWN_SEC}s"
 
     while [[ "${SHUTDOWN}" -eq 0 ]]; do
         if ! watch_batch_is_active; then
@@ -1103,7 +1146,14 @@ run_separate_steps_batch() {
             break
         fi
 
-        sleep_interruptible "${INTERVAL}"
+        local completed_reviews=0
+        completed_reviews="$(completed_review_count)"
+        if [[ "${COOLDOWN_EVERY}" -gt 0 ]] && [[ "${COOLDOWN_SEC}" -gt 0 ]] && [[ "${completed_reviews}" -gt 0 ]] && (( completed_reviews % COOLDOWN_EVERY == 0 )); then
+            log "Cooldown triggered after ${completed_reviews} completed reviews. Waiting ${COOLDOWN_SEC}s."
+            cooldown_interruptible "${COOLDOWN_SEC}"
+        else
+            sleep_interruptible "${INTERVAL}"
+        fi
     done
 
     trap - INT TERM

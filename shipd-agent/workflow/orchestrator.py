@@ -395,6 +395,8 @@ def _batch_options(
     review: bool,
     submit: bool,
     cleanup: bool | None,
+    cooldown_every: int,
+    cooldown_sec: int,
 ) -> dict[str, bool | None]:
     return {
         "review": review,
@@ -402,6 +404,8 @@ def _batch_options(
         "clone": clone,
         "cleanup": cleanup,
         "separate_steps": False,
+        "cooldown_every": int(cooldown_every),
+        "cooldown_sec": int(cooldown_sec),
     }
 
 
@@ -418,6 +422,8 @@ def _prepare_watch_batch(
     *,
     quest: str,
     interval_sec: int,
+    cooldown_every: int,
+    cooldown_sec: int,
     max_runs: int | None,
     clone: bool,
     review: bool,
@@ -435,6 +441,8 @@ def _prepare_watch_batch(
         review=review,
         submit=submit,
         cleanup=cleanup,
+        cooldown_every=cooldown_every,
+        cooldown_sec=cooldown_sec,
     )
     if fresh:
         watch_batch.clear_batch()
@@ -545,6 +553,8 @@ def run_watch_loop(
     max_runs, batch = _prepare_watch_batch(
         quest=quest,
         interval_sec=interval_sec,
+        cooldown_every=cooldown_every,
+        cooldown_sec=cooldown_sec,
         max_runs=max_runs,
         clone=clone,
         review=review,
@@ -772,10 +782,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cooldown-every",
         type=int,
-        default=int(os.getenv("WATCH_COOLDOWN_EVERY_COMPLETED", "10")),
+        default=int(os.getenv("WATCH_COOLDOWN_EVERY_COMPLETED", "5")),
         help=(
             "After this many completed reviews, pause for cooldown "
-            "(default: 10, or WATCH_COOLDOWN_EVERY_COMPLETED from .env)."
+            "(default: 5, or WATCH_COOLDOWN_EVERY_COMPLETED from .env)."
         ),
     )
     parser.add_argument(

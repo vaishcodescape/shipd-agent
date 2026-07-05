@@ -24,6 +24,8 @@ def _empty_options() -> dict[str, Any]:
         "clone": True,
         "cleanup": None,
         "separate_steps": False,
+        "cooldown_every": 5,
+        "cooldown_sec": 3600,
     }
 
 
@@ -41,7 +43,14 @@ def load_batch(path: Path = BATCH_PATH) -> dict[str, Any] | None:
     completed = int(data.get("completed_runs", 0))
     if max_runs <= 0 or completed < 0 or completed > max_runs:
         return None
-    data.setdefault("options", _empty_options())
+    saved_options = data.get("options")
+    if isinstance(saved_options, dict):
+        data["options"] = {
+            **_empty_options(),
+            **saved_options,
+        }
+    else:
+        data["options"] = _empty_options()
     return data
 
 
