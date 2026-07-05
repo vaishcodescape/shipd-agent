@@ -58,6 +58,7 @@ from workflow.time_logs import (
 
 
 PHASE_PREFIX = "SHIPD:PHASE:"
+COOLDOWN_PREFIX = "SHIPD:COOLDOWN:"
 
 
 class ReviewAgentError(RuntimeError):
@@ -534,6 +535,8 @@ def run_watch_loop(
     submit: bool,
     cleanup: bool | None,
     interval_sec: int,
+    cooldown_every: int,
+    cooldown_sec: int,
     max_runs: int | None,
     log_file: Path | None,
     fresh: bool = False,
@@ -630,12 +633,43 @@ def run_watch_loop(
             if watcher.requested:
                 break
 
-            log_message(
-                f"Sleeping {interval_sec}s before next run "
-                "(browser closed, minimal memory use).",
-                log_file=log_file,
+            completed_reviews = int(
+                session_stats.get_summary().get("total_completed", 0)
             )
-            watcher.sleep(interval_sec)
+            should_cooldown = (
+                cooldown_every > 0
+                and cooldown_sec > 0
+                and completed_reviews > 0
+                and completed_reviews % cooldown_every == 0
+            )
+            if should_cooldown:
+                log_message(
+                    f"Cooldown triggered after {completed_reviews} completed "
+                    f"reviews. Waiting {cooldown_sec}s.",
+                    log_file=log_file,
+                )
+                for elapsed in range(cooldown_sec):
+                    if watcher.requested:
+                        break
+                    log_message(
+                        f"{COOLDOWN_PREFIX}{elapsed}:{cooldown_sec}",
+                        log_file=log_file,
+                    )
+                    watcher.sleep(1)
+                if watcher.requested:
+                    break
+                log_message(
+                    f"{COOLDOWN_PREFIX}{cooldown_sec}:{cooldown_sec}",
+                    log_file=log_file,
+                )
+                log_message("Cooldown complete; starting next run.", log_file=log_file)
+            elif interval_sec > 0:
+                log_message(
+                    f"Sleeping {interval_sec}s before next run "
+                    "(browser closed, minimal memory use).",
+                    log_file=log_file,
+                )
+                watcher.sleep(interval_sec)
     finally:
         watcher.restore()
         log_message("Watch mode stopped.", log_file=log_file)
@@ -736,6 +770,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--cooldown-every",
+        type=int,
+        default=int(os.getenv("WATCH_COOLDOWN_EVERY_COMPLETED", "10")),
+        help=(
+            "After this many completed reviews, pause for cooldown "
+            "(default: 10, or WATCH_COOLDOWN_EVERY_COMPLETED from .env)."
+        ),
+    )
+    parser.add_argument(
+        "--cooldown-sec",
+        type=int,
+        default=int(os.getenv("WATCH_COOLDOWN_SEC", "3600")),
+        help=(
+            "Cooldown duration in seconds after each cooldown-every milestone "
+            "(default: 3600, or WATCH_COOLDOWN_SEC from .env)."
+        ),
+    )
+    parser.add_argument(
         "--max-runs",
         type=int,
         default=None,
@@ -811,7 +863,10 @@ def main() -> int:
     headless = not args.headed
 
     if args.watch:
-        if args.interval < 60:
+        if args.interval < 0:
+            print("Warning: negative --interval is invalid; using 0.", file=sys.stderr)
+            args.interval = 0
+        if args.interval != 0 and args.interval < 60:
             print(
                 "Warning: intervals under 60s may keep Chromium busy too often.",
                 file=sys.stderr,
@@ -827,6 +882,8 @@ def main() -> int:
             submit=submit,
             cleanup=cleanup,
             interval_sec=args.interval,
+            cooldown_every=args.cooldown_every,
+            cooldown_sec=args.cooldown_sec,
             max_runs=args.max_runs,
             log_file=log_file,
             fresh=fresh,

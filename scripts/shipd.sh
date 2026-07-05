@@ -15,7 +15,7 @@ VENV_DIR="${ROOT_DIR}/.venv"
 ENV_FILE="${ROOT_DIR}/.env"
 LOG_DIR="${ROOT_DIR}/logs"
 DEFAULT_LOG_FILE="${LOG_DIR}/run.log"
-DEFAULT_INTERVAL=1200
+DEFAULT_INTERVAL=0
 
 QUEST="olympus"
 SEPARATE_STEPS=0
@@ -350,6 +350,16 @@ ui_handle_structured_line() {
         return 0
     fi
 
+    if [[ "${marker}" == COOLDOWN:* ]]; then
+        local rest="${marker#COOLDOWN:}"
+        local elapsed="${rest%%:*}"
+        local total="${rest#*:}"
+        if [[ "${elapsed}" =~ ^[0-9]+$ ]] && [[ "${total}" =~ ^[0-9]+$ ]] && [[ "${total}" -gt 0 ]]; then
+            ui_cooldown_tick "${elapsed}" "${total}"
+        fi
+        return 0
+    fi
+
     return 1
 }
 
@@ -466,6 +476,27 @@ ui_sleep_tick() {
     local bar
     bar="$(ui_progress_bar "${elapsed}" "${total}" 16)"
     printf '\r  %s Next review in %dm %02ds ' "${bar}" "${mins}" "${secs}"
+}
+
+ui_cooldown_tick() {
+    local elapsed="$1"
+    local total="$2"
+    local remaining=$((total - elapsed))
+    if [[ "${remaining}" -lt 0 ]]; then
+        remaining=0
+    fi
+    if [[ "${USE_TTY_UI}" -eq 0 ]]; then
+        return
+    fi
+    local mins=$((remaining / 60))
+    local secs=$((remaining % 60))
+    local bar
+    bar="$(ui_progress_bar "${elapsed}" "${total}" 16)"
+    printf '\r  %s Cooldown ends in %dm %02ds ' "${bar}" "${mins}" "${secs}"
+    if [[ "${remaining}" -eq 0 ]]; then
+        printf '\r\033[K'
+        _emit_terminal "  ${C_GREEN}✓${C_RESET} Cooldown complete"
+    fi
 }
 
 prompt_review_count() {
