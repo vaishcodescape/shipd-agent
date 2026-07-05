@@ -1134,7 +1134,7 @@ main() {
     resolve_python
     activate_venv
 
-    ui_header "Shipd agent"
+    ui_header "> - Shipd agent"
     log "Log file: ${LOG_FILE}"
 
     if [[ "${FRESH}" -eq 0 ]] && [[ "${ONCE}" -eq 0 ]]; then
