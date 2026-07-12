@@ -99,7 +99,7 @@ pip install shipd-agent \
 
 Submit is **off by default**. Pass `--submit` explicitly when you want feedback posted to Shipd.
 
-## Demo (5 minutes)
+## Test Demo  
 
 For a live walkthrough without posting to Shipd:
 
