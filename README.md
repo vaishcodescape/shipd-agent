@@ -1,4 +1,4 @@
-# shipd-agent
+# >- shipd-agent
 
 End-to-end autonomous reviewer for [Shipd.ai](https://shipd.ai) (Datacurve's Olympus/Mars quest workflow).
 
