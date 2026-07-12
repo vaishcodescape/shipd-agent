@@ -138,4 +138,4 @@ See `.env.example` for model selection, token budgets, cooldowns, and cleanup op
 ./run.sh --status        # session stats + batch resume state
 ```
 
-## Built by vaishcodescape
+Built by vaishcodescape
