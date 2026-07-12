@@ -138,8 +138,4 @@ See `.env.example` for model selection, token budgets, cooldowns, and cleanup op
 ./run.sh --status        # session stats + batch resume state
 ```
 
-## Releases
-
-Tagged releases and wheels: [github.com/vaishcodescape/shipd-agent/releases](https://github.com/vaishcodescape/shipd-agent/releases)
-
-GitHub Package: [github.com/vaishcodescape/shipd-agent/packages](https://github.com/vaishcodescape/shipd-agent/packages)
+## Built by vaishcodescape
