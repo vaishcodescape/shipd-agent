@@ -110,7 +110,7 @@ Inspect the generated review bundle under `reviews/` before enabling `--submit`.
 - Playwright Chromium (`./run.sh --setup`)
 - Docker  
 - IMAP app password for headless Shipd login
-- Anthropic API key for the review agent
+- Any LLM of your choice API key for the review agent
 
 See `.env.example` for model selection, token budgets, cooldowns, and cleanup options.
 
