@@ -58,7 +58,13 @@ cp .env.example .env   # AUTH_EMAIL, AUTH_PASSWORD, ANTHROPIC_API_KEY
 ./run.sh --check       # validate environment before first run
 ```
 
-**From GitHub Packages** (Python library; still use `./run.sh` from a cloned repo for the full pipeline)
+**From GitHub Releases** (install the published wheel)
+
+```bash
+pip install https://github.com/vaishcodescape/shipd-agent/releases/download/v0.1.0/shipd_agent-0.1.0-py3-none-any.whl
+```
+
+**From GitHub Packages** (if enabled for your org)
 
 ```bash
 pip install shipd-agent \

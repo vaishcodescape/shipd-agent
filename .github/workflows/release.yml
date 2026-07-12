@@ -28,12 +28,13 @@ jobs:
         run: python -m build
 
       - name: Publish to GitHub Packages
+        continue-on-error: true
         env:
-          TWINE_USERNAME: __token__
+          TWINE_USERNAME: ${{ github.actor }}
           TWINE_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: >
           python -m twine upload
-          --repository-url https://upload.pkg.github.com/vaishcodescape/shipd-agent
+          --repository-url https://upload.pkg.github.com/${{ github.repository_owner }}/
           dist/*
 
       - name: Create GitHub Release
