@@ -36,6 +36,7 @@ try:
 except (ImportError, AttributeError):
     run_review_agent = None  # type: ignore[assignment, misc]
 from review.activity import set_activity_log_file
+from review.config import get_review_config
 from review.review_bundles import save_review_bundle
 from review.result import is_review_complete, review_failure_reason
 from workflow.review import (
@@ -182,6 +183,19 @@ def run_workflow(
 
     set_activity_log_file(log_file)
     log_message("Starting workflow run.", log_file=log_file)
+    if review:
+        cfg = get_review_config()
+        log_message(
+            f"Review config: quest={quest}, model={cfg.review_model}, "
+            f"explore={cfg.review_explore_model}, phase0={cfg.review_phase0}, "
+            f"submit={'yes' if submit else 'no'}.",
+            log_file=log_file,
+        )
+    else:
+        log_message(
+            f"Workflow config: quest={quest}, review=no, submit=no.",
+            log_file=log_file,
+        )
     phases = PhaseTracker(log_file)
     do_cleanup = cleanup if cleanup is not None else cleanup_after_review_enabled()
 

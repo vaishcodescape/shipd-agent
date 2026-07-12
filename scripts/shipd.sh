@@ -32,7 +32,7 @@ HEADED=0
 NO_CLONE=0
 NO_CLEANUP=0
 REVIEW=1
-SUBMIT=1
+SUBMIT=0
 SUBMIT_EXPLICIT=0
 FOREGROUND=0
 CLONE_DIR=""
@@ -50,6 +50,56 @@ CURRENT_REVIEW_TOTAL=0
 
 usage() {
     cat <<'EOF'
+Shipd Agent — autonomous Olympus/Mars review automation for Shipd.ai
+
+Usage:
+  ./run.sh [options]
+
+Setup & diagnostics:
+  --setup              Create venv, install deps, install Playwright Chromium
+  --check              Validate environment without running a review
+  --status             Show session stats and saved batch progress
+  --version            Print installed version
+
+Run modes:
+  --once               Run exactly one review (no count prompt)
+  --reviews N          Run N reviews in batch mode
+  --max-runs N         Alias for --reviews N
+  --no-prompt          Require --once or --reviews (no interactive prompt)
+
+Review pipeline:
+  --quest NAME         olympus or mars (default: olympus)
+  --review             Run autonomous review agent (default: on)
+  --no-review          Reserve/clone only; skip LLM review
+  --submit             Submit feedback on Shipd (default: off; opt in explicitly)
+  --no-submit          Run review but do not submit on Shipd
+  --no-clone           Reserve without Quick Setup clone
+  --no-cleanup         Keep cloned repos and Docker artifacts after review
+  --clone-dir PATH     Where to clone submissions (default: ./submissions)
+  --separate-steps     Run each phase as a separate Python process
+
+Batch / overnight:
+  --interval SEC       Seconds between reviews (default: 0, or WATCH_INTERVAL_SEC)
+  --fresh              Clear saved batch resume state and session stats
+  --foreground-priority  Do not lower CPU nice level in background mode
+
+Browser / logging:
+  --headed             Show browser window (default: headless)
+  --log-file PATH      Append run output to this file (default: logs/run.log)
+
+Environment:
+  Copy .env.example to .env and set AUTH_EMAIL, AUTH_PASSWORD, ANTHROPIC_API_KEY.
+  SHIPD_NO_COLOR=1 or SHIPD_PLAIN=1 disables terminal colors.
+
+Examples:
+  ./run.sh --setup
+  ./run.sh --check
+  ./run.sh --once --no-submit          # Safe first run: review locally only
+  ./run.sh --once --submit             # Full cycle including Shipd submit
+  ./run.sh --reviews 10 --submit       # Batch with auto-submit each review
+  ./run.sh --fresh --reviews 5         # New batch, ignore saved resume state
+
+More: https://github.com/vaishcodescape/shipd-agent
 EOF
 }
 
@@ -658,6 +708,18 @@ while [[ $# -gt 0 ]]; do
             EXTRA_ARGS=(setup)
             shift
             ;;
+        --check)
+            EXTRA_ARGS=(check)
+            shift
+            ;;
+        --status)
+            EXTRA_ARGS=(status)
+            shift
+            ;;
+        --version)
+            EXTRA_ARGS=(version)
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -782,11 +844,20 @@ preflight() {
         die "Playwright not installed. Run: ./run.sh --setup"
     fi
 
+    if [[ "${REVIEW}" -eq 1 ]]; then
+        if ! command -v docker >/dev/null 2>&1; then
+            die "Docker is required for Phase 0 test execution (install Docker or use --no-review)"
+        fi
+        if ! docker info >/dev/null 2>&1; then
+            die "Docker daemon is not running (start Docker or use --no-review)"
+        fi
+    fi
+
     if [[ "${SUBMIT}" -eq 1 ]] && [[ "${REVIEW}" -eq 0 ]]; then
         if [[ "${SUBMIT_EXPLICIT}" -eq 1 ]]; then
             die "--submit requires --review (or a saved reviews/pending-submit.json for manual submit)"
         fi
-        # Submit defaults on; --no-review implies nothing to submit.
+        # Submit defaults off; --no-review implies nothing to submit.
         SUBMIT=0
     fi
 
@@ -795,6 +866,134 @@ preflight() {
     fi
 
     log "Preflight passed (reviews=${MAX_RUNS:-prompt}, quest=${QUEST}, review=${REVIEW}, submit=${SUBMIT}, interval=${INTERVAL}s, cooldown_every=${COOLDOWN_EVERY}, cooldown_sec=${COOLDOWN_SEC}s)"
+}
+
+print_version() {
+    local version
+    version="$(cd "${AGENT_DIR}" && PYTHONPATH="${AGENT_DIR}" "${PYTHON}" -c "from importlib.metadata import version, PackageNotFoundError
+try:
+    print(version('shipd-agent'))
+except PackageNotFoundError:
+    from pathlib import Path
+    import re
+    text = Path('__init__.py').read_text(encoding='utf-8')
+    match = re.search(r'__version__\\s*=\\s*[\"\\']([^\"\\']+)[\"\\']', text)
+    print(match.group(1) if match else 'unknown')
+" 2>/dev/null || echo "unknown")"
+    printf 'shipd-agent %s\n' "${version}"
+}
+
+run_check() {
+    ui_header "Shipd environment check"
+    local ok=1
+
+    resolve_python
+    log "Python: $("${PYTHON}" --version 2>&1)"
+
+    if [[ -d "${VENV_DIR}" ]]; then
+        activate_venv
+        log "Virtualenv: ${VENV_DIR}"
+    else
+        log "WARNING: No virtualenv at ${VENV_DIR} — run ./run.sh --setup"
+        ok=0
+    fi
+
+    if [[ -f "${ENV_FILE}" ]]; then
+        load_env_file "${ENV_FILE}"
+        log "Env file: ${ENV_FILE}"
+    else
+        log "WARNING: Missing ${ENV_FILE} — copy .env.example"
+        ok=0
+    fi
+
+    local missing=()
+    [[ -z "${AUTH_EMAIL:-}" ]] && missing+=("AUTH_EMAIL")
+    [[ -z "${AUTH_PASSWORD:-}" ]] && missing+=("AUTH_PASSWORD")
+    if [[ "${#missing[@]}" -gt 0 ]]; then
+        log "WARNING: Missing credentials: ${missing[*]}"
+        ok=0
+    else
+        log "Auth credentials: configured"
+    fi
+
+    if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+        log "WARNING: ANTHROPIC_API_KEY not set (required for --review)"
+        ok=0
+    else
+        log "Anthropic API key: configured"
+    fi
+
+    if "${PYTHON}" -c "import playwright" 2>/dev/null; then
+        log "Playwright: installed"
+    else
+        log "WARNING: Playwright not installed — run ./run.sh --setup"
+        ok=0
+    fi
+
+    if command -v docker >/dev/null 2>&1; then
+        if docker info >/dev/null 2>&1; then
+            log "Docker: running"
+        else
+            log "WARNING: Docker installed but daemon not running"
+            ok=0
+        fi
+    else
+        log "WARNING: Docker not found (required for Phase 0 tests)"
+        ok=0
+    fi
+
+    if [[ -f "${ROOT_DIR}/auth-jwt/shipd-auth.json" ]]; then
+        log "Saved Shipd session: present"
+    else
+        log "Saved Shipd session: none (first run will sign in via IMAP OTP)"
+    fi
+
+    log_msg "$(print_version)"
+
+    if [[ "${ok}" -eq 1 ]]; then
+        if [[ "${USE_TTY_UI}" -eq 1 ]]; then
+            _emit_terminal "${C_GREEN}${C_BOLD}✓ Environment ready${C_RESET}"
+        else
+            log "Environment ready"
+        fi
+        return 0
+    fi
+
+    if [[ "${USE_TTY_UI}" -eq 1 ]]; then
+        _emit_terminal "${C_YELLOW}${C_BOLD}⚠ Fix warnings above before running reviews${C_RESET}"
+    else
+        log "Fix warnings above before running reviews"
+    fi
+    return 1
+}
+
+run_status() {
+    resolve_python
+    activate_venv
+
+    ui_header "Shipd session status"
+    log_msg "$(print_version)"
+    log "Log file: ${LOG_FILE}"
+
+    local summary batch_msg
+    summary="$(cd "${AGENT_DIR}" && PYTHONPATH="${AGENT_DIR}" "${PYTHON}" -c "from session_stats import format_summary_log; print(format_summary_log())" 2>/dev/null || true)"
+    if [[ -n "${summary}" ]]; then
+        log "${summary}"
+    fi
+
+    batch_msg="$(cd "${AGENT_DIR}" && PYTHONPATH="${AGENT_DIR}" "${PYTHON}" -c "
+from stats import watch_batch
+batch = watch_batch.get_active_batch()
+if batch is None:
+    print('Batch: none (no saved progress)')
+else:
+    print(watch_batch.format_resume_message(batch))
+" 2>/dev/null || true)"
+    if [[ -n "${batch_msg}" ]]; then
+        log "${batch_msg}"
+    fi
+
+    ui_session_panel
 }
 
 build_orchestrator_args() {
@@ -1206,16 +1405,39 @@ run_once() {
 }
 
 main() {
-    if [[ "${#EXTRA_ARGS[@]}" -gt 0 ]] && [[ "${EXTRA_ARGS[0]}" == "setup" ]]; then
-        resolve_python
-        run_setup
-        exit 0
+    if [[ "${#EXTRA_ARGS[@]}" -gt 0 ]]; then
+        case "${EXTRA_ARGS[0]}" in
+            setup)
+                resolve_python
+                run_setup
+                exit 0
+                ;;
+            check)
+                init_ui
+                mkdir -p "${LOG_DIR}"
+                run_check
+                exit $?
+                ;;
+            status)
+                init_ui
+                mkdir -p "${LOG_DIR}"
+                resolve_python
+                run_status
+                exit 0
+                ;;
+            version)
+                resolve_python
+                print_version
+                exit 0
+                ;;
+        esac
     fi
 
     resolve_python
     activate_venv
 
-    ui_header "> - Shipd agent"
+    ui_header "Shipd Agent"
+    log_msg "$(print_version)"
     log "Log file: ${LOG_FILE}"
 
     if [[ "${FRESH}" -eq 0 ]] && [[ "${ONCE}" -eq 0 ]]; then
