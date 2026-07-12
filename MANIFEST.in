@@ -1,0 +1,7 @@
+include README.md
+include LICENSE
+include requirements.txt
+include shipd-rubric.md
+include .env.example
+include run.sh
+recursive-include scripts *.sh

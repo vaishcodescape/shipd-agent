@@ -48,12 +48,21 @@ flowchart LR
 
 ## Install
 
+**From source (recommended)**
+
 ```bash
 git clone https://github.com/vaishcodescape/shipd-agent.git
 cd shipd-agent
 ./run.sh --setup
 cp .env.example .env   # AUTH_EMAIL, AUTH_PASSWORD, ANTHROPIC_API_KEY
 ./run.sh --check       # validate environment before first run
+```
+
+**From GitHub Packages** (Python library; still use `./run.sh` from a cloned repo for the full pipeline)
+
+```bash
+pip install shipd-agent \
+  --index-url https://pypi.pkg.github.com/vaishcodescape/simple/
 ```
 
 ## Quick start
@@ -122,3 +131,9 @@ See `.env.example` for model selection, token budgets, cooldowns, and cleanup op
 ./run.sh --check         # environment doctor
 ./run.sh --status        # session stats + batch resume state
 ```
+
+## Releases
+
+Tagged releases and wheels: [github.com/vaishcodescape/shipd-agent/releases](https://github.com/vaishcodescape/shipd-agent/releases)
+
+GitHub Package: [github.com/vaishcodescape/shipd-agent/packages](https://github.com/vaishcodescape/shipd-agent/packages)

@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shipd-agent"
+version = "0.1.0"
+description = "Autonomous Shipd.ai Olympus/Mars review automation"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Aditya Vaish" }]
+keywords = ["shipd", "datacurve", "code-review", "automation", "playwright", "langgraph"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+    "playwright>=1.49.0",
+    "python-dotenv>=1.0.0",
+    "anthropic>=0.40.0",
+    "langgraph>=0.2.0",
+    "langchain>=0.3.0",
+    "langchain-anthropic>=0.3.0",
+    "langchain-core>=0.3.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.urls]
+Homepage = "https://github.com/vaishcodescape/shipd-agent"
+Repository = "https://github.com/vaishcodescape/shipd-agent"
+Issues = "https://github.com/vaishcodescape/shipd-agent/issues"
+Changelog = "https://github.com/vaishcodescape/shipd-agent/releases"
+
+[tool.setuptools]
+package-dir = { "" = "shipd-agent" }
+py-modules = [
+    "orchestrator",
+    "review_agent",
+    "browser_session",
+    "session_stats",
+    "shipd_submit",
+    "time_logs",
+]
+
+[tool.setuptools.packages.find]
+where = ["shipd-agent"]
+
+[tool.setuptools.package-data]
+review = ["*.md"]
