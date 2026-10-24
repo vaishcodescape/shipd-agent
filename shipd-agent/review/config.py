@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
 from auth import REPO_ROOT
+from review.credentials import resolve_api_key
+from review.llm_providers import (
+    STRUCTURED_OUTPUT_METHODS,
+    ProviderSpec,
+    foreign_model_owner,
+    get_provider,
+)
 from review.rubric_defaults import (
     MARS_MAX_EFFECTIVE_LOC,
     MARS_MIN_EFFECTIVE_LOC,
@@ -47,9 +54,17 @@ DEFAULT_REVIEW_COVERAGE_RECHECK_MAX_STEPS = 6
 
 @dataclass(frozen=True)
 class ReviewConfig:
-    anthropic_api_key: str
+    anthropic_api_key: str = field(repr=False)
     review_model: str
     review_explore_model: str
+    # LLM provider (review/llm_providers.py); review_model is the finalize
+    # model and review_explore_model the explore model for this provider.
+    llm_provider: str
+    llm_api_key: str = field(repr=False)
+    llm_api_key_source: str
+    llm_base_url: str
+    llm_reasoning_effort: str
+    llm_structured_output_method: str
     review_phase0: str
     review_phase0_test_timeout: int
     review_phase0_docker_build_timeout: int
@@ -91,6 +106,47 @@ def resolve_model_id(raw: str, *, default: str) -> str:
     return resolved
 
 
+def _model_from_env(spec: ProviderSpec, env_name: str, *, default: str) -> str:
+    """Read a model env var for ``spec``, ignoring another provider's model ID."""
+    raw = os.getenv(env_name, "").strip()
+    owner = foreign_model_owner(spec, raw)
+    if owner is not None:
+        print(
+            f"WARNING: {env_name}={raw!r} is a {owner.label} model but the "
+            f"review provider is {spec.name}; using "
+            f"{default or 'the explore model'!r} instead.",
+            flush=True,
+        )
+        raw = ""
+    return resolve_model_id(raw, default=default)
+
+
+def resolve_review_models(spec: ProviderSpec) -> tuple[str, str]:
+    """Return (explore_model, finalize_model) for ``spec`` from the environment.
+
+    REVIEW_EXPLORE_MODEL / REVIEW_MODEL override the provider defaults; the
+    finalize model falls back to the explore model when the provider has no
+    default of its own.
+    """
+    explore = _model_from_env(
+        spec, "REVIEW_EXPLORE_MODEL", default=spec.default_explore_model
+    )
+    finalize = _model_from_env(
+        spec, "REVIEW_MODEL", default=spec.default_finalize_model or explore
+    )
+    return explore, finalize or explore
+
+
+def _structured_output_method_from_env() -> str:
+    method = os.getenv("REVIEW_STRUCTURED_OUTPUT_METHOD", "").strip().lower()
+    if method and method not in STRUCTURED_OUTPUT_METHODS:
+        raise ValueError(
+            "REVIEW_STRUCTURED_OUTPUT_METHOD must be one of "
+            f"{', '.join(STRUCTURED_OUTPUT_METHODS)} (got {method!r})."
+        )
+    return method
+
+
 def get_review_config(*, dry_run_override: bool | None = None) -> ReviewConfig:
     """Load review settings from .env and environment."""
     load_dotenv(REPO_ROOT / ".env")
@@ -98,20 +154,24 @@ def get_review_config(*, dry_run_override: bool | None = None) -> ReviewConfig:
     dry_run_env = _truthy(os.getenv("REVIEW_DRY_RUN", "0"))
     dry_run = dry_run_override if dry_run_override is not None else dry_run_env
 
-    review_model = resolve_model_id(
-        os.getenv("REVIEW_MODEL", DEFAULT_REVIEW_MODEL),
-        default=DEFAULT_REVIEW_MODEL,
-    )
-    explore_raw = os.getenv("REVIEW_EXPLORE_MODEL", "").strip()
-    explore_model = resolve_model_id(
-        explore_raw or DEFAULT_EXPLORE_MODEL,
-        default=DEFAULT_EXPLORE_MODEL,
-    )
+    provider = get_provider(os.getenv("REVIEW_PROVIDER", ""))
+    explore_model, review_model = resolve_review_models(provider)
+    # Provider env var(s) first, then the key saved by ./run.sh --configure-llm.
+    resolved_key = resolve_api_key(provider)
+    anthropic_api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if provider.name == "anthropic" and resolved_key is not None:
+        anthropic_api_key = resolved_key.value
 
     return ReviewConfig(
-        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", "").strip(),
+        anthropic_api_key=anthropic_api_key,
         review_model=review_model,
         review_explore_model=explore_model,
+        llm_provider=provider.name,
+        llm_api_key=resolved_key.value if resolved_key else "",
+        llm_api_key_source=resolved_key.source if resolved_key else "",
+        llm_base_url=os.getenv("REVIEW_LLM_BASE_URL", "").strip(),
+        llm_reasoning_effort=os.getenv("REVIEW_REASONING_EFFORT", "").strip().lower(),
+        llm_structured_output_method=_structured_output_method_from_env(),
         review_phase0=os.getenv("REVIEW_PHASE0", "full").strip().lower(),
         review_phase0_test_timeout=int(
             os.getenv("REVIEW_PHASE0_TEST_TIMEOUT", "600")

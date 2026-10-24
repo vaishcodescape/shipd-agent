@@ -2,7 +2,7 @@
 # the task prompt bars (1,000 words, Too Many Requirements) and the agent run
 # bar (Nova, Vega, Orion × 4 runs, exactly one passing run).
 #
-# The finalize LLM is faked (no API calls); it approves everything, so any
+# The finalize LLM (make_chat_model) is faked — no API calls; it approves everything, so any
 # FAIL/request_changes in the output comes from the deterministic checks. The
 # browser cases scrape a synthetic Shipd review page with the real scraper; they
 # skip without chromium unless SHIPD_REQUIRE_BROWSER=1 (set in CI).
@@ -64,16 +64,17 @@ def _approving_review() -> ReviewResult:
 
 
 def _fake_chat(review: ReviewResult) -> MagicMock:
-    """Stand-in for ChatAnthropic whose structured output is ``review``."""
-    chat = MagicMock()
-    structured = chat.return_value.with_structured_output.return_value
-    structured.invoke.return_value = review
-    return chat
+    """Stand-in for make_chat_model whose structured output is ``review``."""
+    factory = MagicMock()
+    factory.return_value.invoke.return_value = review
+    return factory
 
 
 def _config(**overrides):
     base = dataclasses.replace(
         get_review_config(),
+        llm_provider="anthropic",
+        llm_api_key="test-key",
         anthropic_api_key="test-key",
         review_dry_run=False,
         review_phase0="fast",
@@ -148,7 +149,7 @@ class FinalizeAndValidateTests(_RepoCase):
         state.update(g._run_agent_runs_analysis(state))
         state.update(g._run_prompt_analysis(state))
         chat = _fake_chat(_approving_review())
-        with patch.object(g, "ChatAnthropic", chat):
+        with patch.object(g, "make_chat_model", chat):
             state.update(g.finalize_node(state))
         return g.validate_node(state)["review_result"], chat
 
@@ -180,7 +181,10 @@ class FinalizeAndValidateTests(_RepoCase):
         self.assertEqual(_finding_names(result, "1") + _finding_names(result, "5"), [])
 
         # The finalize model was given the deterministic task prompt analysis.
-        messages = chat.return_value.with_structured_output.return_value.invoke.call_args[0][0]
+        _, role = chat.call_args.args
+        self.assertEqual(role, "finalize")
+        self.assertIs(chat.call_args.kwargs["structured_output"], ReviewResult)
+        messages = chat.return_value.invoke.call_args.args[0]
         self.assertIn("words (limit 1000)", messages[1].content)
 
 
@@ -269,7 +273,7 @@ class ReviewGraphOnScrapedPageTests(_RepoCase):
                 _review_page_html(agent_rows=agent_rows, requirements_check=check)
             )
             chat = _fake_chat(_approving_review())
-            with patch.object(g, "ChatAnthropic", chat):
+            with patch.object(g, "make_chat_model", chat):
                 return g.run_review_graph(
                     repo_path=str(self.repo),
                     quest="olympus",

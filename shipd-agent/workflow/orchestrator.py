@@ -186,7 +186,8 @@ def run_workflow(
     if review:
         cfg = get_review_config()
         log_message(
-            f"Review config: quest={quest}, model={cfg.review_model}, "
+            f"Review config: quest={quest}, provider={cfg.llm_provider}, "
+            f"model={cfg.review_model}, "
             f"explore={cfg.review_explore_model}, phase0={cfg.review_phase0}, "
             f"submit={'yes' if submit else 'no'}.",
             log_file=log_file,
@@ -768,7 +769,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "After cloning, run the autonomous review agent "
-            "(requires ANTHROPIC_API_KEY)."
+            "(requires an LLM API key; see ./run.sh --configure-llm)."
         ),
     )
     parser.add_argument(
