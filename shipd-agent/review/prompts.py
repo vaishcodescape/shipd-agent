@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from review.rubric_defaults import (
     AGENT_RUN_THRESHOLDS_PROMPT,
+    AGENT_TYPES,
     APPROVE_CHECKLIST,
     APPROVE_MIN_BAND_SCORE,
     BAND_SCORE_MEANINGS,
@@ -12,20 +13,24 @@ from review.rubric_defaults import (
     MARS_MAX_EFFECTIVE_LOC,
     MARS_MIN_EFFECTIVE_LOC,
     MARS_MIN_MEDIAN_LOC,
-    MIN_AGENT_RUNS,
-    OLYMPUS_MAX_PASS_RATE_PCT,
+    MAX_PROMPT_REQUIREMENTS,
+    MAX_PROMPT_WORDS,
     OLYMPUS_MIN_EFFECTIVE_LOC,
     OLYMPUS_MIN_MEDIAN_FILES,
     OLYMPUS_MIN_MEDIAN_LOC,
     OLYMPUS_MIN_MEDIAN_MESSAGES,
-    MARS_MAX_PASS_RATE_PCT,
     PHASE0_PASS_CRITERIA,
+    PROMPT_THRESHOLDS_PROMPT,
+    REQUIRED_AGENT_RUNS,
+    REQUIRED_PASSING_RUNS,
+    RUNS_PER_AGENT_TYPE,
 )
 
 _BAND_SCORE_GUIDE = "; ".join(
     f"{score}={meaning.split('—', 1)[0].strip()}" for score, meaning in sorted(BAND_SCORE_MEANINGS.items())
 )
 _PHASE0_CRITERIA = "; ".join(PHASE0_PASS_CRITERIA)
+_AGENT_TYPES_TEXT = ", ".join(AGENT_TYPES[:-1]) + f", and {AGENT_TYPES[-1]}"
 
 PHASE_CHECKLIST = f"""
 Work through rubric phases **in order** (0 through 6):
@@ -33,11 +38,11 @@ Work through rubric phases **in order** (0 through 6):
 | Phase | Focus |
 |-------|--------|
 | 0 | Artifacts, git HEAD, patch apply --check, **Docker test.sh base/new runs** (`docker build` + `docker run --network none`; deterministic at review start when REVIEW_PHASE0=full; re-run with `run_phase0_checks`); pass criteria: {_PHASE0_CRITERIA} |
-| 1 | Problem description quality (concise, no AI slop, repo fit, duplicates) |
+| 1 | Problem description quality (concise, no AI slop, repo fit, duplicates; ≤ {MAX_PROMPT_WORDS:,} words; not Too Many Requirements) |
 | 2 | Dockerfile & test.sh harness (minimal Dockerfile, base/new split) |
 | 3 | Test quality (coverage, determinism, behaviour not implementation, no network) |
 | 4 | Solution & code quality (requirements, repo patterns, LOC discipline — approve min band {APPROVE_MIN_BAND_SCORE}; see LOC thresholds below) |
-| 5 | Agent runs & solvability (use agent_runs + Holistic AI Check; SKIP if not available) |
+| 5 | Agent runs & solvability ({_AGENT_TYPES_TEXT} × {RUNS_PER_AGENT_TYPE} runs each, exactly {REQUIRED_PASSING_RUNS} passing run; use agent_runs + Holistic AI Check; SKIP if not available) |
 | 6 | Holistic / platform (related submissions, Holistic AI Check fairness notes, Mars vs Olympus fit, eligibility) |
 
 Band scores (0–3): {_BAND_SCORE_GUIDE}
@@ -55,7 +60,8 @@ Rules:
 - Do not invent paths, line numbers, or command results — verify with tools.
 - Do not approve anything; your job is evidence collection for the finalize step.
 - Use `read_holistic_check` or `read_shipd_review_panel` to re-read Shipd page panels when needed.
-- For phase 5: **read** Holistic AI Check reviewer notes (agent pass rates, solvability) and agent_runs context before findings; cite pass rates and failure patterns in evidence when available.
+- For phase 1: apply the task prompt bars in the user prompt — the word limit and Shipd's "Too Many Requirements" check (count the independent asks; a long, detailed prompt usually trips it). The precomputed task prompt checks are deterministic; cite them rather than recounting.
+- For phase 5: **read** Holistic AI Check reviewer notes (agent pass counts, solvability) and agent_runs context before findings; cite per-agent (Nova/Vega/Orion) pass counts and failure patterns in evidence when available.
 - For phase 6: **read** Holistic AI Check fairness/readiness notes and related_submissions context; note duplicate/overlap risk with similarity scores/tags.
 - When Holistic AI Check status is PASS with explicit checklist passes, do not contradict without your own evidence.
 - Band ratings alignment: phase 1 → problem band; phases 2–3 → tests band; phase 4 → solution band.
@@ -121,9 +127,12 @@ def build_unified_review_user_prompt(
     related_submissions: str,
     holistic_check: str = "",
     loc_analysis: str = "",
+    prompt_analysis: str = "",
     olympus_min_loc: int = OLYMPUS_MIN_EFFECTIVE_LOC,
     mars_min_loc: int = MARS_MIN_EFFECTIVE_LOC,
     mars_max_loc: int = MARS_MAX_EFFECTIVE_LOC,
+    max_prompt_words: int = MAX_PROMPT_WORDS,
+    max_prompt_requirements: int = MAX_PROMPT_REQUIREMENTS,
     max_tool_steps: int = 20,
 ) -> str:
     holistic_section = holistic_check or _HOLISTIC_UNAVAILABLE
@@ -134,13 +143,19 @@ def build_unified_review_user_prompt(
         mars_max=mars_max_loc,
     )
     agent_thresholds = AGENT_RUN_THRESHOLDS_PROMPT.format(
-        min_runs=MIN_AGENT_RUNS,
-        olympus_pass_pct=OLYMPUS_MAX_PASS_RATE_PCT,
+        agent_types=_AGENT_TYPES_TEXT,
+        runs_per_agent=RUNS_PER_AGENT_TYPE,
+        required_runs=REQUIRED_AGENT_RUNS,
+        required_passes=REQUIRED_PASSING_RUNS,
         olympus_median_files=OLYMPUS_MIN_MEDIAN_FILES,
         olympus_median_messages=OLYMPUS_MIN_MEDIAN_MESSAGES,
         olympus_median_loc=OLYMPUS_MIN_MEDIAN_LOC,
-        mars_pass_pct=MARS_MAX_PASS_RATE_PCT,
         mars_median_loc=MARS_MIN_MEDIAN_LOC,
+    )
+    prompt_section = prompt_analysis.strip() or "Task prompt checks not yet run."
+    prompt_thresholds = PROMPT_THRESHOLDS_PROMPT.format(
+        max_words=max_prompt_words,
+        max_requirements=max_prompt_requirements,
     )
     return f"""Review this Shipd **{quest}** submission across **all phases 0–6**.
 
@@ -160,6 +175,11 @@ Phase 0 log (Docker build/run output, `--network none` test contract):
 
 {loc_thresholds}
 
+## Precomputed task prompt checks (Phase 1)
+{prompt_section}
+
+{prompt_thresholds}
+
 {agent_thresholds}
 
 {holistic_section}
@@ -167,7 +187,7 @@ Phase 0 log (Docker build/run output, `--network none` test contract):
 Agent runs context (read before phase 5 feedback): {agent_runs}
 Related submissions context (read before phase 6 feedback): {related_submissions}
 
-Read the Shipd page context above before providing feedback. Cite agent pass rates,
+Read the Shipd page context above before providing feedback. Cite per-agent pass counts,
 failure patterns, similarity scores, and holistic reviewer notes in findings when available.
 
 Tool budget: ~{max_tool_steps} tool steps — inspect key artifacts first, then summarize.
@@ -220,15 +240,25 @@ FINALIZE_PHASE_INSTRUCTIONS = f"""
 - Phase `"4"` status from deterministic LOC check is authoritative for LOC limits; incorporate
   your code-quality findings into phase 4 summary and solution band without reversing LOC PASS/FAIL.
 
+**Task prompt (Phase 1 — platform bars):**
+- At most {MAX_PROMPT_WORDS:,} words.
+- Shipd's "Too Many Requirements" check flags prompts with too many independent requirements;
+  a focused scope matters more than ever, and a long prompt near the word limit usually trips it.
+- `prompt_analysis` holds the deterministic word count, requirement estimate, and any Shipd flag.
+  A deterministic phase 1 FAIL is authoritative; fold your clarity / AI-slop / repo-fit judgement
+  into the phase 1 summary and problem band without reversing it.
+
 **Agent runs (Phase 5 — platform bars):**
-- At least 10 agent runs must complete.
-- Olympus: pass rate ≤ 20%; median successful runs ≥ 3 files, ≥ 80 messages, ≥ 400 LOC.
-- Mars: pass rate ≤ 30%; median successful runs ≥ 100 LOC.
+- {_AGENT_TYPES_TEXT} must each run {RUNS_PER_AGENT_TYPE} times ({REQUIRED_AGENT_RUNS} runs total).
+- Exactly {REQUIRED_PASSING_RUNS} run must pass, so the passing run belongs to a single agent type;
+  0 passes → unsolvable or unfair, more → too easy.
+- Olympus: median successful runs ≥ {OLYMPUS_MIN_MEDIAN_FILES} files, ≥ {OLYMPUS_MIN_MEDIAN_MESSAGES:.0f} messages, ≥ {OLYMPUS_MIN_MEDIAN_LOC} LOC.
+- Mars: median successful runs ≥ {MARS_MIN_MEDIAN_LOC} LOC.
 - Deterministic phase 5 checks run when agent run data is scraped; incorporate without reversing
   PASS/FAIL unless you have contradictory evidence.
 
 **Shipd page context (when provided):**
-- `agent_run_notes` ← agent runs scrape (pass rates, failure patterns, LOC hints).
+- `agent_run_notes` ← agent runs scrape (per-agent pass counts, failure patterns, LOC hints).
 - `related_submissions_notes` ← related submissions scrape (similarity, duplicate tags).
 - `holistic_check_notes` ← Holistic AI Check status, checklist, reviewer notes.
 - Use scraped data in phases 5–6; populate these fields from evidence, not invention.

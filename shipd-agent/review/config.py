@@ -11,6 +11,8 @@ from auth import REPO_ROOT
 from review.rubric_defaults import (
     MARS_MAX_EFFECTIVE_LOC,
     MARS_MIN_EFFECTIVE_LOC,
+    MAX_PROMPT_REQUIREMENTS,
+    MAX_PROMPT_WORDS,
     OLYMPUS_MIN_EFFECTIVE_LOC,
 )
 
@@ -69,6 +71,8 @@ class ReviewConfig:
     olympus_min_loc: int
     mars_min_loc: int
     mars_max_loc: int
+    max_prompt_words: int = MAX_PROMPT_WORDS
+    max_prompt_requirements: int = MAX_PROMPT_REQUIREMENTS
 
 
 def _truthy(value: str) -> bool:
@@ -197,5 +201,11 @@ def get_review_config(*, dry_run_override: bool | None = None) -> ReviewConfig:
         ),
         mars_max_loc=int(
             os.getenv("REVIEW_MARS_MAX_LOC", str(MARS_MAX_EFFECTIVE_LOC))
+        ),
+        max_prompt_words=int(
+            os.getenv("REVIEW_MAX_PROMPT_WORDS", str(MAX_PROMPT_WORDS))
+        ),
+        max_prompt_requirements=int(
+            os.getenv("REVIEW_MAX_PROMPT_REQUIREMENTS", str(MAX_PROMPT_REQUIREMENTS))
         ),
     )

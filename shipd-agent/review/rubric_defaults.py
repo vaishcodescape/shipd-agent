@@ -100,11 +100,23 @@ MARS_MAX_EFFECTIVE_LOC: Final[int] = 600
 # note downgrade suggestion… prefer request_changes over reject"
 LOC_DOWNGRADE_TAG: Final[str] = "Lines of code"
 
+# --- Task prompt bars (Phase 1) ---
+
+# Shipd allows task prompts up to this many words.
+MAX_PROMPT_WORDS: Final[int] = 1000
+# Shipd's "Too Many Requirements" check flags prompts with too many independent
+# requirements. Its threshold is not published; this heuristic default only
+# flags clearly sprawling prompts (override with REVIEW_MAX_PROMPT_REQUIREMENTS).
+MAX_PROMPT_REQUIREMENTS: Final[int] = 10
+
 # --- Agent run platform bars (Phase 5) ---
 
-MIN_AGENT_RUNS: Final[int] = 10
-OLYMPUS_MAX_PASS_RATE_PCT: Final[float] = 20.0
-MARS_MAX_PASS_RATE_PCT: Final[float] = 30.0
+# Each agent type runs this many times, and exactly one run across all of them
+# may pass — so the single passing run belongs to a single agent type.
+AGENT_TYPES: Final[tuple[str, ...]] = ("Nova", "Vega", "Orion")
+RUNS_PER_AGENT_TYPE: Final[int] = 4
+REQUIRED_AGENT_RUNS: Final[int] = RUNS_PER_AGENT_TYPE * len(AGENT_TYPES)
+REQUIRED_PASSING_RUNS: Final[int] = 1
 # Median of successful agent runs (long-horizon / minimum scope).
 OLYMPUS_MIN_MEDIAN_LOC: Final[int] = 400
 OLYMPUS_MIN_MEDIAN_FILES: Final[int] = 3
@@ -155,12 +167,20 @@ LOC_THRESHOLDS_PROMPT: Final[str] = (
 )
 
 AGENT_RUN_THRESHOLDS_PROMPT: Final[str] = (
-    "Agent run platform bars: at least {min_runs} runs must complete. "
-    "Olympus: pass rate ≤ {olympus_pass_pct:.0f}% (Hard); median successful runs "
-    "≥ {olympus_median_files} files, ≥ {olympus_median_messages:.0f} messages, "
-    "≥ {olympus_median_loc} LOC (long-horizon). "
-    "Mars: pass rate ≤ {mars_pass_pct:.0f}% (Hard); median successful runs "
-    "≥ {mars_median_loc} LOC (minimum scope)."
+    "Agent run platform bars: {agent_types} must each run {runs_per_agent} times "
+    "({required_runs} runs total), and exactly {required_passes} run must pass — so the "
+    "passing run comes from a single agent type. Zero passes → unsolvable or unfair; "
+    "more than {required_passes} → too easy. "
+    "Olympus: median successful runs ≥ {olympus_median_files} files, "
+    "≥ {olympus_median_messages:.0f} messages, ≥ {olympus_median_loc} LOC (long-horizon). "
+    "Mars: median successful runs ≥ {mars_median_loc} LOC (minimum scope)."
+)
+
+PROMPT_THRESHOLDS_PROMPT: Final[str] = (
+    "Task prompt bars (Phase 1): at most {max_words} words. Shipd's \"Too Many "
+    "Requirements\" check flags prompts with too many independent requirements "
+    "(heuristic flag above {max_requirements}) — the higher word limit is a trap, "
+    "since every extra detail risks this check, so prefer a focused scope."
 )
 
 DECISION_GUARDS_PROMPT: Final[str] = (

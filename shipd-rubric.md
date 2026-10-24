@@ -103,6 +103,8 @@ Standards from the Shipd guide — behavioural ask, not implementation doc:
 - **Not overly prescriptive** unless implementation detail is truly required.
 - **Not external framing** — don't write as if the repo is outside the prompt.
 - **Not a snappy command list** — avoid bullet laundry of micro-requests.
+- **Length:** up to **1,000 words** — the higher limit is a trap, not room for more detail; every extra detail risks Too Many Requirements.
+- **Too Many Requirements** (Shipd platform check) — flags prompts with too many independent requirements. Keep the scope to one focused behavioural ask; count the distinct asks. Flagged or clearly sprawling → `request_changes` (MAJOR). `prompt_analysis` gives the word count, a requirement estimate, and Shipd's own flag from the Holistic Check.
 - **No discoverable repo behaviour** restated unless necessary.
 - **No code snippets** when plain English suffices.
 - Leaks solution or mandates how to implement? Quote lines.
@@ -163,14 +165,14 @@ Review from the **problem description alone** — not reverse-engineered from te
 
 When agent run data is available (pass/fail, diffs, failure reasons, LOC):
 
-- **Minimum runs:** at least **10/10** agent runs must complete before approval.
-- **Difficulty (pass rate):** Olympus ≤ **20%** (Hard); Mars ≤ **30%** (Hard).
+- **Required runs:** **Nova, Vega, and Orion** each run **four times** (12 runs) before approval.
+- **Pass bar:** exactly **one** of the 12 runs passes — one agent type with a single passing run. **0 passes** → unsolvable or unfair (localise the cause); **2+ passes** (same agent or across agents) → too easy.
 - **Scope medians (successful runs):** Olympus long-horizon — ≥ **3** files, ≥ **80** messages, ≥ **400** LOC; Mars minimum — ≥ **100** LOC median.
 - **Do not trust pass/fail alone** — inspect diffs and failure reasons.
 - Passing agents → task may be solvable; also check for **weak tests** if short/incomplete solutions pass.
 - Failing agents → confirm failures are **fair** (expose ambiguous prompt or unfair tests vs trickery).
 - Compare user solution LOC to median agent LOC; flag mismatch with evidence.
-- For **Olympus:** `solvability_ok` — at least one agent could solve; 0% pass may be one ambiguous sentence or one unfair test — localise which.
+- For **Olympus:** `solvability_ok` — the one required passing run shows an agent could solve it; 0 passes may be one ambiguous sentence or one unfair test — localise which.
 - If no agent data → `SKIP` phase; note in `internal_notes`; do not assume solvability either way.
 
 ---
@@ -191,13 +193,13 @@ When agent run data is available (pass/fail, diffs, failure reasons, LOC):
 ### Olympus
 
 - Set `repo_eligible` and `solvability_ok` (boolean).
-- Long-horizon scope: effective solution LOC **≥ 400**; agent medians **≥ 3** files, **≥ 80** messages, **≥ 400** LOC; pass rate **≤ 20%**; **10/10** agent runs complete.
+- Long-horizon scope: effective solution LOC **≥ 400**; agent medians **≥ 3** files, **≥ 80** messages, **≥ 400** LOC; Nova/Vega/Orion **× 4** runs with **exactly one** pass.
 - Ineligible repo or solvability concerns → usually **`request_changes`**, not `reject`, unless wrong repo entirely.
 
 ### Mars
 
 - Set `quality` (1–3) and `difficulty` (1–3; usually 2, rarely 3).
-- Minimum scope: median successful agent runs **≥ 100** LOC; pass rate **≤ 30%**; **10/10** agent runs complete.
+- Minimum scope: median successful agent runs **≥ 100** LOC; Nova/Vega/Orion **× 4** runs with **exactly one** pass.
 - Weight code quality heavily. Low ratings → **`request_changes`** with clear fixes, not `reject`, unless extreme.
 
 ---
