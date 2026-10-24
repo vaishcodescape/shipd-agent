@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Run the Shipd agent
 
 set -euo pipefail
@@ -45,8 +46,6 @@ RESUME_BATCH=0
 # Terminal UX state (colors/spinners when stdout is a TTY; plain otherwise).
 USE_TTY_UI=0
 C_RESET="" C_BOLD="" C_DIM="" C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_CYAN="" C_MAGENTA=""
-CURRENT_REVIEW=0
-CURRENT_REVIEW_TOTAL=0
 
 usage() {
     cat <<'EOF'
@@ -163,7 +162,8 @@ _emit_terminal() {
 }
 
 log() {
-    local line="[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] $*"
+    local line
+    line="[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] $*"
     _log_to_file "$line"
     if [[ "${USE_TTY_UI}" -eq 1 ]]; then
         _emit_terminal "${C_DIM}${line}${C_RESET}"
@@ -208,8 +208,6 @@ ui_header() {
 ui_review_banner() {
     local current="$1"
     local total="$2"
-    CURRENT_REVIEW="${current}"
-    CURRENT_REVIEW_TOTAL="${total}"
     ui_reset_phases
 
     if [[ "${USE_TTY_UI}" -eq 0 ]]; then

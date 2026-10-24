@@ -27,7 +27,6 @@ from workflow.submit import (
     _is_tier_modal,
     _looks_like_reason_field,
     _mark_band_scope,
-    _mark_in_form_submit,
     _normalize_confidence,
     _normalize_decision,
     _pick_band_reason_candidate,
