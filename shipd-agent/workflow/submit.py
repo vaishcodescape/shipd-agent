@@ -1580,14 +1580,12 @@ def _verify_band_filled(
 ) -> None:
     deadline = time.monotonic() + 2.5
     last_issues: list[str] = []
-    last_band: dict[str, Any] = {}
     while True:
         state = _read_form_state(page)
         band = next(
             (b for b in state.get("bands") or [] if b.get("heading") == heading),
             {},
         )
-        last_band = band
         issues: list[str] = []
         if not band.get("found"):
             issues.append("section not found")

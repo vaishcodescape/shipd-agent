@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import unittest
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
 
 from review import graph as g
 from review.config import get_review_config

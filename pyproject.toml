@@ -19,6 +19,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Quality Assurance",
 ]
 dependencies = [
@@ -54,6 +55,21 @@ py-modules = [
 
 [tool.setuptools.packages.find]
 where = ["shipd-agent"]
+# Namespace discovery is on by default, so tests/ would ship as a top-level package.
+exclude = ["tests", "tests.*"]
 
 [tool.setuptools.package-data]
 review = ["*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["shipd-agent/tests"]
+
+[tool.ruff.lint]
+# Pinned to the pre-0.17 defaults (pyflakes + syntax errors); newer ruff
+# releases widen the default set.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# These scripts put the package root on sys.path before importing siblings.
+"shipd-agent/tests/debug_submit.py" = ["E402"]
+"shipd-agent/workflow/submit_from_json.py" = ["E402"]

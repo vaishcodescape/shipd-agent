@@ -8,7 +8,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from auth import AUTH_STATE_PATH, AuthConfig, ensure_signed_in, load_auth_config, managed_browser
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+from auth import AUTH_STATE_PATH, ensure_signed_in, load_auth_config, managed_browser
 from workflow.review import (
     PROBLEM_DECK_URL,
     _review_ready_locator,

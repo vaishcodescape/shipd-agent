@@ -11,9 +11,13 @@
 # whose digit + label render as separate children, a confidence row, and a
 # reason textarea). Before the fix it collapses; after the fix each band is read
 # independently.
+#
+# Skips when chromium is missing, unless SHIPD_REQUIRE_BROWSER=1 (set in CI) so a
+# broken browser install fails loudly instead of silently dropping coverage.
 
 from __future__ import annotations
 
+import os
 import unittest
 
 from workflow.submit import (
@@ -127,6 +131,8 @@ class BandScopeBrowserTests(unittest.TestCase):
             cls._browser = cls._pw.chromium.launch(headless=True)
         except Exception as exc:  # pragma: no cover - browser binary missing
             cls._pw.stop()
+            if os.environ.get("SHIPD_REQUIRE_BROWSER") == "1":
+                raise
             raise unittest.SkipTest(f"chromium unavailable: {exc}")
 
     @classmethod
@@ -288,6 +294,8 @@ class PositionalClickBrowserTests(unittest.TestCase):
             cls._browser = cls._pw.chromium.launch(headless=True)
         except Exception as exc:  # pragma: no cover - browser binary missing
             cls._pw.stop()
+            if os.environ.get("SHIPD_REQUIRE_BROWSER") == "1":
+                raise
             raise unittest.SkipTest(f"chromium unavailable: {exc}")
 
     @classmethod
