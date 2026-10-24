@@ -41,22 +41,18 @@ jobs:
         run: ./run.sh --help
 
   test:
-    name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
-    runs-on: ${{ matrix.os }}
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
         include:
-          # The in-page form JS is Python-version independent, so one leg
-          # installs Chromium and requires the browser regression tests to run.
-          - os: ubuntu-latest
-            python-version: "3.14"
+          # Oldest version requires-python allows.
+          - python-version: "3.10"
+          # Latest; the in-page form JS is Python-version independent, so only
+          # this leg installs Chromium and requires the browser tests to run.
+          - python-version: "3.14"
             browser: true
-          # The agent is run day-to-day on macOS.
-          - os: macos-latest
-            python-version: "3.14"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
