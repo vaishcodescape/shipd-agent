@@ -10,7 +10,11 @@ permissions:
   packages: write
 
 jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   publish:
+    needs: ci
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
