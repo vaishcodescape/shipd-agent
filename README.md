@@ -55,9 +55,10 @@ git clone https://github.com/vaishcodescape/shipd-agent.git
 cd shipd-agent
 ./run.sh --setup
 cp .env.example .env     # AUTH_EMAIL, AUTH_PASSWORD
-./run.sh --configure-llm # pick an LLM provider + models, store the API key securely
 ./run.sh --check         # validate environment before first run
 ```
+
+On the first run, `./run.sh` asks you to pick an LLM provider and models and to paste the API key. It stores them, then starts the review. Later runs skip this step. To change the LLM later, run `./run.sh --configure-llm`.
 
 **From GitHub Releases** (install the published wheel)
 
@@ -129,7 +130,7 @@ This asks for the provider, an explore model and a finalize model (pick from a l
 - The key is never written to `.env`, never printed or logged (`--check` shows only the last 4 characters), and never passed as a command-line argument.
 - The provider and model choices are saved to `.env` as `REVIEW_PROVIDER`, `REVIEW_EXPLORE_MODEL` and `REVIEW_MODEL`, so later runs reuse them.
 
-When a review run finds no key for the selected provider, it asks for one (hidden input) and stores it, as long as it runs in a terminal. In cron, CI or with piped stdin, it stops right away with an error that says what to set.
+**First run:** when a review run finds no API key for the selected provider, it runs this same setup before anything else, saves the choices without asking, and then continues the run. If you passed `--provider`, `--model` or `--explore-model`, it only asks for the key. Once a key is found (env var or stored), runs start straight away. In cron, CI or with piped stdin there is no terminal to ask on, so the run stops right away with an error that says what to set.
 
 **Key lookup order:** the provider's env var (shell or `.env`) first, then the stored key.
 
