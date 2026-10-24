@@ -42,6 +42,10 @@ EXTRA_ARGS=()
 SHUTDOWN=0
 FRESH=0
 RESUME_BATCH=0
+# Review LLM overrides from --provider / --model / --explore-model.
+CLI_PROVIDER=""
+CLI_MODEL=""
+CLI_EXPLORE_MODEL=""
 
 # Terminal UX state (colors/spinners when stdout is a TTY; plain otherwise).
 USE_TTY_UI=0
@@ -59,6 +63,17 @@ Setup & diagnostics:
   --check              Validate environment without running a review
   --status             Show session stats and saved batch progress
   --version            Print installed version
+
+Review LLM (any provider):
+  --configure-llm      Choose provider + models and save the API key securely
+                       (OS keychain; hidden input; never written to .env)
+  --forget-llm-key     Remove the stored API key for the current provider
+  --provider NAME      anthropic (default), openai, google, deepseek, moonshot,
+                       xai, openai-compatible (aliases: claude, gpt, gemini,
+                       kimi, grok). Without --model/--explore-model, switching
+                       provider uses that provider's default models.
+  --model ID           Finalize model (overrides REVIEW_MODEL)
+  --explore-model ID   Explore model (overrides REVIEW_EXPLORE_MODEL)
 
 Run modes:
   --once               Run exactly one review (no count prompt)
@@ -87,12 +102,16 @@ Browser / logging:
   --log-file PATH      Append run output to this file (default: logs/run.log)
 
 Environment:
-  Copy .env.example to .env and set AUTH_EMAIL, AUTH_PASSWORD, ANTHROPIC_API_KEY.
+  Copy .env.example to .env and set AUTH_EMAIL and AUTH_PASSWORD, then run
+  ./run.sh --configure-llm (or set REVIEW_PROVIDER and the provider's key env
+  var, e.g. ANTHROPIC_API_KEY or OPENAI_API_KEY; env vars win over stored keys).
   SHIPD_NO_COLOR=1 or SHIPD_PLAIN=1 disables terminal colors.
 
 Examples:
   ./run.sh --setup
+  ./run.sh --configure-llm             # Pick provider/models, store API key
   ./run.sh --check
+  ./run.sh --once --no-submit --provider openai   # One run on GPT (provider defaults)
   ./run.sh --once --no-submit          # Safe first run: review locally only
   ./run.sh --once --submit             # Full cycle including Shipd submit
   ./run.sh --reviews 10 --submit       # Batch with auto-submit each review
@@ -702,6 +721,26 @@ while [[ $# -gt 0 ]]; do
             FRESH=1
             shift
             ;;
+        --provider)
+            CLI_PROVIDER="${2:?--provider requires a value}"
+            shift 2
+            ;;
+        --model)
+            CLI_MODEL="${2:?--model requires a value}"
+            shift 2
+            ;;
+        --explore-model)
+            CLI_EXPLORE_MODEL="${2:?--explore-model requires a value}"
+            shift 2
+            ;;
+        --configure-llm)
+            EXTRA_ARGS=(configure_llm)
+            shift
+            ;;
+        --forget-llm-key)
+            EXTRA_ARGS=(forget_llm_key)
+            shift
+            ;;
         --setup)
             EXTRA_ARGS=(setup)
             shift
@@ -819,6 +858,50 @@ run_setup() {
     log "Setup complete"
 }
 
+# Apply --provider / --model / --explore-model on top of .env (call after every
+# load_env_file). Model vars are blanked rather than unset when switching
+# provider so python-dotenv in the child cannot reload the old provider's
+# models from .env; an empty value means "use the provider default".
+apply_llm_overrides() {
+    if [[ -n "${CLI_PROVIDER}" ]]; then
+        # tr instead of ${var,,}: macOS still ships bash 3.2.
+        local wanted current
+        wanted="$(printf '%s' "${CLI_PROVIDER}" | tr '[:upper:]' '[:lower:]')"
+        current="$(printf '%s' "${REVIEW_PROVIDER:-anthropic}" | tr '[:upper:]' '[:lower:]')"
+        if [[ "${wanted}" != "${current}" ]]; then
+            [[ -z "${CLI_MODEL}" ]] && export REVIEW_MODEL=""
+            [[ -z "${CLI_EXPLORE_MODEL}" ]] && export REVIEW_EXPLORE_MODEL=""
+        fi
+        export REVIEW_PROVIDER="${CLI_PROVIDER}"
+    fi
+    [[ -n "${CLI_MODEL}" ]] && export REVIEW_MODEL="${CLI_MODEL}"
+    [[ -n "${CLI_EXPLORE_MODEL}" ]] && export REVIEW_EXPLORE_MODEL="${CLI_EXPLORE_MODEL}"
+    return 0
+}
+
+# Provider/model/key helper (review/llm_setup.py). API keys never pass through
+# the shell: Python reads them from the env, the OS keychain or a hidden prompt.
+llm_tool() {
+    (cd "${AGENT_DIR}" && PYTHONPATH="${AGENT_DIR}" "${PYTHON}" -m review.llm_setup "$@")
+}
+
+log_lines() {
+    local line
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        [[ -n "${line}" ]] && log "${line}"
+    done <<< "$1"
+    return 0
+}
+
+# Exit 0 when the review LLM is usable. On a TTY a missing key is prompted for
+# (hidden input) and stored; non-interactive runs fail fast instead of waiting.
+ensure_llm_ready() {
+    local output rc=0
+    output="$(llm_tool ensure-key)" || rc=$?
+    log_lines "${output}"
+    return "${rc}"
+}
+
 preflight() {
     log "Preflight checks"
     resolve_python
@@ -833,9 +916,10 @@ preflight() {
     elif [[ -f "${ENV_FILE}" ]]; then
         load_env_file "${ENV_FILE}"
     fi
+    apply_llm_overrides
 
-    if [[ "${REVIEW}" -eq 1 ]] && [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-        die "ANTHROPIC_API_KEY is required for review (set in .env or use --no-review)"
+    if [[ "${REVIEW}" -eq 1 ]] && ! ensure_llm_ready; then
+        die "Review LLM is not ready (see above): run ./run.sh --configure-llm, set the provider's API key in .env, or use --no-review (missing packages: ./run.sh --setup)"
     fi
 
     if ! "${PYTHON}" -c "import playwright" 2>/dev/null; then
@@ -903,6 +987,7 @@ run_check() {
         log "WARNING: Missing ${ENV_FILE} — copy .env.example"
         ok=0
     fi
+    apply_llm_overrides
 
     local missing=()
     [[ -z "${AUTH_EMAIL:-}" ]] && missing+=("AUTH_EMAIL")
@@ -914,11 +999,13 @@ run_check() {
         log "Auth credentials: configured"
     fi
 
-    if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-        log "WARNING: ANTHROPIC_API_KEY not set (required for --review)"
+    # Provider, models and key source; the key itself is only shown masked.
+    local llm_output llm_rc=0
+    llm_output="$(llm_tool status 2>&1)" || llm_rc=$?
+    log_lines "${llm_output}"
+    if [[ "${llm_rc}" -ne 0 ]]; then
+        log "WARNING: Review LLM not ready (required for --review; run ./run.sh --configure-llm)"
         ok=0
-    else
-        log "Anthropic API key: configured"
     fi
 
     if "${PYTHON}" -c "import playwright" 2>/dev/null; then
@@ -1427,6 +1514,19 @@ main() {
                 resolve_python
                 print_version
                 exit 0
+                ;;
+            configure_llm|forget_llm_key)
+                resolve_python
+                activate_venv
+                load_env_file "${ENV_FILE}"
+                apply_llm_overrides
+                if [[ "${EXTRA_ARGS[0]}" == "configure_llm" ]]; then
+                    # Runs on the terminal directly: interactive prompts, hidden key input.
+                    llm_tool configure --env-file "${ENV_FILE}"
+                else
+                    llm_tool forget
+                fi
+                exit $?
                 ;;
         esac
     fi

@@ -6,7 +6,7 @@ import re
 import time
 from typing import Annotated, Any, TypedDict
 
-from langchain_anthropic import ChatAnthropic
+from review.llm import llm_config_error, make_chat_model
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
@@ -541,11 +541,12 @@ def unified_review_node(state: ReviewState) -> dict:
             ),
         }
 
-    if not config.anthropic_api_key:
+    llm_error = llm_config_error(config)
+    if llm_error:
         return {
             **phase0_updates,
-            "error": "ANTHROPIC_API_KEY is not set.",
-            "explore_notes": "Unified review skipped: missing API key.",
+            "error": llm_error,
+            "explore_notes": "Unified review skipped: LLM provider not configured.",
         }
 
     from pathlib import Path
@@ -567,11 +568,7 @@ def unified_review_node(state: ReviewState) -> dict:
         cached_phase0=phase0_result,
         config=config,
     )
-    llm = ChatAnthropic(
-        model=config.review_explore_model,
-        api_key=config.anthropic_api_key,
-        max_tokens=config.review_explore_max_output_tokens,
-    )
+    llm = make_chat_model(config, "explore")
     agent = create_react_agent(llm, tools)
 
     summary = state.get("submission_summary", {})
@@ -759,9 +756,10 @@ def finalize_node(state: ReviewState) -> dict:
         return {"review_result": _fallback_result(state, state["error"])}
 
     config: ReviewConfig = state["config"]
-    if not config.anthropic_api_key:
+    llm_error = llm_config_error(config)
+    if llm_error:
         return {
-            "review_result": _fallback_result(state, "ANTHROPIC_API_KEY is not set."),
+            "review_result": _fallback_result(state, llm_error),
         }
 
     rubric = _load_rubric_excerpt(
@@ -825,11 +823,7 @@ def finalize_node(state: ReviewState) -> dict:
         category="review",
     )
 
-    llm = ChatAnthropic(
-        model=config.review_model,
-        api_key=config.anthropic_api_key,
-        max_tokens=config.review_finalize_max_output_tokens,
-    ).with_structured_output(ReviewResult)
+    llm = make_chat_model(config, "finalize", structured_output=ReviewResult)
 
     log_activity(
         f"finalize: structuring review with {config.review_model} "
