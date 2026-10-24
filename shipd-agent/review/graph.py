@@ -30,6 +30,11 @@ from review.context import build_submission_summary
 from review.agent_runs_checks import evaluate_agent_runs_phase5
 from review.downgrade import apply_downgrade_logic, evaluate_loc_phase4
 from review.loc import compute_effective_loc, format_loc_analysis
+from review.prompt_checks import (
+    analyze_task_prompt,
+    evaluate_prompt_phase1,
+    format_prompt_analysis,
+)
 from review.review_phases import (
     any_phase_failed,
     dicts_to_phase_results,
@@ -86,6 +91,7 @@ class ReviewState(TypedDict, total=False):
     scrape_context: dict[str, str]
     loc_info: dict
     loc_analysis: str
+    prompt_analysis: str
     review_result: dict
     error: str
 
@@ -247,10 +253,10 @@ def _explore_coverage_gaps(
 
 
 _COVERAGE_PHASE_INSTRUCTIONS: dict[str, str] = {
-    "1": "Phase 1 (problem description): read the problem statement and judge clarity, repo fit, and AI-slop.",
+    "1": "Phase 1 (problem description): read the problem statement and judge clarity, repo fit, AI-slop, the word limit, and Too Many Requirements.",
     "2": "Phase 2 (harness): read the Dockerfile and test.sh; check minimal image and the base/new split.",
     "3": "Phase 3 (tests): read test.patch; check coverage, determinism, no network, and behaviour-not-implementation.",
-    "5": "Phase 5 (agent runs): call read_holistic_check and read_shipd_review_panel('Agent Runs'); cite pass rate and medians.",
+    "5": "Phase 5 (agent runs): call read_holistic_check and read_shipd_review_panel('Agent Runs'); cite Nova/Vega/Orion pass counts and medians.",
     "6": "Phase 6 (platform): call read_shipd_review_panel('Related Submissions') and read_holistic_check; note duplicate/overlap and Mars-vs-Olympus fit.",
 }
 
@@ -321,11 +327,40 @@ def _run_agent_runs_analysis(state: ReviewState) -> dict:
         agent_runs_data,
         quest=quest,
     )
+    if phase5_result.status == "SKIP":
+        # Nothing measurable — leave phase 5 to the reviewer instead of
+        # stamping a deterministic verdict over it.
+        return {}
     phase_results = dict(state.get("phase_results", {}))
     phase_results["5"] = phase5_result.model_dump()
     findings = list(state.get("findings", []))
     findings.extend(f.model_dump() for f in phase5_findings)
     return {"phase_results": phase_results, "findings": findings}
+
+
+def _run_prompt_analysis(state: ReviewState) -> dict:
+    """Run deterministic Phase 1 task prompt checks (word limit, Too Many Requirements)."""
+    from pathlib import Path
+
+    config: ReviewConfig = state["config"]
+    scrape = state.get("scrape_context") or {}
+    analysis = analyze_task_prompt(
+        Path(state["repo_path"]),
+        holistic_text=scrape.get("holistic_check_raw", ""),
+    )
+    limits = {
+        "max_words": config.max_prompt_words,
+        "max_requirements": config.max_prompt_requirements,
+    }
+    out: dict[str, Any] = {"prompt_analysis": format_prompt_analysis(analysis, **limits)}
+    phase1_result, phase1_findings = evaluate_prompt_phase1(analysis, **limits)
+    if phase1_result is not None:
+        phase_results = dict(state.get("phase_results", {}))
+        phase_results["1"] = phase1_result.model_dump()
+        findings = list(state.get("findings", []))
+        findings.extend(f.model_dump() for f in phase1_findings)
+        out.update({"phase_results": phase_results, "findings": findings})
+    return out
 
 
 def _run_loc_analysis(state: ReviewState) -> dict:
@@ -386,7 +421,11 @@ def _run_phase0_into_state(state: ReviewState) -> dict:
     )
     phase_results = dict(state.get("phase_results", {}))
     phase_results["0"] = phase0_to_phase_result(phase0).model_dump()
-    findings = [f.model_dump() for f in phase0.findings]
+    # Keep findings recorded before Phase 0 (scrape-time agent run checks).
+    findings = [
+        *state.get("findings", []),
+        *(f.model_dump() for f in phase0.findings),
+    ]
     out = {
         "phase0_result": phase0,
         "phase0_log": phase0.phase0_log,
@@ -395,6 +434,7 @@ def _run_phase0_into_state(state: ReviewState) -> dict:
         "force_request_changes": phase0.critical_fail,
     }
     out.update(_run_loc_analysis({**state, **out}))
+    out.update(_run_prompt_analysis({**state, **out}))
     return out
 
 
@@ -415,6 +455,15 @@ def _dry_run_result(state: ReviewState) -> dict:
     phase4_dict = state.get("phase_results", {}).get("4")
     if phase4_dict:
         phase_results["4"] = PhaseResult(**phase4_dict)
+    # Deterministic task prompt (1) and agent run (5) verdicts need no LLM.
+    for key in ("1", "5"):
+        det = state.get("phase_results", {}).get(key)
+        if det:
+            phase_results[key] = PhaseResult(**det)
+            findings.extend(
+                f for f in state.get("findings", [])
+                if isinstance(f, dict) and f.get("phase") == key
+            )
 
     quest = state.get("quest", "olympus")
     loc_analysis = state.get("loc_analysis") or format_loc_analysis(
@@ -556,9 +605,12 @@ def unified_review_node(state: ReviewState) -> dict:
         ),
         holistic_check=holistic_section,
         loc_analysis=loc_analysis,
+        prompt_analysis=phase0_updates.get("prompt_analysis", ""),
         olympus_min_loc=config.olympus_min_loc,
         mars_min_loc=config.mars_min_loc,
         mars_max_loc=config.mars_max_loc,
+        max_prompt_words=config.max_prompt_words,
+        max_prompt_requirements=config.max_prompt_requirements,
         max_tool_steps=config.review_max_tool_steps,
     )
     log_activity(
@@ -750,6 +802,9 @@ def finalize_node(state: ReviewState) -> dict:
         "force_request_changes": state.get("force_request_changes", False),
         "loc_analysis": state.get("loc_analysis", ""),
         "loc_info": state.get("loc_info", {}),
+        "prompt_analysis": state.get("prompt_analysis", ""),
+        "max_prompt_words": config.max_prompt_words,
+        "max_prompt_requirements": config.max_prompt_requirements,
         "olympus_min_loc": config.olympus_min_loc,
         "mars_min_loc": config.mars_min_loc,
         "mars_max_loc": config.mars_max_loc,
@@ -905,6 +960,31 @@ def finalize_node(state: ReviewState) -> dict:
                 *base_findings,
                 *[Finding(**f) for f in phase5_findings],
             ]
+
+    phase1_det = state.get("phase_results", {}).get("1")
+    if phase1_det and phase1_det.get("status") == "FAIL":
+        merged_phases = dict(loc_updates.get("phase_results", review.phase_results))
+        reviewer_phase1 = merged_phases.get("1")
+        reviewer_summary = reviewer_phase1.summary.strip() if reviewer_phase1 else ""
+        merged_phases["1"] = PhaseResult(
+            status="FAIL",
+            summary=" ".join(
+                part for part in (phase1_det.get("summary", ""), reviewer_summary) if part
+            ),
+        )
+        loc_updates["phase_results"] = merged_phases
+    phase1_findings = [
+        f for f in state.get("findings", [])
+        if isinstance(f, dict)
+        and f.get("phase") == "1"
+        and ("1", f.get("finding", "")) not in existing_finding_keys
+    ]
+    if phase1_findings:
+        base_findings = loc_updates.get("findings", review.findings)
+        loc_updates["findings"] = [
+            *base_findings,
+            *[Finding(**f) for f in phase1_findings],
+        ]
 
     if loc_updates:
         review = review.model_copy(update=loc_updates)
