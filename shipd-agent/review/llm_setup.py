@@ -2,6 +2,8 @@
 #
 # Used by scripts/shipd.sh:
 #   configure   ./run.sh --configure-llm   interactive provider/model/key setup
+#   onboard     first thing in a review run: the same setup when no API key is
+#               configured yet (asks nothing once set up, or without a TTY)
 #   ensure-key  preflight before a review run (prompts only on a TTY)
 #   status      ./run.sh --check           masked, secret-free summary
 #   forget      ./run.sh --forget-llm-key  remove a stored key
@@ -34,6 +36,10 @@ from review.llm_providers import (
 
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$")
 _URL_RE = re.compile(r"^https?://\S+$")
+
+# `onboard` exit status when it saved new provider/model settings to the env
+# file: the caller (scripts/shipd.sh) reloads that file before continuing.
+ONBOARD_SAVED_SETTINGS = 3
 
 
 def _err(message: str) -> None:
@@ -149,18 +155,19 @@ def _write_env_settings(env_file: Path, values: dict[str, str], remove: list[str
     for key in remove:
         if key in existing:
             unset_key(str(env_file), key)
+    # Later config loads in this process see the new values too (load_dotenv
+    # never overrides variables that are already set).
+    os.environ.update(values)
+    for key in remove:
+        os.environ.pop(key, None)
 
 
-def cmd_configure(args: argparse.Namespace) -> int:
-    if not _interactive():
-        _err(
-            "ERROR: --configure-llm needs an interactive terminal. In scripts, set "
-            "REVIEW_PROVIDER / REVIEW_EXPLORE_MODEL / REVIEW_MODEL and the "
-            "provider's API key env var instead."
-        )
-        return 2
+def _configure_interactively(env_file: Path, *, first_run: bool = False) -> bool:
+    """Ask for provider, models and key; return True when settings were saved.
 
-    env_file = Path(args.env_file).expanduser()
+    ``first_run`` (onboard) saves without asking and stops before saving when
+    no key was entered, since the run cannot start without one.
+    """
     load_dotenv(env_file)  # no-op for keys the caller already exported
     try:
         current = normalize_provider_name(os.getenv("REVIEW_PROVIDER", ""))
@@ -168,7 +175,6 @@ def cmd_configure(args: argparse.Namespace) -> int:
         print(f"WARNING: {exc} Starting from the default provider.")
         current = normalize_provider_name("")
 
-    print("Configure the review LLM (provider, models, API key).")
     print(f"API keys are stored in: {credentials.describe_store()}")
 
     spec = _choose_provider(current)
@@ -202,6 +208,8 @@ def cmd_configure(args: argparse.Namespace) -> int:
             if _confirm("Replace it?", default=False):
                 _prompt_and_store_key(spec)
         elif not _prompt_and_store_key(spec):
+            if first_run:
+                return False
             print(
                 f"WARNING: no {spec.label} key stored; reviews will fail until you "
                 f"set {spec.primary_key_env} or rerun ./run.sh --configure-llm."
@@ -221,13 +229,61 @@ def cmd_configure(args: argparse.Namespace) -> int:
     print("")
     for key, value in settings.items():
         print(f"  {key}={value}")
-    if _confirm(f"Save these settings to {env_file}?", default=True):
+    if first_run or _confirm(f"Save these settings to {env_file}?", default=True):
         _write_env_settings(env_file, settings, remove)
         print(f"Saved to {env_file} (no API key is written there).")
-    else:
-        print("Not saved. Pass --provider/--model/--explore-model or set the env vars.")
+        return True
+    print("Not saved. Pass --provider/--model/--explore-model or set the env vars.")
+    return False
+
+
+def cmd_configure(args: argparse.Namespace) -> int:
+    if not _interactive():
+        _err(
+            "ERROR: --configure-llm needs an interactive terminal. In scripts, set "
+            "REVIEW_PROVIDER / REVIEW_EXPLORE_MODEL / REVIEW_MODEL and the "
+            "provider's API key env var instead."
+        )
+        return 2
+    print("Configure the review LLM (provider, models, API key).")
+    _configure_interactively(Path(args.env_file).expanduser())
     print("Run ./run.sh --check to verify.")
     return 0
+
+
+def cmd_onboard(args: argparse.Namespace) -> int:
+    """First run: set up the review LLM when no API key is configured yet.
+
+    Exit 0 when nothing had to change (already set up, or no terminal to ask
+    on; ensure-key then reports the missing key), ONBOARD_SAVED_SETTINGS when
+    provider/model settings were saved, 1 when there is still no key.
+    """
+    config = _load_config()
+    if config is None:
+        return 2
+    if not missing_api_key_message(config) or not _interactive():
+        return 0
+
+    saved = False
+    if args.key_only:
+        # Provider/models came from the command line; only the key is missing.
+        spec = get_provider(config.llm_provider)
+        print(f"\nFirst run: no API key found for {spec.label}.")
+        _prompt_and_store_key(spec)
+    else:
+        print("\nFirst run: set up the review LLM (provider, models, API key).")
+        print("Press Enter to accept a default. Settings are saved for later runs.")
+        saved = _configure_interactively(Path(args.env_file).expanduser(), first_run=True)
+
+    config = _load_config()
+    if config is None:
+        return 2
+    problem = missing_api_key_message(config)
+    if problem:
+        print(f"ERROR: {problem}")
+        return 1
+    print("Review LLM is set up; starting the agent.\n")
+    return ONBOARD_SAVED_SETTINGS if saved else 0
 
 
 def _summary_lines(config: ReviewConfig) -> list[str]:
@@ -354,6 +410,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Where to save REVIEW_PROVIDER / REVIEW_*MODEL (default: repo .env).",
     )
     configure.set_defaults(func=cmd_configure)
+    onboard = sub.add_parser(
+        "onboard", help="First run: interactive setup when no API key is configured."
+    )
+    onboard.add_argument(
+        "--env-file",
+        default=str(REPO_ROOT / ".env"),
+        help="Where to save REVIEW_PROVIDER / REVIEW_*MODEL (default: repo .env).",
+    )
+    onboard.add_argument(
+        "--key-only",
+        action="store_true",
+        help="Only ask for the key (provider/models were given on the command line).",
+    )
+    onboard.set_defaults(func=cmd_onboard)
     sub.add_parser("status", help="Show the LLM setup (keys masked).").set_defaults(
         func=cmd_status
     )

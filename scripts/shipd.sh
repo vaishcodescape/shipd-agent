@@ -102,9 +102,11 @@ Browser / logging:
   --log-file PATH      Append run output to this file (default: logs/run.log)
 
 Environment:
-  Copy .env.example to .env and set AUTH_EMAIL and AUTH_PASSWORD, then run
-  ./run.sh --configure-llm (or set REVIEW_PROVIDER and the provider's key env
-  var, e.g. ANTHROPIC_API_KEY or OPENAI_API_KEY; env vars win over stored keys).
+  Copy .env.example to .env and set AUTH_EMAIL and AUTH_PASSWORD. The first
+  review run asks for the LLM provider, models and API key, then starts; later
+  runs reuse them (change with ./run.sh --configure-llm, or set REVIEW_PROVIDER
+  and the provider's key env var, e.g. ANTHROPIC_API_KEY or OPENAI_API_KEY;
+  env vars win over stored keys).
   SHIPD_NO_COLOR=1 or SHIPD_PLAIN=1 disables terminal colors.
 
 Examples:
@@ -893,6 +895,33 @@ log_lines() {
     return 0
 }
 
+# First run: with no API key configured for the review LLM yet, walk through
+# provider/model/key setup before anything else, then carry on with the run.
+# Asks nothing once configured, or without a terminal (preflight then fails
+# fast on the missing key).
+setup_llm_on_first_run() {
+    [[ "${REVIEW}" -eq 1 ]] && [[ -t 0 ]] || return 0
+    load_env_file "${ENV_FILE}"
+    apply_llm_overrides
+
+    local args=(onboard --env-file "${ENV_FILE}")
+    # Provider/models given on the command line: only ask for the key.
+    if [[ -n "${CLI_PROVIDER}${CLI_MODEL}${CLI_EXPLORE_MODEL}" ]]; then
+        args+=(--key-only)
+    fi
+    # Runs on the terminal directly: interactive prompts, hidden key input.
+    local rc=0
+    llm_tool "${args[@]}" || rc=$?
+    if [[ "${rc}" -eq 3 ]]; then
+        # New settings were saved to .env. Drop this shell's exported copies so
+        # a base URL the setup removed cannot linger, then reload them.
+        unset REVIEW_PROVIDER REVIEW_MODEL REVIEW_EXPLORE_MODEL REVIEW_LLM_BASE_URL
+        load_env_file "${ENV_FILE}"
+    elif [[ "${rc}" -ne 0 ]]; then
+        die "Review LLM is not set up (see above): rerun ./run.sh to try again, set the provider's API key in .env, or use --no-review (missing packages: ./run.sh --setup)"
+    fi
+}
+
 # Exit 0 when the review LLM is usable. On a TTY a missing key is prompted for
 # (hidden input) and stored; non-interactive runs fail fast instead of waiting.
 ensure_llm_ready() {
@@ -1537,6 +1566,8 @@ main() {
     ui_header "Shipd Agent"
     log_msg "$(print_version)"
     log "Log file: ${LOG_FILE}"
+
+    setup_llm_on_first_run
 
     if [[ "${FRESH}" -eq 0 ]] && [[ "${ONCE}" -eq 0 ]]; then
         apply_watch_resume || true
