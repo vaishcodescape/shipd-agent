@@ -114,7 +114,7 @@ Examples:
   ./run.sh --configure-llm             # Pick provider/models, store API key
   ./run.sh --check
   ./run.sh --once --no-submit --provider openai   # One run on GPT (provider defaults)
-  ./run.sh --once --no-submit          # Safe first run: review locally only
+  ./run.sh --once --no-submit          # Live review; feedback is not submitted
   ./run.sh --once --submit             # Full cycle including Shipd submit
   ./run.sh --reviews 10 --submit       # Batch with auto-submit each review
   ./run.sh --fresh --reviews 5         # New batch, ignore saved resume state

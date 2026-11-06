@@ -241,38 +241,6 @@ def _find_holistic_section(page: Any) -> Locator | None:
     return _find_section_by_heading(page, r"Holistic Check")
 
 
-def _expand_checklist_if_collapsed(section: Locator) -> None:
-    checklist = section.get_by_text(re.compile(r"^CHECKLIST$", re.I))
-    if not checklist.count():
-        return
-
-    expand_patterns = (
-        re.compile(r"expand", re.I),
-        re.compile(r"show", re.I),
-        re.compile(r"chevron", re.I),
-        re.compile(r"more", re.I),
-    )
-    checklist_block = checklist.first.locator(
-        "xpath=ancestor::*[self::div or self::section][1]"
-    )
-    scope = checklist_block if checklist_block.count() else section
-    for pattern in expand_patterns:
-        button = scope.get_by_role("button", name=pattern)
-        if button.count() and button.first.is_visible():
-            try:
-                button.first.click(timeout=2_000)
-            except PlaywrightTimeoutError:
-                pass
-            return
-
-    disclosure = scope.locator("[aria-expanded='false']")
-    if disclosure.count() and disclosure.first.is_visible():
-        try:
-            disclosure.first.click(timeout=2_000)
-        except PlaywrightTimeoutError:
-            pass
-
-
 def _extract_reviewer_notes(section: Locator) -> str:
     notes_heading = section.get_by_text(re.compile(r"Reviewer Notes", re.I))
     if not notes_heading.count():
@@ -323,8 +291,9 @@ def scrape_holistic_check(page: Any) -> dict[str, Any]:
         if section is None:
             return dict(_HOLISTIC_EMPTY)
 
-        _expand_checklist_if_collapsed(section)
-
+        # Reading evidence must never click controls. Broad "more"/"show"
+        # matches can start paid agent runs, and an LLM may read this panel
+        # repeatedly (issue #1). Collapsed content stays unavailable.
         raw_text = section.inner_text(timeout=DEFAULT_TIMEOUT_MS).strip()
         parsed = parse_holistic_check_from_text(raw_text)
 

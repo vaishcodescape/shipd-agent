@@ -1,0 +1,33 @@
+name: Bug report
+description: Report a reproducible problem with installation, review, or browser automation.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: "Remove API keys, passwords, cookies, and private submission data before posting."
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Include what you expected and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include the command and whether submission was enabled.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, repository commit or release, provider/model.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted logs or synthetic fixture
+      description: Include relevant error output and any anonymized UI example.
