@@ -32,6 +32,7 @@ from workflow.cleanup import (
     remove_clone_directory,
     snapshot_docker_state,
 )
+from review.page_guard import ensure_review_not_completed
 
 # The problem deck. Defaults to the reviews page; override if the deck lives
 # at a different path.
@@ -195,7 +196,9 @@ def _click_into_review(page: Page, control: Locator) -> None:
         with page.expect_navigation(timeout=15_000, wait_until="commit"):
             control.click()
     except PlaywrightTimeoutError:
-        control.click()
+        # SPA navigation may not emit a document navigation event. The first
+        # click may already have succeeded; never replay it on a changed DOM.
+        pass
     wait_for_review_ready(page)
 
 
@@ -251,6 +254,7 @@ def open_review(page: Page) -> None:
 def reserve_and_open_review(page: Page) -> None:
     """Reserve (or continue) and open the review in one pass."""
     if continue_existing_review(page):
+        ensure_review_not_completed(page)
         return
 
     if "/reviews" not in page.url:
@@ -261,11 +265,13 @@ def reserve_and_open_review(page: Page) -> None:
     wait_for_post_reserve(page)
     print("Reserved a submission.")
     _open_review_from_deck(page)
+    ensure_review_not_completed(page)
     print(f"Review open: {page.url}")
 
 
 def open_quick_setup(page: Page) -> None:
     """Scroll to Quick Setup and expand the setup script."""
+    ensure_review_not_completed(page)
     pre = page.locator("pre").first
     if pre.count() > 0 and pre.is_visible():
         script = pre.inner_text().strip()

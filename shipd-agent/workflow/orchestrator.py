@@ -38,6 +38,7 @@ except (ImportError, AttributeError):
 from review.activity import set_activity_log_file
 from review.config import get_review_config
 from review.review_bundles import save_review_bundle
+from review.page_guard import CompletedReviewError
 from review.result import is_review_complete, review_failure_reason
 from workflow.review import (
     clone_submission_locally,
@@ -639,6 +640,11 @@ def run_watch_loop(
                     f"SHIPD:REVIEW:{runs}:{max_display}:fail",
                     log_file=log_file,
                 )
+                if isinstance(exc, CompletedReviewError):
+                    # A stale reservation will reopen the same completed page.
+                    # Leave the batch resumable instead of repeatedly retrying.
+                    log_message("Batch stopped: completed submission requires attention.", log_file=log_file)
+                    break
 
             failed_url = _load_failed_review_url() if run_status == "fail" else ""
             finished = watch_batch.record_run_complete(

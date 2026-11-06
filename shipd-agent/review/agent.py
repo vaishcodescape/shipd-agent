@@ -10,6 +10,7 @@ from typing import Any
 
 from review.config import ReviewConfig, get_review_config
 from review.graph import run_review_graph
+from review.page_guard import ensure_review_not_completed
 from review.result import is_review_complete, review_failure_reason
 from review.review_bundles import PENDING_SUBMIT_PATH, save_review_bundle
 
@@ -23,6 +24,8 @@ def run_review_agent(
     config: ReviewConfig | None = None,
 ) -> dict:
     """Run the LangGraph review pipeline and return a submit-ready review dict."""
+    if page is not None:
+        ensure_review_not_completed(page)
     path = Path(repo_path)
     config = config or get_review_config()
 

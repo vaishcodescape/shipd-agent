@@ -16,6 +16,7 @@ from playwright.sync_api import (
 )
 
 from review.feedback_format import format_compact_author_note
+from review.page_guard import ensure_review_not_completed
 
 LogFn = Callable[[str], None]
 
@@ -356,7 +357,9 @@ _JS_FIND_AND_MARK = """
     }
     return el;
   };
-""" + _JS_BAND_RANGE_HELPERS + """
+""" + _JS_FORM_ROOT_HELPERS + _JS_BAND_RANGE_HELPERS + """
+  const documentRoot = findReviewFormRoot(args.formMarkers || []);
+  if (!documentRoot) return { ok: false, reason: 'review form not found' };
   const findBandScope = (headingNorm) =>
     bandScopeFromRange(
       headingNorm,
@@ -365,7 +368,7 @@ _JS_FIND_AND_MARK = """
       args.confidenceTargets || []
     );
 
-  let scopes = [document.body];
+  let scopes = [documentRoot];
   if (args.scopeHeading) {
     const headingNorm = norm(args.scopeHeading);
     const scope = findBandScope(headingNorm);
@@ -1310,7 +1313,8 @@ _JS_MARK_IN_FORM_SUBMIT = """
 """ + _JS_FORM_ROOT_HELPERS + """
   const submitPattern = /^submit(\\s+(review|feedback))?$/i;
   const formRoot = findReviewFormRoot(args.formMarkers || [], submitPattern);
-  const searchRoot = formRoot || document.body;
+  if (!formRoot) return { ok: false, reason: 'review form not found' };
+  const searchRoot = formRoot;
   const candidates = Array.from(searchRoot.querySelectorAll('button'))
     .filter((el) => isVisible(el) && submitPattern.test(norm(el.innerText)));
   const button = candidates.length ? candidates[candidates.length - 1] : null;
@@ -1967,6 +1971,7 @@ def _find_and_mark(
             "checkVisual": check_visual,
             "requireInteractive": require_interactive,
             "requireButton": require_button,
+            "formMarkers": list(SUBMIT_FORM_MARKERS),
             **_band_scope_eval_args(),
         },
     )
@@ -2114,6 +2119,7 @@ def _verify_band_scores(page: Page, *, log: LogFn = _noop_log) -> None:
 
 def _ensure_submit_review_form(page: Page, *, log: LogFn = _noop_log) -> None:
     """Open the submit-review form if the decision cards are not visible."""
+    ensure_review_not_completed(page)
     for marker in SUBMIT_FORM_MARKERS:
         if page.get_by_text(marker, exact=True).count():
             log("submit: review form already open")
@@ -2968,6 +2974,7 @@ def _click_in_form_submit(
     separately by _wait_submit_confirmation, which scopes its lookups to the
     live dialog so it can never hit the form's own controls.
     """
+    ensure_review_not_completed(page)
     diag = _submit_button_diagnostics(page)
     if not diag.get("found"):
         raise RuntimeError(

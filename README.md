@@ -1,202 +1,196 @@
-# >- shipd-agent
+<div align="center">
 
-End-to-end autonomous reviewer for [Shipd.ai](https://shipd.ai) (Datacurve's Olympus/Mars quest workflow).
+# shipd-agent
 
-The agent signs in, clocks in, reserves a submission, clones it via Quick Setup, runs mechanical Phase 0 checks (Docker + `test.sh`), performs a rubric-aligned LLM review, and optionally submits structured feedback on Shipd — all without human intervention.
+**From submission to evidence-backed review.**
 
-## Why this exists
+A Python review agent for Shipd’s Olympus and Mars workflows.<br>
+Docker checks · rubric-guided reasoning · inspectable feedback · opt-in submission
 
-Shipd's quality loop depends on **automated tests plus human review**. Reviewer throughput is the bottleneck. This agent mirrors a trained Shipd reviewer: same rubric (`shipd-rubric.md`), same band ratings, same contributor-facing feedback format — but runs continuously in batch mode with resume, cooldowns, and session accounting.
+[![CI](https://github.com/vaishcodescape/shipd-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/vaishcodescape/shipd-agent/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
+[![MIT license](https://img.shields.io/badge/License-MIT-22c55e)](LICENSE)
 
-## Architecture
+[Get started](#get-started) · [Terminal preview](#terminal-preview) · [Review approach](#how-it-models-a-human-quality-review) · [Contribute](CONTRIBUTING.md)
 
-```mermaid
-flowchart LR
-  subgraph browser["Browser (Playwright)"]
-    A[Sign in via IMAP OTP]
-    B[Clock in]
-    C[Reserve submission]
-    D[Quick Setup clone]
-    E[Submit review form]
-  end
+</div>
 
-  subgraph review["Review agent (LangGraph)"]
-    P0[Phase 0: Docker + tests]
-    P1[Phases 1–6: explore + evidence]
-    F[Finalize bands + verdict]
-  end
+Reviewing a submission means moving between setup scripts, test failures, patches, agent results, and a detailed rubric. **shipd-agent brings those steps into one workflow**, then saves structured feedback you can inspect before posting.
 
-  A --> B --> C --> D --> P0 --> P1 --> F
-  F --> E
-  F --> G[(reviews/*.json)]
-  D --> H[(submissions/)]
-```
+Built for Shipd reviewers with access to the review queue, and developers who want to study or extend a Playwright + LangGraph review pipeline. Independent community project; not an official Shipd or Datacurve product.
 
-**Pipeline phases**
+## Why use it?
 
-| Step | What happens |
-|------|----------------|
-| Auth | Headless Clerk login; OTP fetched over IMAP |
-| Clock in | Starts Shipd time log for the quest |
-| Reserve | Claims the next available submission |
-| Clone | Runs Quick Setup script into `./submissions/` |
-| Phase 0 | Builds Docker image, runs `test.sh` (base/new/solution) |
-| Review | LangGraph agent explores repo, scores Problem/Tests/Solution bands 0–3 |
-| Submit | Fills Shipd review form via Playwright (opt-in) |
-| Cleanup | Removes clone + Docker artifacts (configurable) |
-| Clock out | Posts per-quest session summary on batch completion |
+| Capability | What it gives you |
+| --- | --- |
+| **Check before reasoning** | Docker builds, patch checks, and the base/new/solution test contract before the LLM review |
+| **Review against a rubric** | Problem, Tests, and Solution ratings with findings, evidence, and suggested fixes |
+| **Choose your provider** | Anthropic, OpenAI, Google, DeepSeek, Moonshot, xAI, or an OpenAI-compatible endpoint |
+| **Inspect before posting** | A JSON review bundle; feedback submission is off by default |
+| **Keep track of batches** | Saved progress, cooldowns, and session statistics |
+| **Adapt the workflow** | Separate modules for browser sessions, deterministic checks, reasoning, and submission |
 
-## Install
+## Terminal preview
 
-**From source (recommended)**
+![Shipd terminal review preview showing workflow phases and an opt-out submission step](docs/assets/terminal-review.svg)
+
+*Offline preview rendered by the actual CLI UI functions with example statuses. It does not represent a live review or a benchmark.*
+
+<details>
+<summary><strong>See the command-line help</strong></summary>
+
+![Shipd CLI help showing setup, provider configuration, and run options](docs/assets/terminal-help.svg)
+
+*Captured from `./run.sh --help`. Regenerate both images with the [preview script](scripts/render_terminal_previews.py).*
+
+</details>
+
+## Get started
+
+You’ll need **Python 3.10+**, Bash, Git, ripgrep (`rg`), a running Docker daemon, a Shipd reviewer account, an IMAP app password for its verification mailbox, and an API key for a supported LLM provider. The shell launcher targets macOS/Linux; Windows users need a Bash environment such as WSL. CI is configured for Python 3.10 and 3.14 on Linux.
+
+**1. Install from source**
 
 ```bash
 git clone https://github.com/vaishcodescape/shipd-agent.git
 cd shipd-agent
 ./run.sh --setup
-cp .env.example .env     # AUTH_EMAIL, AUTH_PASSWORD
-./run.sh --check         # validate environment before first run
+cp .env.example .env
 ```
 
-On the first run, `./run.sh` asks you to pick an LLM provider and models and to paste the API key. It stores them, then starts the review. Later runs skip this step. To change the LLM later, run `./run.sh --configure-llm`.
+Edit `.env`: set `AUTH_EMAIL` and `AUTH_PASSWORD`. The password is your mailbox’s **IMAP app password**, used to retrieve the Shipd sign-in code. Keep quoted passwords quoted.
 
-**From GitHub Releases** (install the published wheel)
+**2. Choose a provider and check your environment**
 
 ```bash
-pip install https://github.com/vaishcodescape/shipd-agent/releases/download/v0.1.0/shipd_agent-0.1.0-py3-none-any.whl
+./run.sh --configure-llm
+./run.sh --check
 ```
 
-**From GitHub Packages** (if enabled for your org)
+The setup wizard asks for exploration and finalization models, then stores your API key in the OS keychain (with a restricted local file fallback). See [configuration and troubleshooting](docs/configuration.md).
+
+**3. Run one review and keep the evidence**
 
 ```bash
-pip install shipd-agent \
-  --index-url https://pypi.pkg.github.com/vaishcodescape/simple/
+./run.sh --once --no-submit --no-cleanup --headed
 ```
 
-## Quick start
+This is a **live workflow**: it signs in, clocks in, reserves or continues a submission, executes Quick Setup, runs Docker checks, and calls your LLM provider. `--no-submit` prevents posting review feedback; it is not an offline mode. `--no-cleanup` keeps the clone and Docker artifacts for inspection.
 
-**Safe first run** — review locally, do not submit on Shipd:
+Quick Setup executes the submission’s shell script on your machine. Use a dedicated development environment for submissions you do not trust; Docker test execution does not isolate the setup script itself.
+
+**4. Inspect the result**
+
+Open `reviews/pending-submit.json` for the latest completed review bundle. Look at the decision, phase results, band ratings, evidence, and contributor feedback. This file is overwritten by the next saved review; copy it if you want to keep a history.
 
 ```bash
-./run.sh --once --no-submit
+./run.sh --status
 ```
 
-**Full cycle** — review and submit one submission:
+When ready to enable posting for a live review:
 
 ```bash
 ./run.sh --once --submit
 ```
 
-**Overnight batch** — 10 reviews, cooldown every 5 completed:
+This starts a workflow run; it does not simply upload the JSON you inspected.
 
-```bash
-./run.sh --reviews 10 --submit
+## Assessment checks
+
+The code includes the criteria reported in community assessment feedback:
+
+| Check | Implemented behavior |
+| --- | --- |
+| **Prompt length** | Flags explicit task-prompt files over **1,000 words** |
+| **Too Many Requirements** | Reads the platform flag and estimates independent requirements locally |
+| **Agent runs** | Checks **Nova × 4, Vega × 4, Orion × 4** — 12 runs total |
+| **Passing runs** | Requires **exactly one passing run overall**, belonging to one agent type |
+
+The requirement-count threshold defaults to 10 and is a **local heuristic**, not a published Shipd threshold. Existing run results are read without clicking evaluation controls. The agent does not launch Nova, Vega, or Orion runs.
+
+Missing data and an aggregate-only run summary have limitations: see the [criteria guide](docs/assessment-checks.md) before treating a PASS as complete verification. Assessment rules can change; this repository’s checks are not a guarantee of acceptance.
+
+## How it models a human quality review
+
+A good reviewer does more than check whether tests are green. They ask whether the problem is clear, the tests are fair, the solution fits the repository, and the evidence supports the verdict. The supplied [review rubric](shipd-rubric.md) makes that process explicit enough for an AI agent to follow.
+
+**The rubric is the review specification.** It defines what to inspect, how to rate it, what counts as evidence, and when to approve, request changes, or reject. shipd-agent combines that specification with repository tools and deterministic checks:
+
+| Human review habit | How the agent follows it |
+| --- | --- |
+| **Reproduce before judging** | **Phase 0:** checks the base commit, patch application, Docker setup, and test behavior before and after the solution |
+| **Understand the actual request** | **Phase 1:** assesses clarity, scope, repository fit, discoverability, and whether the prompt leaks the solution |
+| **Inspect the test harness** | **Phase 2:** reviews Dockerfile and `test.sh`, including whether the intended base and new tests actually run |
+| **Challenge the tests** | **Phase 3:** looks for missing edge cases, brittle assertions, hidden requirements, and tests that reject valid alternative solutions |
+| **Review like a maintainer** | **Phase 4:** judges correctness against the problem, repository conventions, security, maintainability, and unnecessary changes |
+| **Investigate agent outcomes** | **Phase 5:** uses available run results and failure evidence to assess solvability and fairness; a pass rate alone is insufficient |
+| **Make the overall judgment** | **Phase 6:** considers platform checks, related submissions, eligibility, and Mars/Olympus fit using available evidence |
+
+The exploration model can read files, search the repository, inspect patches, and read platform panels. A bounded coverage recheck asks for missing phase evidence. The finalization model turns that evidence into **Problem / Tests / Solution scores (0–3)**, confidence levels, severity-tagged findings, and concrete feedback. Deterministic decision guards then constrain the result so known failures cannot be waved away by a positive LLM summary.
+
+**Example of the intended reasoning:** a new test expects sorted output, but neither the prompt nor existing repository behavior requires sorting. A reviewer should identify a possible hidden requirement, cite the assertion and relevant prompt text, and explain the fix. Under the rubric, a confirmed, fixable fairness defect calls for `request_changes`; the contributor should get a chance to repair it. This is an illustrative example, not a captured review result.
+
+Every finding is expected to point to a file/line, test output, or log evidence. The rubric treats uncertainty as a reason to gather more evidence or request changes, and reserves rejection for extreme cases such as confirmed duplication or no credible fix path.
+
+This reproduces a **review process**, with explicit criteria and inspectable reasoning. It does not establish that the agent matches expert human accuracy: models can miss defects, misread intent, or overstate confidence, and platform evidence can be incomplete. Inspect the saved review and its cited evidence before relying on the verdict. A reproducible evaluation against expert-reviewed examples is a [proposed next step](docs/roadmap.md).
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[Sign in and reserve] --> B[Quick Setup clone]
+    B --> C[Docker and patch checks]
+    C --> D[LangGraph review]
+    E[Existing platform results] --> D
+    D --> F[Structured review bundle]
+    F --> G[Inspect locally]
+    F --> H[Submit when enabled]
 ```
 
-**Monitor progress**
+The review pipeline covers phases 0–6 of the [bundled rubric](shipd-rubric.md). Deterministic checks feed into the LLM review, which gathers repository evidence and produces a structured verdict. Approval guards account for failed phases, blocking findings, and low band scores.
+
+| Output | Where to find it |
+| --- | --- |
+| Latest completed review and submission context | `reviews/pending-submit.json` |
+| Run log | `logs/run.log` by default |
+| Batch resume state | `logs/watch-batch.json` |
+| Form failure screenshots and diagnostics | `logs/debug-submit/` |
+| Cloned submissions | `submissions/` (keep with `--no-cleanup`) |
+
+## Everyday commands
 
 ```bash
-./run.sh --status
+./run.sh --help                          # All options
+./run.sh --once --quest mars --no-submit # Review a Mars submission
+./run.sh --once --no-submit --provider openai
+./run.sh --reviews 5 --submit            # Five live reviews with posting enabled
+./run.sh --status                        # Session summary and batch progress
+./run.sh --configure-llm                 # Change provider, models, or key
 ```
 
-Submit is **off by default**. Pass `--submit` explicitly when you want feedback posted to Shipd.
-
-## Choosing an LLM
-
-The review agent works with any of these providers. Anthropic stays the default, so an existing `.env` with `ANTHROPIC_API_KEY` keeps working unchanged. If you installed before multi-provider support, rerun `./run.sh --setup` once to add `langchain-openai`, `langchain-google-genai` and `keyring`.
-
-| Provider | `REVIEW_PROVIDER` | API key env var | Default explore / finalize model |
-|----------|-------------------|-----------------|----------------------------------|
-| Anthropic (Claude) | `anthropic` (default) | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` / `claude-opus-4-8` |
-| OpenAI (GPT) | `openai` | `OPENAI_API_KEY` | `gpt-6.1-sol` / `gpt-6.1-sol` |
-| Google (Gemini) | `google` | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | `gemini-3.8-flash` / `gemini-4-argon` |
-| DeepSeek | `deepseek` | `DEEPSEEK_API_KEY` | `deepseek-flash` / `deepseek-v4-pro` |
-| Moonshot (Kimi) | `moonshot` | `MOONSHOT_API_KEY` | `kimi-k3.1-pro` / `kimi-k3.1-pro` |
-| xAI (Grok) | `xai` | `XAI_API_KEY` | `grok-4.7` / `grok-4.7` |
-| Any OpenAI-compatible endpoint | `openai-compatible` | `REVIEW_LLM_API_KEY` | set `REVIEW_EXPLORE_MODEL` and `REVIEW_LLM_BASE_URL` |
-
-The **explore** model drives the tool-calling pass over the repo. The **finalize** model (`REVIEW_MODEL`) writes the structured verdict. You can use any model ID the provider offers. The table only lists the defaults.
-
-**Interactive setup (recommended)**
+**Already have a submission cloned?** Run the review entry point directly, without signing in or reserving through the browser:
 
 ```bash
-./run.sh --configure-llm
+.venv/bin/python shipd-agent/review_agent.py /path/to/submission \
+  --quest olympus --output reviews/local-review.json
 ```
 
-This asks for the provider, an explore model and a finalize model (pick from a list or type any ID), then the API key. Key input is hidden.
+This still runs checks and calls the configured LLM. Browser-only platform evidence is unavailable. Its `--dry-run` option skips LLM calls but still runs Phase 0; an incomplete dry run returns a nonzero exit code.
 
-- The key is saved to the OS keychain: macOS Keychain on a Mac, Windows Credential Locker, or Secret Service on Linux.
-- With no keychain available, it goes to `~/.config/shipd-agent/credentials`, with the file at `0600` and the directory at `0700`.
-- The key is never written to `.env`, never printed or logged (`--check` shows only the last 4 characters), and never passed as a command-line argument.
-- The provider and model choices are saved to `.env` as `REVIEW_PROVIDER`, `REVIEW_EXPLORE_MODEL` and `REVIEW_MODEL`, so later runs reuse them.
+## Make it your own
 
-**First run:** when a review run finds no API key for the selected provider, it runs this same setup before anything else, saves the choices without asking, and then continues the run. If you passed `--provider`, `--model` or `--explore-model`, it only asks for the key. Once a key is found (env var or stored), runs start straight away. In cron, CI or with piped stdin there is no terminal to ask on, so the run stops right away with an error that says what to set.
+Start with the part you want to improve:
 
-**Key lookup order:** the provider's env var (shell or `.env`) first, then the stored key.
+| You want to… | Start here |
+| --- | --- |
+| Update assessment rules | [`rubric_defaults.py`](shipd-agent/review/rubric_defaults.py) and the [rubric](shipd-rubric.md) |
+| Improve prompt/run checks | [`prompt_checks.py`](shipd-agent/review/prompt_checks.py), [`agent_runs_checks.py`](shipd-agent/review/agent_runs_checks.py) |
+| Add a provider | [`llm_providers.py`](shipd-agent/review/llm_providers.py) |
+| Change agent behavior | [`graph.py`](shipd-agent/review/graph.py), [`tools.py`](shipd-agent/review/tools.py) |
+| Fix browser interactions | [`workflow/`](shipd-agent/workflow), [`scrape.py`](shipd-agent/review/scrape.py) |
 
-**Per-run overrides**
+Read the [contribution guide](CONTRIBUTING.md) for setup and tests, or browse [proposed improvements](docs/roadmap.md). Small fixes, anonymized UI fixtures, and clearer setup instructions are welcome.
 
-```bash
-./run.sh --once --no-submit --provider openai                    # provider defaults
-./run.sh --once --no-submit --provider gemini --model gemini-3.8-flash
-./run.sh --once --no-submit --explore-model claude-haiku-5-5     # keep provider, change explore model
-./run.sh --check --provider deepseek                             # is that provider ready?
-./run.sh --forget-llm-key                                        # remove the stored key (current provider)
-./run.sh --forget-llm-key --provider xai                         # ...or a specific one
-```
+**If shipd-agent helps your review workflow, give it a star.** Fork it to try a provider, improve a check, or build a better reviewer — and send useful changes back as a pull request.
 
-If you switch provider with `--provider` and leave out `--model` and `--explore-model`, that provider's default models are used, not the models saved in `.env`.
-
-**Provider notes**
-
-- **OpenAI:** calls go through the Responses API, because current GPT models only support tool calling there.
-- **Gemini:** uses the native Gemini API (`langchain-google-genai`), which keeps Gemini 3+ thought signatures intact across tool calls.
-- **DeepSeek:** runs in non-thinking mode, because thinking mode rejects the forced tool choice that structured output needs.
-- **Kimi K3:** gets `tool_choice="required"` and has its `reasoning_content` passed back on each turn.
-- **Reasoning effort:** OpenAI, Gemini and Kimi run at `REVIEW_REASONING_EFFORT=low` by default. Thinking tokens count toward `REVIEW_*_MAX_OUTPUT_TOKENS`.
-- **Escape hatches:** `REVIEW_STRUCTURED_OUTPUT_METHOD` (`function_calling`, `json_schema` or `json_mode`) and `REVIEW_LLM_BASE_URL` (proxies and regional endpoints).
-
-**Adding a provider:** if it has an OpenAI-compatible API, append one `ProviderSpec` entry with its base URL, key env var and default models to `shipd-agent/review/llm_providers.py`.
-
-## Test Demo  
-
-For a live walkthrough without posting to Shipd:
-
-```bash
-./run.sh --check
-./run.sh --once --no-submit --headed    # visible browser; review only
-./run.sh --status
-```
-
-Inspect the generated review bundle under `reviews/` before enabling `--submit`.
-
-## Quality controls
-
-- **Rubric-aligned**: 7 phases (0–6), band ratings, severity-tagged findings, contributor feedback without internal jargon
-- **Evidence-bound**: every claim must cite `file:line`, test output, or Phase 0 logs — no fabrication
-- **Deterministic gates**: LOC thresholds, patch-apply checks, Docker test contract before LLM explore
-- **Coverage recheck**: re-prompts the agent when required rubric phases lack evidence
-- **Human-readable output**: review bundles saved to `reviews/` for audit before submit
-
-## Requirements
-
-- Python 3.14+
-- Playwright Chromium (`./run.sh --setup`)
-- Docker  
-- IMAP app password for headless Shipd login
-- An API key for one supported LLM provider: Claude, GPT, Gemini, DeepSeek, Kimi, Grok, or any OpenAI-compatible endpoint (see [Choosing an LLM](#choosing-an-llm))
-
-See `.env.example` for provider and model selection, token budgets, cooldowns, and cleanup options.
-
-## CLI reference
-
-```bash
-./run.sh --help            # full option list
-./run.sh --version         # installed version
-./run.sh --check           # environment doctor (LLM provider, models, masked key)
-./run.sh --status          # session stats + batch resume state
-./run.sh --configure-llm   # choose provider/models, store API key in the OS keychain
-./run.sh --forget-llm-key  # delete the stored API key
-```
-
-Built by vaishcodescape ☕
+[Report a bug](https://github.com/vaishcodescape/shipd-agent/issues/new?template=bug_report.yml) · [Suggest an improvement](https://github.com/vaishcodescape/shipd-agent/issues/new?template=feature_request.yml) · [MIT license](LICENSE)

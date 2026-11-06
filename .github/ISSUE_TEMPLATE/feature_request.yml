@@ -1,0 +1,18 @@
+name: Feature request
+description: Suggest a focused improvement to the review workflow.
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is difficult today?
+      description: Describe the workflow and who would benefit.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe one focused improvement and how you would know it worked.
+    validations:
+      required: true

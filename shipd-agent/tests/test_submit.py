@@ -514,6 +514,7 @@ class SubmitButtonDiagnosticsTests(unittest.TestCase):
 class ClickInFormSubmitTests(unittest.TestCase):
     def test_click_logs_strategy(self) -> None:
         page = MagicMock()
+        page.get_by_text.return_value.count.return_value = 0
         logs: list[str] = []
         button = page.locator.return_value.first
         with patch(
