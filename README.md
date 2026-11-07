@@ -17,7 +17,7 @@ Docker checks · rubric-guided reasoning · inspectable feedback · opt-in submi
 
 Reviewing a submission means moving between setup scripts, test failures, patches, agent results, and a detailed rubric. **shipd-agent brings those steps into one workflow**, then saves structured feedback you can inspect before posting.
 
-Built for Shipd reviewers with access to the review queue, and developers who want to study or extend a Playwright + LangGraph review pipeline. Independent community project; not an official Shipd or Datacurve product.
+Built for Shipd reviewers with access to the review queue, and developers who want to study or extend a LangGraph + Deep Agents review pipeline. Independent community project; not an official Shipd or Datacurve product.
 
 ## Why use it?
 
