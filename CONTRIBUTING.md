@@ -13,7 +13,7 @@ python -m pip install -e '.[dev]'
 python -m playwright install chromium
 ```
 
-Use Python 3.10 or newer. Bash, Git, and ripgrep are needed for the launcher/repository tools. Docker and Shipd credentials are needed for a live review, but not for the mocked test suite or synthetic browser fixtures.
+Use Python 3.11 or newer (3.14 recommended). Bash, Git, and ripgrep are needed for the launcher/repository tools. Docker and Shipd credentials are needed for a live review, but not for the mocked test suite or synthetic browser fixtures.
 
 ## Check your changes
 

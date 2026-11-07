@@ -10,7 +10,7 @@ These are contribution ideas, not shipped features or promised release dates. Pr
 | 1 | Strict handling of incomplete platform evidence | Know exactly what a PASS verifies | Missing per-agent splits cannot be mistaken for a verified 4/4/4 matrix |
 | 1 | Versioned assessment profiles | Understand which rules a report used | Every saved report identifies its rubric version and effective thresholds |
 | 2 | Immutable review history | Compare runs without copying the latest JSON | Each completed review has a unique artifact path |
-| 2 | Usage accounting and budget stops | Control provider spend during batches | Actual token usage is recorded and new calls stop at configured limits |
+| 2 | Batch-wide usage budgets | Control cumulative provider spend across reviews | Aggregate the existing per-review usage records and stop the batch at configured limits |
 | 2 | Installable CLI entry point | Launch reliably after package installation | A documented console command works outside the source checkout |
 | 3 | Fixture-based provider evaluation | Compare review quality with reproducible evidence | Public, synthetic fixtures and repeatable quality/cost measurements |
 

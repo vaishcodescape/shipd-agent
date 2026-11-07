@@ -88,6 +88,7 @@ class ReviewConfig:
     mars_max_loc: int
     max_prompt_words: int = MAX_PROMPT_WORDS
     max_prompt_requirements: int = MAX_PROMPT_REQUIREMENTS
+    review_max_total_tokens: int = 200_000
 
 
 def _truthy(value: str) -> bool:
@@ -180,6 +181,7 @@ def get_review_config(*, dry_run_override: bool | None = None) -> ReviewConfig:
             os.getenv("REVIEW_PHASE0_DOCKER_BUILD_TIMEOUT", "600")
         ),
         review_dry_run=dry_run,
+        review_max_total_tokens=int(os.getenv("REVIEW_MAX_TOTAL_TOKENS", "200000")),
         review_max_tool_steps=int(
             os.getenv("REVIEW_MAX_TOOL_STEPS", str(DEFAULT_REVIEW_MAX_TOOL_STEPS))
         ),

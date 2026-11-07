@@ -1,13 +1,11 @@
 # Unit tests for review accuracy guards: deterministic band-score capping,
-# coverage-gap flagging, phase-coverage detection, and transcript preservation.
+# coverage-gap flagging. Deep Agents provenance tests live in test_deep_review.py.
 # These exercise review/graph.py, which previously had no test coverage — the
 # blind spot that let phases/factors get silently skipped.
 
 from __future__ import annotations
 
 import unittest
-
-from langchain_core.messages import AIMessage, ToolMessage
 
 from review import graph as g
 from review.config import get_review_config
@@ -84,68 +82,6 @@ class BandCapTests(unittest.TestCase):
         capped, _ = g._cap_bands_to_deterministic(review, self._phase_results(review))
         # Score already <= 1, so it is left alone (never raised to 1).
         self.assertIsNone(capped)
-
-
-class CoverageGapDetectionTests(unittest.TestCase):
-    NO_DATA = {
-        "agent_runs": "not available",
-        "related_submissions": "not available",
-        "holistic_check_available": "false",
-    }
-    WITH_AGENT = {
-        "agent_runs": "10/10 runs, 15% pass rate",
-        "related_submissions": "not available",
-        "holistic_check_available": "false",
-    }
-
-    def test_missing_phase_reported_as_gap(self) -> None:
-        summary = "\n".join(f"Phase {i}: PASS — ok" for i in (0, 1, 2, 4, 5, 6))
-        msgs = [AIMessage(content=summary)]
-        self.assertEqual(g._explore_coverage_gaps(msgs, self.NO_DATA), ["3"])
-
-    def test_all_phases_covered_no_gap(self) -> None:
-        summary = "\n".join(f"Phase {i}: PASS — ok" for i in range(7))
-        self.assertEqual(g._explore_coverage_gaps([AIMessage(content=summary)], self.NO_DATA), [])
-
-    def test_phase5_gap_only_when_agent_data_present(self) -> None:
-        summary = "\n".join(f"Phase {i}: PASS — ok" for i in (0, 1, 2, 3, 4, 6))
-        summary += "\nPhase 5: SKIP — none"
-        msgs = [AIMessage(content=summary)]
-        # No agent data: phase 5 SKIP is legitimate, not a gap.
-        self.assertEqual(g._explore_coverage_gaps(msgs, self.NO_DATA), [])
-        # Agent data present: phase 5 must be evaluated.
-        self.assertEqual(g._explore_coverage_gaps(msgs, self.WITH_AGENT), ["5"])
-
-    def test_tool_evidence_covers_phase_without_verdict(self) -> None:
-        # Summary skips phase 3, but the agent read test.patch — that counts.
-        summary = "\n".join(f"Phase {i}: PASS — ok" for i in (0, 1, 2, 4, 5, 6))
-        msgs = [
-            AIMessage(
-                content="",
-                tool_calls=[{"name": "read_file", "args": {"path": "test.patch"}, "id": "t"}],
-            ),
-            ToolMessage(content="diff", tool_call_id="t", name="read_file"),
-            AIMessage(content=summary),
-        ]
-        self.assertEqual(g._explore_coverage_gaps(msgs, self.NO_DATA), [])
-
-
-class SummaryPreservationTests(unittest.TestCase):
-    def test_final_summary_survives_verbatim(self) -> None:
-        final = "## Phase coverage\n" + "\n".join(
-            f"Phase {i}: PASS — rationale {i}" for i in range(7)
-        )
-        msgs = [
-            AIMessage(
-                content="",
-                tool_calls=[{"name": "read_file", "args": {"path": "a"}, "id": "t"}],
-            ),
-            ToolMessage(content="x" * 20_000, tool_call_id="t", name="read_file"),
-            AIMessage(content=final),
-        ]
-        out = g._summarize_explore_messages(msgs, max_chars=8_000, tool_output_max_chars=600)
-        self.assertIn(final, out)
-        self.assertLessEqual(len(out), 8_200)  # earlier chatter was truncated
 
 
 class ValidateNodeCoverageTests(unittest.TestCase):
