@@ -4,7 +4,7 @@
 
 **From submission to evidence-backed review.**
 
-A Python review agent for Shipd’s Olympus and Mars workflows.<br>
+A code agent for Shipd quests .<br>
 Docker checks · rubric-guided reasoning · inspectable feedback · opt-in submission
 
 [![CI](https://github.com/vaishcodescape/shipd-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/vaishcodescape/shipd-agent/actions/workflows/ci.yml)
