@@ -8,7 +8,7 @@ A code agent for Shipd quests .<br>
 Docker checks · rubric-guided reasoning · inspectable feedback · opt-in submission
 
 [![CI](https://github.com/vaishcodescape/shipd-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/vaishcodescape/shipd-agent/actions/workflows/ci.yml)
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![MIT license](https://img.shields.io/badge/License-MIT-22c55e)](LICENSE)
 
 [Get started](#get-started) · [Terminal preview](#terminal-preview) · [Review approach](#how-it-models-a-human-quality-review) · [Contribute](CONTRIBUTING.md)
@@ -47,7 +47,7 @@ Built for Shipd reviewers with access to the review queue, and developers who wa
 
 ## Get started
 
-You’ll need **Python 3.10+**, Bash, Git, ripgrep (`rg`), a running Docker daemon, a Shipd reviewer account, an IMAP app password for its verification mailbox, and an API key for a supported LLM provider. The shell launcher targets macOS/Linux; Windows users need a Bash environment such as WSL. CI is configured for Python 3.10 and 3.14 on Linux.
+You’ll need **Python 3.11+**, Bash, Git, ripgrep (`rg`), a running Docker daemon, a Shipd reviewer account, an IMAP app password for its verification mailbox, and an API key for a supported LLM provider. The shell launcher targets macOS/Linux; Windows users need a Bash environment such as WSL. CI is configured for Python 3.11 and 3.14 on Linux.
 
 **1. Install from source**
 
@@ -126,7 +126,7 @@ A good reviewer does more than check whether tests are green. They ask whether t
 | **Investigate agent outcomes** | **Phase 5:** uses available run results and failure evidence to assess solvability and fairness; a pass rate alone is insufficient |
 | **Make the overall judgment** | **Phase 6:** considers platform checks, related submissions, eligibility, and Mars/Olympus fit using available evidence |
 
-The exploration model can read files, search the repository, inspect patches, and read platform panels. A bounded coverage recheck asks for missing phase evidence. The finalization model turns that evidence into **Problem / Tests / Solution scores (0–3)**, confidence levels, severity-tagged findings, and concrete feedback. Deterministic decision guards then constrain the result so known failures cannot be waved away by a positive LLM summary.
+The Deep Agents reviewer can read numbered source pages, search the repository, inspect patches, and delegate focused investigations. Each phase records structured evidence against successful read receipts. A bounded coverage recheck targets missing phase reports. The finalization model turns that evidence into **Problem / Tests / Solution scores (0–3)**, confidence levels, severity-tagged findings, and concrete feedback. Deterministic decision guards then constrain the result so known failures cannot be waved away by a positive LLM summary.
 
 **Example of the intended reasoning:** a new test expects sorted output, but neither the prompt nor existing repository behavior requires sorting. A reviewer should identify a possible hidden requirement, cite the assertion and relevant prompt text, and explain the fix. Under the rubric, a confirmed, fixable fairness defect calls for `request_changes`; the contributor should get a chance to repair it. This is an illustrative example, not a captured review result.
 
@@ -140,9 +140,10 @@ This reproduces a **review process**, with explicit criteria and inspectable rea
 flowchart LR
     A[Sign in and reserve] --> B[Quick Setup clone]
     B --> C[Docker and patch checks]
-    C --> D[LangGraph review]
+    C --> D[Deep Agents evidence collection]
     E[Existing platform results] --> D
-    D --> F[Structured review bundle]
+    D --> I[Final scorer and rubric guards]
+    I --> F[Structured review bundle]
     F --> G[Inspect locally]
     F --> H[Submit when enabled]
 ```
@@ -156,6 +157,18 @@ The review pipeline covers phases 0–6 of the [bundled rubric](shipd-rubric.md)
 | Batch resume state | `logs/watch-batch.json` |
 | Form failure screenshots and diagnostics | `logs/debug-submit/` |
 | Cloned submissions | `submissions/` (keep with `--no-cleanup`) |
+
+## Deep Agents review harness
+
+Deep Agents is the primary review harness. The outer LangGraph workflow keeps ownership of Docker execution, deterministic rubric rules, final validation, and submission. Rerun `./run.sh --setup` after upgrading to install the pinned harness and compatible LangChain packages. Python 3.11 is the minimum supported version (3.14 recommended).
+
+The reviewer can delegate substantial investigations to harness/tests and solution workers. All workers share one model-call budget and a private evidence ledger. `REVIEW_MAX_TOOL_STEPS` retains its old name but now counts model calls across the parent and workers (default 15); a coverage recheck can use up to `REVIEW_COVERAGE_RECHECK_MAX_STEPS` more (default 6), with two additional calls reserved for final scoring and its validation retry. `REVIEW_MAX_TOTAL_TOKENS` (default 200,000) stops new calls once provider-reported usage reaches the limit; already running calls can overshoot, and missing usage is recorded explicitly. These are application-level limits; provider-internal HTTP retries follow the SDK policy.
+
+Submission files are accessed through scoped, read-only tools. `read_submission_file` returns numbered pages, citation receipts, and a continuation line for large files. Deep Agents' built-in filesystem is separate, ephemeral scratch storage: it has no host shell, live browser, persistent memory, or repository write access. Workers receive cached Shipd page data rather than Playwright objects.
+
+Each phase report must cite successful reads of its required artifacts. Citation paths, excerpts, and line ranges come from immutable read receipts. Later investigations may add evidence or escalate a phase to FAIL, while retaining all existing citations and findings; accepted failures cannot be downgraded. This checks provenance and artifact coverage; semantic correctness still depends on review quality. Verified reports and excerpts reach the final scorer without transcript clipping and are saved as `review_evidence` in the review bundle, alongside model-call/token accounting in `review_usage`. If structured evidence exceeds the configured final payload budget, the review is marked incomplete instead of slicing JSON or dropping citations. Missing required reports force `request_changes` with an explicit coverage note, preserving the existing submission policy.
+
+See the [integration validation report](docs/deep-agents-validation.md) for tested behavior, coverage, and sandbox limitations.
 
 ## Everyday commands
 
@@ -186,7 +199,7 @@ Start with the part you want to improve:
 | Update assessment rules | [`rubric_defaults.py`](shipd-agent/review/rubric_defaults.py) and the [rubric](shipd-rubric.md) |
 | Improve prompt/run checks | [`prompt_checks.py`](shipd-agent/review/prompt_checks.py), [`agent_runs_checks.py`](shipd-agent/review/agent_runs_checks.py) |
 | Add a provider | [`llm_providers.py`](shipd-agent/review/llm_providers.py) |
-| Change agent behavior | [`graph.py`](shipd-agent/review/graph.py), [`tools.py`](shipd-agent/review/tools.py) |
+| Change agent behavior | [`deep.py`](shipd-agent/review/deep.py), [`evidence.py`](shipd-agent/review/evidence.py), [`graph.py`](shipd-agent/review/graph.py) |
 | Fix browser interactions | [`workflow/`](shipd-agent/workflow), [`scrape.py`](shipd-agent/review/scrape.py) |
 
 Read the [contribution guide](CONTRIBUTING.md) for setup and tests, or browse [proposed improvements](docs/roadmap.md). Small fixes, anonymized UI fixtures, and clearer setup instructions are welcome.

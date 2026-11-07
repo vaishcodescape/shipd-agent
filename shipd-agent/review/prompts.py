@@ -190,7 +190,8 @@ Related submissions context (read before phase 6 feedback): {related_submissions
 Read the Shipd page context above before providing feedback. Cite per-agent pass counts,
 failure patterns, similarity scores, and holistic reviewer notes in findings when available.
 
-Tool budget: ~{max_tool_steps} tool steps — inspect key artifacts first, then summarize.
+Shared model-call allowance: {max_tool_steps} calls across reviewer and workers.
+Inspect key artifacts first, then record phase evidence and summarize.
 
 {PHASE_CHECKLIST}
 

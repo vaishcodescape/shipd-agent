@@ -1,23 +1,17 @@
 # LangGraph review agent
 from __future__ import annotations
 
-import json
-import re
 import time
 from typing import Annotated, Any, TypedDict
 
 from review.llm import llm_config_error, make_chat_model
 from langchain_core.messages import (
-    AIMessage,
     BaseMessage,
     HumanMessage,
     SystemMessage,
-    ToolMessage,
 )
-from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import create_react_agent
 
 from review.activity import log_activity, timed_step
 from review.config import ReviewConfig
@@ -47,7 +41,6 @@ from review.review_phases import (
 from review.prompts import (
     FINALIZE_PHASE_INSTRUCTIONS,
     PHASE_CHECKLIST,
-    UNIFIED_REVIEW_SYSTEM_PROMPT,
     build_holistic_check_prompt_section,
     build_unified_review_user_prompt,
 )
@@ -70,6 +63,8 @@ from review.scrape import (
 )
 from review.tools import make_review_tools
 from review.token_budget import estimate_tokens, truncate_text
+from review.deep import ReviewBudget, ReviewBudgetExceeded, run_deep_review
+from review.evidence import EvidenceLedger, fit_finalize_payload, panel_text_available
 
 
 class ReviewState(TypedDict, total=False):
@@ -85,6 +80,9 @@ class ReviewState(TypedDict, total=False):
     findings: list[dict]
     explore_messages: Annotated[list[BaseMessage], add_messages]
     explore_notes: str
+    review_evidence: dict
+    evidence_gaps: list[str]
+    review_budget: Any
     force_request_changes: bool
     holistic_check: dict[str, Any]
     agent_runs_data: dict[str, Any]
@@ -153,15 +151,10 @@ _PHASE_LABELS: dict[str, str] = {
 # Phases always evaluable from the cloned repo (their artifacts are local).
 _ARTIFACT_PHASES: tuple[str, ...] = ("1", "2", "3")
 
-_PHASE_STATUS_RE = re.compile(
-    r"(?:phase\s*)?([0-6])\b[^\n]*?\b(PASS|FAIL|SKIP)\b", re.IGNORECASE
-)
-
 
 def _scrape_value_present(value: Any) -> bool:
     """True when a scraped panel string carries real data (not a placeholder)."""
-    text = str(value or "").strip().lower()
-    return bool(text) and text not in {"not available", "none", "n/a", ""}
+    return panel_text_available(value)
 
 
 def _agent_runs_available(scrape: dict[str, str]) -> bool:
@@ -172,106 +165,6 @@ def _platform_data_available(scrape: dict[str, str]) -> bool:
     return (
         _scrape_value_present(scrape.get("related_submissions"))
         or scrape.get("holistic_check_available") == "true"
-    )
-
-
-def _required_coverage_phases(scrape: dict[str, str]) -> set[str]:
-    """Phases the agent must have evidence for, given what data is available."""
-    required = set(_ARTIFACT_PHASES)
-    if _agent_runs_available(scrape):
-        required.add("5")
-    if _platform_data_available(scrape):
-        required.add("6")
-    return required
-
-
-def _final_assistant_text(messages: list[BaseMessage]) -> str:
-    """Text of the last assistant message without tool calls (the summary)."""
-    for msg in reversed(messages):
-        if isinstance(msg, AIMessage) and not msg.tool_calls:
-            text = msg.content if isinstance(msg.content, str) else str(msg.content)
-            if text.strip():
-                return text.strip()
-    return ""
-
-
-def _parse_phase_verdicts(summary: str) -> dict[str, str]:
-    """Map phase number -> PASS/FAIL/SKIP from the agent's coverage block."""
-    verdicts: dict[str, str] = {}
-    for line in summary.splitlines():
-        match = _PHASE_STATUS_RE.search(line)
-        if match:
-            verdicts.setdefault(match.group(1), match.group(2).upper())
-    return verdicts
-
-
-def _explore_tool_phase_evidence(messages: list[BaseMessage]) -> set[str]:
-    """Phases the agent gathered tool evidence for (independent of its summary)."""
-    evidence: set[str] = set()
-    for msg in messages:
-        if not (isinstance(msg, AIMessage) and msg.tool_calls):
-            continue
-        for call in msg.tool_calls:
-            name = call.get("name", "")
-            args = call.get("args", {}) or {}
-            path = str(args.get("path", "")).lower()
-            if name == "get_submission_summary":
-                evidence.add("1")
-            elif name == "compute_effective_loc":
-                evidence.add("4")
-            elif name in ("read_holistic_check", "read_shipd_review_panel"):
-                evidence.update({"5", "6"})
-            elif name in ("run_phase0_checks", "check_patch_apply", "get_git_info"):
-                evidence.add("0")
-            elif name == "read_file":
-                if any(k in path for k in ("problem", "prompt", "statement", "readme")):
-                    evidence.add("1")
-                if "dockerfile" in path or "test.sh" in path:
-                    evidence.add("2")
-                if "test" in path and "patch" in path:
-                    evidence.update({"2", "3"})
-                elif "test" in path:
-                    evidence.add("3")
-                if "solution" in path:
-                    evidence.add("4")
-    return evidence
-
-
-def _explore_coverage_gaps(
-    messages: list[BaseMessage], scrape: dict[str, str]
-) -> list[str]:
-    """Required phases with neither a PASS/FAIL verdict nor tool evidence."""
-    required = _required_coverage_phases(scrape)
-    verdicts = _parse_phase_verdicts(_final_assistant_text(messages))
-    evidence = _explore_tool_phase_evidence(messages)
-    gaps = []
-    for phase in sorted(required):
-        covered = verdicts.get(phase) in ("PASS", "FAIL") or phase in evidence
-        if not covered:
-            gaps.append(phase)
-    return gaps
-
-
-_COVERAGE_PHASE_INSTRUCTIONS: dict[str, str] = {
-    "1": "Phase 1 (problem description): read the problem statement and judge clarity, repo fit, AI-slop, the word limit, and Too Many Requirements.",
-    "2": "Phase 2 (harness): read the Dockerfile and test.sh; check minimal image and the base/new split.",
-    "3": "Phase 3 (tests): read test.patch; check coverage, determinism, no network, and behaviour-not-implementation.",
-    "5": "Phase 5 (agent runs): call read_holistic_check and read_shipd_review_panel('Agent Runs'); cite Nova/Vega/Orion pass counts and medians.",
-    "6": "Phase 6 (platform): call read_shipd_review_panel('Related Submissions') and read_holistic_check; note duplicate/overlap and Mars-vs-Olympus fit.",
-}
-
-
-def _build_coverage_followup_prompt(gaps: list[str]) -> str:
-    steps = "\n".join(
-        f"- {_COVERAGE_PHASE_INSTRUCTIONS.get(p, f'Phase {p}: inspect the relevant artifacts.')}"
-        for p in gaps
-    )
-    return (
-        "Coverage check: you have not gathered evidence for rubric phase(s) "
-        f"{', '.join(gaps)}. Do not skip a phase whose data exists. Inspect them now:\n"
-        f"{steps}\n\n"
-        "Use tools to read the artifacts, then re-emit the '## Phase coverage' block "
-        "with a `Phase N: PASS|FAIL|SKIP` line for every phase 0–6."
     )
 
 
@@ -518,7 +411,7 @@ def _dry_run_result(state: ReviewState) -> dict:
 
 
 def unified_review_node(state: ReviewState) -> dict:
-    """Run Phase 0 checks, then a single LLM explore pass for phases 0–6."""
+    """Run mechanical checks, then the primary Deep Agents evidence reviewer."""
     phase0_updates = _run_phase0_into_state(state)
     config: ReviewConfig = state["config"]
 
@@ -557,6 +450,23 @@ def unified_review_node(state: ReviewState) -> dict:
     # runs parallel tool calls on worker threads — never hand the live page to
     # explore tools ("cannot switch to a different thread"). scrape_node already
     # captured every panel on the main thread; tools serve that cache.
+    scrape = state.get("scrape_context", {})
+    panels = {
+        "agent_runs": scrape.get("agent_runs", ""),
+        "related_submissions": scrape.get("related_submissions", ""),
+        "holistic_check": build_holistic_check_prompt_section(scrape)
+        if scrape.get("holistic_check_available") == "true" else "",
+    }
+    ledger = EvidenceLedger(
+        repo_path, state.get("submission_summary", {}).get("artifacts", {}),
+        panels, phase0_updates.get("phase0_log", ""),
+        max_phase_chars=max(1000, min(4000, (config.review_finalize_payload_max_chars - 8000) // 6)),
+    )
+    budget = ReviewBudget(
+        config.review_max_tool_steps,
+        config.review_coverage_recheck_max_steps if config.review_coverage_recheck else 0,
+        config.review_max_total_tokens,
+    )
     tools = make_review_tools(
         repo_path,
         quest=state["quest"],
@@ -567,9 +477,8 @@ def unified_review_node(state: ReviewState) -> dict:
         cached_holistic=state.get("holistic_check"),
         cached_phase0=phase0_result,
         config=config,
+        evidence=ledger,
     )
-    llm = make_chat_model(config, "explore")
-    agent = create_react_agent(llm, tools)
 
     summary = state.get("submission_summary", {})
     scrape = state.get("scrape_context", {})
@@ -615,137 +524,19 @@ def unified_review_node(state: ReviewState) -> dict:
         category="review",
     )
 
-    log_activity(
-        f"explore agent starting (model {config.review_explore_model}, "
-        f"budget ~{config.review_max_tool_steps} tool steps, "
-        "phases 0–6)",
-        category="review",
-    )
-    started = time.monotonic()
-    messages: list[BaseMessage] = []
-    budget_exhausted = False
-    # Each ReAct tool step spends two graph super-steps (agent node + tools
-    # node), plus one final agent turn with no tool calls: 2N + 1 to finish
-    # a full budget. Headroom covers the prebuilt remaining_steps fallback.
-    recursion_limit = 2 * config.review_max_tool_steps + 5
     try:
-        for chunk in agent.stream(
-            {
-                "messages": [
-                    SystemMessage(content=UNIFIED_REVIEW_SYSTEM_PROMPT),
-                    HumanMessage(content=user_prompt),
-                ]
-            },
-            config={"recursion_limit": recursion_limit},
-            stream_mode="values",
-        ):
-            new_messages = chunk.get("messages", [])
-            for msg in new_messages[len(messages):]:
-                _log_agent_message(msg)
-            messages = new_messages
-    except GraphRecursionError:
-        # Budget exhausted mid-loop: keep the partial transcript and let
-        # finalize score from what was gathered instead of failing the run.
-        budget_exhausted = True
-        log_activity(
-            "explore budget exhausted (recursion limit "
-            f"{recursion_limit}) — salvaging partial transcript",
-            category="review",
+        output = run_deep_review(
+            model=make_chat_model(config, "explore"), tools=tools,
+            prompt=user_prompt, ledger=ledger, config=config, budget=budget,
         )
+        return {**phase0_updates, **output, "review_budget": budget}
     except Exception as exc:
         return {
-            **phase0_updates,
-            "error": f"Explore phase failed: {exc}",
-            "explore_notes": f"Unified review agent error: {exc}",
+            **phase0_updates, "review_budget": budget,
+            "review_evidence": ledger.snapshot(), "evidence_gaps": ledger.gaps(),
+            "error": f"Deep Agents review failed: {exc}",
+            "explore_notes": f"Deep Agents review error: {exc}",
         }
-
-    if budget_exhausted and not any(
-        isinstance(m, AIMessage) for m in messages
-    ):
-        return {
-            **phase0_updates,
-            "error": "Explore phase hit the recursion limit before any agent output.",
-            "explore_notes": "Unified review agent produced no messages.",
-        }
-
-    # Coverage recheck: if the agent skipped a phase whose data exists, re-prompt
-    # the SAME conversation to gather that evidence before finalize scores it.
-    # Only runs when budget remained (a fresh exhaustion would just re-trip) and
-    # is bounded by its own small step budget.
-    if (
-        config.review_coverage_recheck
-        and not budget_exhausted
-        and any(isinstance(m, AIMessage) for m in messages)
-    ):
-        gaps = _explore_coverage_gaps(messages, scrape)
-        if gaps:
-            log_activity(
-                "coverage recheck: no evidence for phase(s) "
-                f"{', '.join(gaps)} — re-exploring "
-                f"(≤{config.review_coverage_recheck_max_steps} steps)",
-                category="review",
-            )
-            recheck_limit = 2 * config.review_coverage_recheck_max_steps + 3
-            try:
-                for chunk in agent.stream(
-                    {"messages": messages + [HumanMessage(content=_build_coverage_followup_prompt(gaps))]},
-                    config={"recursion_limit": recheck_limit},
-                    stream_mode="values",
-                ):
-                    new_messages = chunk.get("messages", [])
-                    for msg in new_messages[len(messages):]:
-                        _log_agent_message(msg)
-                    messages = new_messages
-                remaining = _explore_coverage_gaps(messages, scrape)
-                if remaining:
-                    log_activity(
-                        "coverage recheck: phase(s) "
-                        f"{', '.join(remaining)} still uncovered — validate will flag",
-                        category="review",
-                    )
-            except GraphRecursionError:
-                log_activity(
-                    "coverage recheck hit its step limit — using best-effort evidence",
-                    category="review",
-                )
-            except Exception as exc:
-                log_activity(f"coverage recheck failed: {exc}", category="review")
-        else:
-            log_activity(
-                "coverage recheck: all required phases have evidence",
-                category="review",
-            )
-
-    elapsed = time.monotonic() - started
-    tool_calls = sum(
-        len(m.tool_calls) for m in messages
-        if isinstance(m, AIMessage) and m.tool_calls
-    )
-    log_activity(
-        f"explore agent finished in {elapsed:.1f}s ({tool_calls} tool calls)",
-        category="review",
-    )
-    notes = _summarize_explore_messages(
-        messages,
-        max_chars=config.review_explore_transcript_max_chars,
-        tool_output_max_chars=config.review_tool_output_max_chars,
-    )
-    if budget_exhausted:
-        notes = (
-            "WARNING: the explore agent ran out of its tool-step budget before "
-            "writing final notes; below is a partial transcript. Score phases "
-            "from the evidence present and use lower confidence where coverage "
-            "is missing.\n\n" + notes
-        )
-    log_activity(
-        f"explore transcript ~{estimate_tokens(notes):,} tokens (est.)",
-        category="review",
-    )
-    return {
-        **phase0_updates,
-        "explore_messages": messages,
-        "explore_notes": notes,
-    }
 
 
 def finalize_node(state: ReviewState) -> dict:
@@ -786,6 +577,7 @@ def finalize_node(state: ReviewState) -> dict:
         "phase_results_so_far": state.get("phase_results", {}),
         "findings_so_far": state.get("findings", []),
         "explore_notes": state.get("explore_notes", ""),
+        "review_evidence": state.get("review_evidence", {}),
         "holistic_ai_check": build_holistic_check_prompt_section(scrape),
         "agent_runs": truncate_text(
             scrape.get("agent_runs", "not available"),
@@ -807,15 +599,16 @@ def finalize_node(state: ReviewState) -> dict:
         "mars_min_loc": config.mars_min_loc,
         "mars_max_loc": config.mars_max_loc,
     }
-    human_content = truncate_text(
-        json.dumps(human_payload, indent=2),
-        config.review_finalize_payload_max_chars,
-        label="finalize payload",
-    )
+    try:
+        human_content = fit_finalize_payload(human_payload, config.review_finalize_payload_max_chars)
+    except ValueError as exc:
+        return {"review_result": _fallback_result(state, str(exc))}
 
     system = (
         "You are the Shipd autonomous review agent. Follow shipd-rubric.md exactly.\n"
         "Evaluate all rubric phases 0–6 and output structured ReviewResult fields.\n"
+        "Structured review_evidence contains validated source citations and phase reports. "
+        "Use these reports for scoring; do not invent findings or treat prose as coverage.\n"
         f"--- rubric excerpt ---\n{rubric}"
     )
     log_activity(
@@ -823,7 +616,10 @@ def finalize_node(state: ReviewState) -> dict:
         category="review",
     )
 
-    llm = make_chat_model(config, "finalize", structured_output=ReviewResult)
+    try:
+        llm = make_chat_model(config, "finalize", structured_output=ReviewResult)
+    except Exception as exc:
+        return {"review_result": _fallback_result(state, f"Cannot initialize final scorer: {exc}")}
 
     log_activity(
         f"finalize: structuring review with {config.review_model} "
@@ -839,7 +635,9 @@ def finalize_node(state: ReviewState) -> dict:
                 [
                     SystemMessage(content=system),
                     HumanMessage(content=human_content),
-                ]
+                ],
+                config={"callbacks": [state["review_budget"].callback(finalize=True)]}
+                if state.get("review_budget") else None,
             )
             break
         except Exception as exc:
@@ -847,7 +645,9 @@ def finalize_node(state: ReviewState) -> dict:
             log_activity(
                 f"finalize attempt {attempt + 1} failed: {exc}", category="review"
             )
-            human_content += f"\n\nPrevious validation error (fix output): {exc}"
+            if isinstance(exc, ReviewBudgetExceeded):
+                break
+            human_content += f"\n\nPrevious validation error (fix output): {str(exc)[:2000]}"
 
     if review is not None:
         log_activity(
@@ -1033,6 +833,7 @@ def validate_node(state: ReviewState) -> dict:
     except Exception as exc:
         return {"review_result": _fallback_result(state, f"Invalid review result: {exc}")}
 
+    review = _apply_evidence_reports(review, state)
     review = _apply_rubric_guards(review, state)
 
     config: ReviewConfig = state["config"]
@@ -1062,9 +863,9 @@ def validate_node(state: ReviewState) -> dict:
     result_dict = review.to_submit_dict()
     if raw.get("review_complete") is False:
         error = str(raw.get("review_error", "")).strip() or review_failure_reason(raw)
-        return {
-            "review_result": mark_review_incomplete(result_dict, error=error),
-        }
+        return {"review_result": _with_review_audit(
+            mark_review_incomplete(result_dict, error=error), state,
+        )}
 
     # Coverage gaps: a phase whose data exists must not come back SKIP. Phases
     # 1-3 (problem, harness, tests) and 4 (solution/LOC) are always evaluable
@@ -1077,11 +878,11 @@ def validate_node(state: ReviewState) -> dict:
     if _platform_data_available(scrape):
         evaluable.add("6")
     phase_status = result_dict.get("phase_results", {})
-    gap_phases = [
+    gap_phases = sorted(set(state.get("evidence_gaps", [])) | {
         key
         for key in sorted(evaluable)
         if phase_status.get(key, {}).get("status") == "SKIP"
-    ]
+    })
     if gap_phases:
         review = _flag_coverage_gaps(review, gap_phases)
         result_dict = review.to_submit_dict()
@@ -1091,7 +892,50 @@ def validate_node(state: ReviewState) -> dict:
             category="review",
         )
 
-    return {"review_result": mark_review_complete(result_dict)}
+    return {"review_result": _with_review_audit(mark_review_complete(result_dict), state)}
+
+
+def _with_review_audit(result: dict, state: ReviewState) -> dict:
+    if "review_evidence" in state:
+        result["review_evidence"] = state["review_evidence"]
+    if state.get("review_budget") is not None:
+        result["review_usage"] = state["review_budget"].snapshot()
+    return result
+
+
+def _apply_evidence_reports(review: ReviewResult, state: ReviewState) -> ReviewResult:
+    """Scorer assigns bands; recorded evidence and mechanical checks own facts."""
+    if "review_evidence" not in state:
+        return review
+    reports = state["review_evidence"].get("phases", {})
+    phases = dict(review.phase_results)
+    findings = [Finding.model_validate(f) for f in state.get("findings", [])]
+    for phase in map(str, range(1, 7)):
+        report = reports.get(phase)
+        phases[phase] = PhaseResult(
+            status=report["status"] if report else "SKIP",
+            summary=report["summary"] if report else "No verified phase evidence report recorded.",
+        )
+        for finding in report.get("findings", []) if report else []:
+            evidence = "\n".join(
+                f"{c['path']}" + (f":{c['start_line']}-{c['end_line']}" if c['start_line'] else "")
+                + f" [{c['source_id']}]: {c['excerpt']}" for c in finding["citations"]
+            )
+            findings.append(Finding(
+                phase=phase, severity=finding["severity"], finding=finding["finding"],
+                evidence=evidence, suggested_fix=finding.get("suggested_fix", ""),
+            ))
+    for phase, deterministic in state.get("phase_results", {}).items():
+        if phase == "0" or deterministic.get("status") == "FAIL":
+            phases[phase] = PhaseResult.model_validate(deterministic)
+    unique: dict[tuple[str, str], Finding] = {}
+    severity_rank = {"BLOCKER": 4, "MAJOR": 3, "MINOR": 2, "QUESTION": 1}
+    for finding in findings:
+        key = (finding.phase, finding.finding)
+        previous = unique.get(key)
+        if previous is None or severity_rank[finding.severity] > severity_rank[previous.severity]:
+            unique[key] = finding
+    return review.model_copy(update={"phase_results": phases, "findings": list(unique.values())})
 
 
 # Band ← governing rubric phase(s): a FAIL there caps the band score.
@@ -1246,106 +1090,7 @@ def _fallback_result(state: ReviewState, reason: str) -> dict:
     )
     if quest == "olympus":
         result = result.model_copy(update={"repo_eligible": None, "solvability_ok": None})
-    return mark_review_incomplete(result.to_submit_dict(), error=reason)
-
-
-def _log_agent_message(msg: BaseMessage) -> None:
-    """Live-log a single explore agent message (tool call, result, or note)."""
-    if isinstance(msg, AIMessage):
-        for tc in msg.tool_calls or []:
-            try:
-                args = json.dumps(tc.get("args", {}), default=str)
-            except (TypeError, ValueError):
-                args = str(tc.get("args", ""))
-            if len(args) > 200:
-                args = args[:200] + "…"
-            log_activity(f"→ {tc['name']}({args})", category="review")
-        if not msg.tool_calls:
-            text = msg.content if isinstance(msg.content, str) else str(msg.content)
-            preview = " ".join(text.split())[:180]
-            log_activity(
-                f"agent notes ({len(text)} chars): {preview}…"
-                if len(text) > 180
-                else f"agent notes: {preview}",
-                category="review",
-            )
-    elif isinstance(msg, ToolMessage):
-        content = msg.content if isinstance(msg.content, str) else str(msg.content)
-        preview = " ".join(content.split())[:160]
-        suffix = "…" if len(content) > 160 else ""
-        log_activity(
-            f"← {msg.name or 'tool'} ({len(content)} chars): {preview}{suffix}",
-            category="review",
-        )
-
-
-def _summarize_explore_messages(
-    messages: list[BaseMessage],
-    *,
-    max_chars: int = 8_000,
-    tool_output_max_chars: int = 600,
-) -> str:
-    """Condense the explore transcript for the finalize step.
-
-    Human prompts are dropped (phase0 log, rubric, and scrape context are
-    passed to finalize separately) and tool outputs are truncated so the
-    finalize call stays small and fast. The agent's final phase-by-phase
-    summary is preserved verbatim — it is emitted last, so a naive
-    whole-transcript truncation would drop exactly the conclusions finalize
-    needs and phases would read back as SKIP.
-    """
-    # Locate the final assistant summary (last AIMessage without tool calls).
-    final_idx: int | None = None
-    for i in range(len(messages) - 1, -1, -1):
-        msg = messages[i]
-        if isinstance(msg, AIMessage) and not msg.tool_calls:
-            text = msg.content if isinstance(msg.content, str) else str(msg.content)
-            if text.strip():
-                final_idx = i
-                break
-
-    final_summary = ""
-    if final_idx is not None:
-        fmsg = messages[final_idx]
-        final_summary = (
-            fmsg.content if isinstance(fmsg.content, str) else str(fmsg.content)
-        ).strip()
-
-    parts: list[str] = []
-    for i, msg in enumerate(messages):
-        if i == final_idx or isinstance(msg, HumanMessage):
-            continue
-        if isinstance(msg, AIMessage):
-            text = msg.content if isinstance(msg.content, str) else str(msg.content)
-            if msg.tool_calls:
-                tools = ", ".join(tc["name"] for tc in msg.tool_calls)
-                parts.append(f"Assistant [tools: {tools}]: {text}")
-            else:
-                parts.append(f"Assistant: {text}")
-        elif isinstance(msg, ToolMessage):
-            content = msg.content if isinstance(msg.content, str) else str(msg.content)
-            if len(content) > tool_output_max_chars:
-                content = content[:tool_output_max_chars] + "… [tool output truncated]"
-            parts.append(f"Tool[{msg.name or 'tool'}]: {content}")
-        else:
-            parts.append(str(msg.content))
-
-    prefix = "\n".join(parts)
-
-    if not final_summary:
-        if len(prefix) > max_chars:
-            return prefix[:max_chars] + "\n… [explore transcript truncated]"
-        return prefix
-
-    summary_block = "## Final phase summary (verbatim)\n" + final_summary
-    # If the summary alone fills the budget, keep it (head+tail) over the chatter.
-    if len(summary_block) >= max_chars:
-        return truncate_text(summary_block, max_chars, label="final summary")
-
-    prefix_budget = max_chars - len(summary_block) - 2
-    if len(prefix) > prefix_budget:
-        prefix = prefix[:prefix_budget] + "\n… [earlier explore steps truncated]"
-    return f"{prefix}\n\n{summary_block}" if prefix else summary_block
+    return _with_review_audit(mark_review_incomplete(result.to_submit_dict(), error=reason), state)
 
 
 def build_review_graph():

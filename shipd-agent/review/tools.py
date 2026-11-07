@@ -17,11 +17,14 @@ from review.loc import compute_effective_loc, format_loc_analysis
 from review.review_phases import Phase0Result, run_phase0
 from review.review_phases import check_patch_apply as git_check_patch_apply
 from review.token_budget import truncate_text
+from review.evidence import EvidenceLedger, PhaseEvidenceInput, panel_text_available
 
 
 class ReadFileInput(BaseModel):
     path: str = Field(description="Relative path within the submission repo")
     max_chars: int = Field(default=12_000, ge=1, le=100_000)
+    start_line: int = Field(default=1, ge=1, description="First source line (1-based)")
+    line_count: int = Field(default=200, ge=1, le=500)
 
 
 class ListDirectoryInput(BaseModel):
@@ -70,24 +73,48 @@ def make_review_tools(
     cached_holistic: dict | None = None,
     cached_phase0: Phase0Result | None = None,
     config: ReviewConfig | None = None,
+    evidence: EvidenceLedger | None = None,
 ) -> list[StructuredTool]:
     repo_path = resolve_repo_path(repo_path)
     cfg = config or get_review_config()
     read_cap = cfg.review_tool_read_max_chars
     phase0_cap = cfg.review_phase0_log_max_chars
 
-    def read_file(path: str, max_chars: int = read_cap) -> str:
+    def read_file(path: str, max_chars: int = read_cap, start_line: int = 1,
+                  line_count: int = 200) -> str:
         cap = min(max_chars, read_cap)
-        target = _safe_path(repo_path, path)
+        try:
+            target = _safe_path(repo_path, path)
+        except ValueError as exc:
+            return f"Error: {exc}"
         if not target.is_file():
             return f"Error: not a file: {path}"
         try:
-            text = target.read_text(encoding="utf-8", errors="replace")
+            lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError as exc:
             return f"Error reading {path}: {exc}"
-        if len(text) > cap:
-            return truncate_text(text, cap, label=f"read_file {path}")
-        return text
+        if start_line > len(lines) and lines:
+            return f"Error: start_line exceeds file length ({len(lines)} lines)."
+        selected: list[str] = []
+        size = 0
+        for number, line in enumerate(lines[start_line - 1:start_line - 1 + line_count], start_line):
+            cost = len(f"{number}: {line}\n")
+            if size + cost > cap:
+                break
+            selected.append(line)
+            size += cost
+        if lines and not selected:
+            return "Error: source line exceeds read character cap; use a more targeted search."
+        # Keep terminal blank source lines in the receipt's splitlines().
+        text = "\n".join(selected) + ("\n" if selected else "")
+        source = ""
+        if evidence is not None:
+            source_id = evidence.add_source(str(target.relative_to(repo_path)), text, start_line)
+            source = f"Evidence source_id: {source_id}\n"
+        numbered = "\n".join(f"{i}: {line}" for i, line in enumerate(selected, start_line))
+        next_line = start_line + len(selected)
+        more = f"\nMore lines available: call start_line={next_line}." if next_line <= len(lines) else ""
+        return source + (numbered or "(empty file)") + more
 
     def list_directory(path: str = ".", max_depth: int = 2) -> str:
         root = _safe_path(repo_path, path)
@@ -109,6 +136,10 @@ def make_review_tools(
             for entry in entries:
                 if entry.name == ".git":
                     continue
+                try:
+                    _safe_path(repo_path, str(entry.relative_to(repo_path)))
+                except ValueError:
+                    continue
                 rel = entry.relative_to(repo_path)
                 indent = "  " * depth
                 suffix = "/" if entry.is_dir() else ""
@@ -117,7 +148,7 @@ def make_review_tools(
                     walk(entry, depth + 1)
 
         walk(root, 0)
-        return "\n".join(lines) if lines else "(empty)"
+        return truncate_text("\n".join(lines), read_cap, label="directory listing") if lines else "(empty)"
 
     def search_repo(pattern: str, glob: str = "*") -> str:
         try:
@@ -130,6 +161,7 @@ def make_review_tools(
                     "50",
                     "--glob",
                     glob,
+                    "--",
                     pattern,
                     ".",
                 ],
@@ -140,10 +172,12 @@ def make_review_tools(
             )
             if result.returncode in (0, 1):
                 output = result.stdout.strip()
-                return output or "(no matches)"
+                return truncate_text(output, read_cap, label="search results") or "(no matches)"
             return f"rg error: {result.stderr.strip() or result.stdout.strip()}"
         except FileNotFoundError:
-            return _python_search(repo_path, pattern, glob)
+            return truncate_text(_python_search(repo_path, pattern, glob), read_cap, label="search results")
+        except subprocess.TimeoutExpired:
+            return "Error: repository search timed out."
 
     def get_submission_summary() -> str:
         summary = cached_summary or build_submission_summary(
@@ -163,7 +197,10 @@ def make_review_tools(
         if summary.get("problem_excerpt"):
             lines.append("\nproblem excerpt:\n" + str(summary["problem_excerpt"][:2000]))
         lines.append("\nfile tree:\n" + str(summary["file_tree"]))
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        if evidence is not None:
+            result += "\nEvidence manifest and available receipts:\n" + evidence.source_listing()
+        return result
 
     def list_artifacts() -> str:
         artifacts = discover_artifacts(repo_path)
@@ -279,8 +316,8 @@ def make_review_tools(
     tools = [
         StructuredTool.from_function(
             func=read_file,
-            name="read_file",
-            description="Read a text file from the submission repo (relative path).",
+            name="read_submission_file" if evidence is not None else "read_file",
+            description="Read numbered source lines from the submission repo. Paginate with start_line/line_count. Returns a citation receipt on success.",
             args_schema=ReadFileInput,
         ),
         StructuredTool.from_function(
@@ -347,7 +384,7 @@ def make_review_tools(
             scrape_related_submissions,
         )
 
-        def read_holistic_check() -> str:
+        def _read_holistic_check() -> str:
             if page is not None:
                 data = scrape_holistic_check(page)
             elif cached_holistic:
@@ -366,10 +403,10 @@ def make_review_tools(
                 }
             )
 
-        def read_shipd_review_panel(panel_name: str) -> str:
+        def _read_shipd_review_panel(panel_name: str) -> str:
             normalized = panel_name.strip().lower()
             if normalized in ("holistic check", "holistic ai check", "holistic"):
-                return read_holistic_check()
+                return _read_holistic_check()
 
             if page is not None:
                 if "agent" in normalized:
@@ -422,8 +459,26 @@ def make_review_tools(
                 if "related" in normalized:
                     return cached_scrape.get("related_submissions", "not available")
                 if "holistic" in normalized:
-                    return read_holistic_check()
+                    return _read_holistic_check()
             return "not available — run via orchestrator with browser session"
+
+        def panel_receipt(key: str, text: str) -> str:
+            if evidence is None or not panel_text_available(text):
+                return text
+            source_id = evidence.add_source(f"platform:{key}", text)
+            return f"Evidence source_id: {source_id}\n" + "\n".join(
+                f"{i}: {line}" for i, line in enumerate(text.splitlines(), 1)
+            )
+
+        def read_holistic_check() -> str:
+            return panel_receipt("holistic_check", _read_holistic_check())
+
+        def read_shipd_review_panel(panel_name: str) -> str:
+            normalized = panel_name.strip().lower()
+            if evidence is not None and not any(k in normalized for k in ("agent", "related", "holistic")):
+                return "Error: use Agent Runs, Related Submissions, or Holistic Check."
+            key = "agent_runs" if "agent" in normalized else "related_submissions" if "related" in normalized else "holistic_check"
+            return panel_receipt(key, _read_shipd_review_panel(panel_name))
 
         tools.extend(
             [
@@ -447,6 +502,32 @@ def make_review_tools(
             ]
         )
 
+    if evidence is not None:
+        def record_phase_review(phase: str, status: str, summary: str,
+                                citations: list[dict] | None = None,
+                                findings: list[dict] | None = None) -> str:
+            try:
+                report = PhaseEvidenceInput.model_validate({
+                    "phase": phase, "status": status, "summary": summary,
+                    "citations": citations or [], "findings": findings or [],
+                })
+                return evidence.record(report)
+            except ValueError as exc:
+                return f"Error recording phase evidence: {exc}"
+
+        tools.extend([
+            StructuredTool.from_function(
+                func=record_phase_review, name="record_phase_review",
+                description=("Record a rubric phase with citations from successful reads. "
+                             "Use source_id and narrow 1-based start_line/end_line ranges. "
+                             "Cite every required artifact for the phase. Free-text summaries do not count as coverage."),
+                args_schema=PhaseEvidenceInput,
+            ),
+            StructuredTool.from_function(
+                func=evidence.source_listing, name="get_review_evidence",
+                description="List successful evidence receipts, recorded phases, and coverage gaps.",
+            ),
+        ])
     return tools
 
 
@@ -461,8 +542,9 @@ def _python_search(repo_path: Path, pattern: str, glob_pattern: str) -> str:
         if not path.is_file() or ".git" in path.parts:
             continue
         try:
+            _safe_path(repo_path, str(path.relative_to(repo_path)))
             text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        except (OSError, ValueError):
             continue
         for line_no, line in enumerate(text.splitlines(), start=1):
             if regex.search(line):

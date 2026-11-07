@@ -15,7 +15,7 @@ The review agent works with any of these providers. Anthropic stays the default,
 | xAI | `xai` | `XAI_API_KEY` |
 | OpenAI-compatible endpoint | `openai-compatible` | `REVIEW_LLM_API_KEY` |
 
-The **explore** model drives the tool-calling pass over the repo. The **finalize** model (`REVIEW_MODEL`) writes the structured verdict. Choose a model your account can access that supports the tools and structured output this pipeline uses. Repository defaults live in [`llm_providers.py`](../shipd-agent/review/llm_providers.py); they are not a guarantee of provider availability.
+The **explore** model drives the Deep Agents reviewer and its focused workers. The **finalize** model (`REVIEW_MODEL`) writes the structured verdict from verified phase reports. Choose a model your account can access that supports the tools and structured output this pipeline uses. Repository defaults live in [`llm_providers.py`](../shipd-agent/review/llm_providers.py); they are not a guarantee of provider availability. After upgrading, rerun `./run.sh --setup` to install the pinned Deep Agents and compatible LangChain packages.
 
 **Interactive setup (recommended)**
 
@@ -65,8 +65,9 @@ See [`.env.example`](../.env.example) for all settings. Start with one review an
 
 | Setting | Purpose |
 | --- | --- |
-| `REVIEW_MAX_TOOL_STEPS` | Bound the exploration pass |
-| `REVIEW_COVERAGE_RECHECK_MAX_STEPS` | Bound extra evidence gathering |
+| `REVIEW_MAX_TOOL_STEPS` | Shared model calls across the reviewer and workers (legacy variable name; default 15) |
+| `REVIEW_COVERAGE_RECHECK_MAX_STEPS` | Additional shared model calls for missing phase reports (default 6); two more calls are reserved for final scoring and retry |
+| `REVIEW_MAX_TOTAL_TOKENS` | Stop new calls once provider-reported review usage reaches the limit (default 200,000); in-flight calls can overshoot |
 | `REVIEW_EXPLORE_MAX_OUTPUT_TOKENS` | Cap exploration output per call |
 | `REVIEW_FINALIZE_MAX_OUTPUT_TOKENS` | Cap finalization output per call |
 | `REVIEW_PHASE0_TEST_TIMEOUT` | Bound each test invocation |
@@ -75,11 +76,13 @@ See [`.env.example`](../.env.example) for all settings. Start with one review an
 
 These limits bound individual operations; they are not a monetary spending cap. LLM API usage is billed by your provider. The reviewer reads existing Nova/Vega/Orion results; it has no supported command for launching those evaluations.
 
+Review bundles include `review_evidence` with verified citation excerpts and `review_usage` with shared call counts, reported tokens, and missing usage. Provider-internal HTTP retries follow the client SDK policy. See the [review harness](../README.md#deep-agents-review-harness) and [validation report](deep-agents-validation.md) for details.
+
 ## Troubleshooting
 
 | Symptom | Next step |
 | --- | --- |
-| Setup or imports fail | Use Python 3.10+; rerun `./run.sh --setup` in the checkout |
+| Setup or imports fail | Use Python 3.11+ (3.14 recommended); rerun `./run.sh --setup` in the checkout |
 | Chromium cannot launch | Run `.venv/bin/python -m playwright install chromium`; on Linux, install required system libraries with `playwright install --with-deps chromium` |
 | Docker check fails | Start your Docker daemon and confirm `docker info` succeeds |
 | Sign-in cannot retrieve OTP | Check mailbox IMAP settings and the app password in `.env` |

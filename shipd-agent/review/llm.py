@@ -1,6 +1,6 @@
 # Chat-model factory for the review graph's two LLM roles.
 #
-#   explore  — ReAct tool-calling agent (create_react_agent)
+#   explore  — Deep Agents evidence-collection harness
 #   finalize — single structured-output call returning ReviewResult
 #
 # The provider, models and API key come from ReviewConfig (review/config.py);

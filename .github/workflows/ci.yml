@@ -48,7 +48,7 @@ jobs:
       matrix:
         include:
           # Oldest version requires-python allows.
-          - python-version: "3.10"
+          - python-version: "3.11"
           # Latest; the in-page form JS is Python-version independent, so only
           # this leg installs Chromium and requires the browser tests to run.
           - python-version: "3.14"

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import dataclasses
 import unittest
-import warnings
 from unittest.mock import MagicMock, patch
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -63,7 +62,7 @@ def make_config(provider: str = "anthropic", **overrides) -> ReviewConfig:
 
 
 @tool
-def read_file(path: str) -> str:
+def read_submission_file(path: str) -> str:
     """Read a file from the repo."""
     return "contents"
 
@@ -73,24 +72,21 @@ HISTORY = [
     HumanMessage(content="review this"),
     AIMessage(
         content="",
-        tool_calls=[{"name": "read_file", "args": {"path": "a.py"}, "id": "call_1"}],
+        tool_calls=[{"name": "read_submission_file", "args": {"path": "a.py"}, "id": "call_1"}],
         additional_kwargs={"reasoning_content": "I should read a.py"},
     ),
-    ToolMessage(content="print(1)", tool_call_id="call_1", name="read_file"),
+    ToolMessage(content="print(1)", tool_call_id="call_1", name="read_submission_file"),
 ]
 
 
-def _react_agent(model):
-    """The graph's create_react_agent, minus its LangGraph v1 deprecation noise."""
-    from langgraph.prebuilt import create_react_agent
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        return create_react_agent(model, [read_file])
+def _deep_agent(model):
+    """Run provider transports through the production Deep Agents harness."""
+    from review.deep import create_review_harness
+    return create_review_harness(model, [read_submission_file], "Offline provider test")
 
 
 def explore_payload(cfg: ReviewConfig) -> dict:
-    bound = llm.make_chat_model(cfg, "explore").bind_tools([read_file])
+    bound = llm.make_chat_model(cfg, "explore").bind_tools([read_submission_file])
     return bound.bound._get_request_payload(HISTORY, **bound.kwargs)
 
 
@@ -290,7 +286,7 @@ class RequestPayloadTests(unittest.TestCase):
 
 
 class MockTransportEndToEndTests(unittest.TestCase):
-    """Explore ReAct loop + structured finalize over a fake HTTP endpoint."""
+    """Explore Deep Agents loop + structured finalize over a fake HTTP endpoint."""
 
     def _attach(self, chat, handler) -> None:
         import httpx
@@ -344,7 +340,7 @@ class MockTransportEndToEndTests(unittest.TestCase):
                     {"role": "assistant", "content": "", "tool_calls": [call]}))
             if len(requests) == 1:
                 call = {"id": "t1", "type": "function", "function": {
-                    "name": "read_file", "arguments": json.dumps({"path": "a.py"})}}
+                    "name": "read_submission_file", "arguments": json.dumps({"path": "a.py"})}}
                 return httpx.Response(200, json=self._completion({
                     "role": "assistant", "content": "", "tool_calls": [call],
                     "reasoning_content": "need to read a.py"}))
@@ -354,7 +350,7 @@ class MockTransportEndToEndTests(unittest.TestCase):
         cfg = make_config("moonshot")
         explore = llm.make_chat_model(cfg, "explore")
         self._attach(explore, handler)
-        agent = _react_agent(explore)
+        agent = _deep_agent(explore)
         out = agent.invoke({"messages": [SystemMessage(content="s"), HumanMessage(content="go")]})
         self.assertEqual(out["messages"][-1].content, "notes: looks fine")
         self.assertEqual(len(requests), 2)
@@ -392,7 +388,7 @@ class MockTransportEndToEndTests(unittest.TestCase):
                 return httpx.Response(200, json=response([
                     {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "E"},
                     {"type": "function_call", "id": "fc_1", "call_id": "call_1",
-                     "name": "read_file", "arguments": json.dumps({"path": "a.py"}),
+                     "name": "read_submission_file", "arguments": json.dumps({"path": "a.py"}),
                      "status": "completed"},
                 ]))
             return httpx.Response(200, json=response([
@@ -404,9 +400,9 @@ class MockTransportEndToEndTests(unittest.TestCase):
 
         explore = llm.make_chat_model(make_config("openai"), "explore")
         self._attach(explore, handler)
-        agent = _react_agent(explore)
+        agent = _deep_agent(explore)
         out = agent.invoke({"messages": [SystemMessage(content="s"), HumanMessage(content="go")]})
-        # The graph parses phase verdicts line by line from plain text.
+        # Plain text remains available alongside the structured evidence ledger.
         self.assertEqual(out["messages"][-1].content, "Phase 1: PASS\nPhase 2: FAIL")
         second_types = [item.get("type") for item in requests[1]["input"]]
         self.assertIn("reasoning", second_types)
@@ -430,7 +426,7 @@ class MockTransportEndToEndTests(unittest.TestCase):
             calls.append(kwargs)
             if len(calls) == 1:
                 part = types.Part(
-                    function_call=types.FunctionCall(name="read_file", args={"path": "a.py"}),
+                    function_call=types.FunctionCall(name="read_submission_file", args={"path": "a.py"}),
                     thought_signature=b"SIG1",
                 )
             else:
@@ -445,7 +441,7 @@ class MockTransportEndToEndTests(unittest.TestCase):
 
         chat = llm.make_chat_model(make_config("google"), "explore")
         with patch.object(chat.client.models, "generate_content", side_effect=fake_generate):
-            agent = _react_agent(chat)
+            agent = _deep_agent(chat)
             out = agent.invoke({"messages": [SystemMessage(content="s"), HumanMessage(content="go")]})
             self.assertEqual(out["messages"][-1].content, "Phase 1: PASS\nPhase 2: FAIL")
             agent.invoke({"messages": out["messages"] + [HumanMessage(content="recheck")]})
@@ -476,7 +472,7 @@ class MockTransportEndToEndTests(unittest.TestCase):
                 content = [
                     {"type": "thinking", "thinking": "hmm", "signature": "SIGA"},
                     {"type": "text", "text": "Reading a.py"},
-                    {"type": "tool_use", "id": "toolu_1", "name": "read_file",
+                    {"type": "tool_use", "id": "toolu_1", "name": "read_submission_file",
                      "input": {"path": "a.py"}},
                 ]
                 stop = "tool_use"
@@ -500,7 +496,7 @@ class MockTransportEndToEndTests(unittest.TestCase):
             self.skipTest(f"cannot inject a mock transport: {exc}")
         chat.__dict__["_client"] = client  # ChatAnthropic._client is a cached_property
 
-        agent = _react_agent(chat)
+        agent = _deep_agent(chat)
         out = agent.invoke({"messages": [SystemMessage(content="s"), HumanMessage(content="go")]})
         self.assertEqual(out["messages"][2].content, "Reading a.py")
         self.assertEqual(out["messages"][-1].content, "Phase 1: PASS\nPhase 2: FAIL")
@@ -523,10 +519,11 @@ class GraphWiringTests(unittest.TestCase):
     def test_finalize_requests_structured_review_result(self) -> None:
         cfg = make_config("deepseek")
         with patch.object(g, "make_chat_model", side_effect=RuntimeError("stop")) as factory:
-            with self.assertRaises(RuntimeError):
-                g.finalize_node(
-                    {"config": cfg, "quest": "olympus", "phase_results": {}, "findings": []}
-                )
+            result = g.finalize_node(
+                {"config": cfg, "quest": "olympus", "phase_results": {}, "findings": []}
+            )["review_result"]
+            self.assertFalse(result["review_complete"])
+            self.assertIn("Cannot initialize final scorer", result["review_error"])
         factory.assert_called_once_with(cfg, "finalize", structured_output=ReviewResult)
 
 
