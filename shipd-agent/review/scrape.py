@@ -144,9 +144,13 @@ def parse_agent_runs_from_text(raw_text: str) -> dict[str, Any]:
         stripped = line.strip()
         if not stripped:
             continue
-        if re.fullmatch(r"Agent Runs?", stripped, re.I):
+        if re.fullmatch(r"Agent Runs?|Rollouts?", stripped, re.I):
             continue
-        if re.search(r"^(failure pattern|common fail)", stripped, re.I):
+        if re.search(
+            r"^(failure pattern|common fail|submission criteria|auto review|false positive|fp check|related|holistic)",
+            stripped,
+            re.I,
+        ):
             break
         summary_lines.append(stripped)
         if len(summary_lines) >= 12:
@@ -159,7 +163,7 @@ def parse_agent_runs_from_text(raw_text: str) -> dict[str, Any]:
         or summary
         or failure_patterns
         or metrics.get("median_loc") is not None
-        or re.search(r"Agent Runs?", text, re.I)
+        or re.search(r"Agent Runs?|Rollouts?", text, re.I)
     )
     return {
         "available": available,
@@ -323,6 +327,8 @@ def scrape_agent_runs(page: Any) -> dict[str, Any]:
     try:
         raw_text = _scrape_section_text(page, r"Agent Runs?")
         if not raw_text:
+            raw_text = _scrape_section_text(page, r"Rollouts?")
+        if not raw_text:
             return dict(_AGENT_RUNS_EMPTY)
         parsed = parse_agent_runs_from_text(raw_text)
         parsed["raw_text"] = raw_text
@@ -421,6 +427,11 @@ def scrape_review_page_context(page: Any) -> dict[str, Any]:
     holistic = scrape_holistic_check(page)
     agent_runs = scrape_agent_runs(page)
     related = scrape_related_submissions(page)
+    extra_sections = {
+        "submission_criteria": _scrape_section_text(page, r"Submission criteria"),
+        "auto_review_panel": _scrape_section_text(page, r"Auto Review"),
+        "fp_check_panel": _scrape_section_text(page, r"False positives?|FP check"),
+    }
     prompt_strings = scrape_context_for_prompts(
         holistic=holistic,
         agent_runs=agent_runs,
@@ -430,6 +441,7 @@ def scrape_review_page_context(page: Any) -> dict[str, Any]:
         "holistic_check": holistic,
         "agent_runs_data": agent_runs,
         "related_submissions_data": related,
+        **extra_sections,
         **prompt_strings,
     }
 

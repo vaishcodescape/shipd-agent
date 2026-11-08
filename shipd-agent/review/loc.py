@@ -273,9 +273,14 @@ def format_loc_analysis(
 
     files = loc_info.get("files_analyzed") or []
     file_note = f" Files: {', '.join(files)}." if files else ""
-    threshold_note = (
-        f" Thresholds — Olympus min {olympus_min}, Mars {mars_min}–{mars_max}."
-    )
+    del olympus_min  # Olympus no longer publishes a solution-LOC floor.
+    if quest == "olympus":
+        threshold_note = (
+            " Olympus has no solution-LOC floor; long horizon is Nova sequence length. "
+            f"Mars size limits ({mars_min}–{mars_max}) are not applied."
+        )
+    else:
+        threshold_note = f" Thresholds — Mars {mars_min}–{mars_max}."
     return (
         f"Effective solution LOC: {loc} ({method}).{file_note}{threshold_note} "
         f"{loc_info.get('notes', '').strip()}"

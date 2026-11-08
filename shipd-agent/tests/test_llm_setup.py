@@ -258,7 +258,8 @@ class ConfigureTests(CliTestCase):
             "--env-file",
             str(self.env_file),
             interactive=True,
-            inputs=["openai", "", "gpt-6-astra", ""],  # provider, explore, finalize, save
+            # provider, explore, finalize, Auto Review on, its model, agent names?, save
+            inputs=["openai", "", "gpt-6-astra", "", "", "", ""],
             secret=KEY,
         )
         self.assertEqual(code, 0, out + err)
@@ -266,6 +267,8 @@ class ConfigureTests(CliTestCase):
         self.assertIn("REVIEW_PROVIDER=openai\n", text)
         self.assertIn("REVIEW_EXPLORE_MODEL=gpt-6.1-sol\n", text)
         self.assertIn("REVIEW_MODEL=gpt-6-astra\n", text)
+        self.assertIn("REVIEW_AUTO_REVIEW=1\n", text)
+        self.assertNotIn("REVIEW_AUTO_REVIEW_MODEL", text)
         self.assertIn("AUTH_EMAIL=user@example.com", text)
         self.assertIn("# keep this comment", text)
         # A base URL meant for another provider must not receive the OpenAI key.
@@ -283,7 +286,8 @@ class ConfigureTests(CliTestCase):
             "--env-file",
             str(self.env_file),
             interactive=True,
-            inputs=["grok", "2", "1", "n", "y"],  # provider, explore #2, finalize #1, replace?, save
+            # provider, explore #2, finalize #1, replace?, Auto Review x3, save
+            inputs=["grok", "2", "1", "n", "", "", "", "y"],
         )
         self.assertEqual(code, 0, out + err)
         self.getpass_mock.assert_not_called()
@@ -301,7 +305,7 @@ class ConfigureTests(CliTestCase):
             "--env-file",
             str(self.env_file),
             interactive=True,
-            inputs=["custom", "vendor/model-x", "", "https://gw.example/v1/", ""],
+            inputs=["custom", "vendor/model-x", "", "https://gw.example/v1/", "", "", "", ""],
             secret=KEY,
         )
         self.assertEqual(code, 0, out + err)
@@ -309,6 +313,63 @@ class ConfigureTests(CliTestCase):
         self.assertIn("REVIEW_PROVIDER=openai-compatible\n", text)
         self.assertIn("REVIEW_MODEL=vendor/model-x\n", text)
         self.assertIn("REVIEW_LLM_BASE_URL=https://gw.example/v1\n", text)
+
+
+class ConfigureAutoReviewTests(CliTestCase):
+    def configure(self, inputs):
+        return self.run_cli(
+            "configure-auto-review", "--env-file", str(self.env_file),
+            interactive=True, inputs=inputs,
+        )
+
+    def test_requires_terminal(self) -> None:
+        code, out, err = self.run_cli("configure-auto-review", "--env-file", str(self.env_file))
+        self.assertEqual(code, 2)
+        self.assertIn("interactive terminal", err)
+
+    def test_sets_model_and_agent_labels_then_loads_them(self) -> None:
+        self.env_file.write_text("REVIEW_MODEL=claude-opus-4-8\n", encoding="utf-8")
+        # Auto Review on, its model, change agent names, Nova, Vega, Orion (keep), save
+        code, out, err = self.configure(
+            ["y", "claude-sonnet-4-6", "y", "Gemini 5 Argon", "Opus 6 (xhigh)", "", "y"]
+        )
+        self.assertEqual(code, 0, out + err)
+        text = self.env_file.read_text(encoding="utf-8")
+        self.assertIn("REVIEW_AUTO_REVIEW=1\n", text)
+        self.assertIn("REVIEW_AUTO_REVIEW_MODEL=claude-sonnet-4-6\n", text)
+        self.assertIn("REVIEW_VEGA_MODEL=Opus 6 (xhigh)\n", text)
+        self.assertNotIn("REVIEW_ORION_MODEL", text)
+        for key in list(os.environ):
+            if key.startswith("REVIEW_"):
+                del os.environ[key]
+        config = config_module.get_review_config()
+        self.assertEqual(config.review_auto_review_model, "claude-sonnet-4-6")
+        self.assertEqual(config.expected_agent_models["Vega"], "Opus 6 (xhigh)")
+        self.assertEqual(config.expected_agent_models["Orion"], "Sol 6.1 (xhigh)")
+        self.assertEqual(config.expected_agent_models["Nova"], "Gemini 5 Argon")
+        code, out, err = self.run_cli("status")
+        self.assertIn("Auto Review prediction: on, model claude-sonnet-4-6", out)
+        self.assertIn("Vega=Opus 6 (xhigh)", out)
+
+    def test_turning_it_off_and_back_to_finalize(self) -> None:
+        self.env_file.write_text(
+            "REVIEW_MODEL=claude-opus-4-8\nREVIEW_AUTO_REVIEW_MODEL=claude-sonnet-4-6\n",
+            encoding="utf-8",
+        )
+        code, out, err = self.configure(["", "claude-opus-4-8", "", ""])
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("REVIEW_AUTO_REVIEW_MODEL", self.env_file.read_text(encoding="utf-8"))
+        code, out, err = self.configure(["n", "", ""])
+        self.assertIn("REVIEW_AUTO_REVIEW=0\n", self.env_file.read_text(encoding="utf-8"))
+        code, out, err = self.run_cli("status")
+        self.assertIn("Auto Review prediction: off", out)
+
+    def test_bad_agent_label_is_asked_again(self) -> None:
+        # on, model, change names, Nova (keep), Vega (bad, then fixed), Orion (keep), save
+        code, out, err = self.configure(["", "", "y", "", 'bad "label"', "Opus 6", "", "y"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Enter a short label", out)
+        self.assertIn("REVIEW_VEGA_MODEL=Opus 6\n", self.env_file.read_text(encoding="utf-8"))
 
 
 def _shell_test_skip_reason() -> str | None:

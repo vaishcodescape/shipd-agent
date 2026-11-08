@@ -1,6 +1,7 @@
 # End-to-end tests for the 2026-10 assessment criteria through the review graph:
 # the task prompt bars (1,000 words, Too Many Requirements) and the agent run
-# bar (Nova, Vega, Orion × 4 runs, exactly one passing run).
+# bar (at least 4 unhinted runs per model, one model at 25% or below,
+# Nova sequence length above 400K on Olympus).
 #
 # The finalize LLM (make_chat_model) is faked — no API calls; it approves everything, so any
 # FAIL/request_changes in the output comes from the deterministic checks. The
@@ -42,8 +43,9 @@ SPRAWLING_PROMPT = (
     + " ".join(["context"] * 1000)
 )
 
-ONE_PASS_ROWS = ("Nova: 1/4 pass", "Vega: 0/4 pass", "Orion: 0/4 pass")
+ONE_PASS_ROWS = ("Vega: 1/4 pass", "Nova: 0/4 pass", "Orion: 0/4 pass")
 TWO_PASS_ROWS = ("Nova: 1/4 pass", "Vega: 1/4 pass", "Orion: 0/4 pass")
+NOVA_SEQUENCE_LINE = "Nova average sequence length: 450000"
 
 
 def _approving_review() -> ReviewResult:
@@ -115,7 +117,7 @@ class Phase0KeepsScrapeFindingsTests(_RepoCase):
             {"repo_path": str(self.repo), "config": _config(), "submission_summary": {}}
         )
         out = g._run_phase0_into_state(state)
-        self.assertIn("Too many passing agent runs", _finding_names(out, "5"))
+        self.assertIn("More than one model solved the task", _finding_names(out, "5"))
         self.assertEqual(out["phase_results"]["5"]["status"], "FAIL")
 
     def test_unreadable_agent_panel_leaves_phase5_to_reviewer(self) -> None:
@@ -133,7 +135,7 @@ class FinalizeAndValidateTests(_RepoCase):
         self.write_prompt(prompt)
         config = _config()
         panel = "Agent Runs\n12/12 agent runs complete.\n" + "\n".join(agent_rows)
-        panel += "\nMedian files: 5, messages: 146.5, LOC: 420"
+        panel += "\nMedian files: 5, messages: 146.5, LOC: 420\n" + NOVA_SEQUENCE_LINE
         state: dict = {
             "repo_path": str(self.repo),
             "quest": "olympus",
@@ -162,13 +164,13 @@ class FinalizeAndValidateTests(_RepoCase):
         self.assertIn("Reviewer phase 1 ok.", result["phase_results"]["1"]["summary"])
         self.assertEqual(result["phase_results"]["5"]["status"], "FAIL")
         self.assertEqual(
-            _finding_names(result, "1"),
+            _finding_names(result, "1")[:2],
             [
                 "Task prompt exceeds the 1,000-word limit",
                 "Too many independent requirements in task prompt",
             ],
         )
-        self.assertEqual(_finding_names(result, "5"), ["Too many passing agent runs"])
+        self.assertEqual(_finding_names(result, "5"), ["More than one model solved the task"])
         self.assertEqual(result["band_ratings"]["problem"]["score"], 1)
 
     def test_compliant_submission_stays_approved(self) -> None:
@@ -183,7 +185,10 @@ class FinalizeAndValidateTests(_RepoCase):
         # The finalize model was given the deterministic task prompt analysis.
         _, role = chat.call_args.args
         self.assertEqual(role, "finalize")
-        self.assertIs(chat.call_args.kwargs["structured_output"], ReviewResult)
+        structured = [
+            call.kwargs.get("structured_output") for call in chat.call_args_list
+        ]
+        self.assertIn(ReviewResult, structured)
         messages = chat.return_value.invoke.call_args.args[0]
         self.assertIn("words (limit 1000)", messages[1].content)
 
@@ -200,15 +205,16 @@ class PromptTextTests(unittest.TestCase):
             related_submissions="not available",
             prompt_analysis="Task prompt (problem.md): 812 words (limit 1000).",
         )
-        self.assertIn("Nova, Vega, and Orion must each run 4 times (12 runs total)", text)
-        self.assertIn("exactly 1 run must pass", text)
+        self.assertIn("need at least 4 finished unhinted runs", text)
+        self.assertIn("at most 25%", text)
+        self.assertNotIn("exactly 1 run must pass", text)
         self.assertIn("at most 1000 words", text)
         self.assertIn("Too Many Requirements", text)
         self.assertIn("812 words (limit 1000)", text)
         self.assertNotIn("pass rate ≤", text)
 
     def test_finalize_instructions_state_new_bars(self) -> None:
-        self.assertIn("Nova, Vega, and Orion must each run 4 times", FINALIZE_PHASE_INSTRUCTIONS)
+        self.assertIn("need at least 4 finished unhinted runs", FINALIZE_PHASE_INSTRUCTIONS)
         self.assertIn("At most 1,000 words", FINALIZE_PHASE_INSTRUCTIONS)
         self.assertNotIn("At least 10 agent runs", FINALIZE_PHASE_INSTRUCTIONS)
 
@@ -216,7 +222,7 @@ class PromptTextTests(unittest.TestCase):
         # The rubric body is middle-truncated at the default cap, so the bars
         # must survive in the preamble the finalize model always receives.
         excerpt = g._load_rubric_excerpt(get_review_config().rubric_path, max_chars=16_000)
-        self.assertIn("Nova, Vega, and Orion must each run 4 times", excerpt)
+        self.assertIn("need at least 4 finished unhinted runs", excerpt)
         self.assertIn("Too Many Requirements", excerpt)
         self.assertIn("At most 1,000 words", excerpt)
 
@@ -240,6 +246,7 @@ def _review_page_html(*, agent_rows: tuple[str, ...], requirements_check: str) -
 <section><h2>Agent Runs</h2>
   <div>12/12 agent runs complete.</div>{rows}
   <div>Median files: 5, messages: 146.5, LOC: 420</div>
+  <div>Nova average sequence length: 450000</div>
 </section>
 <section><h2>Related Submissions</h2><div>No related submissions.</div></section>
 </main></body></html>"""
@@ -294,10 +301,10 @@ class ReviewGraphOnScrapedPageTests(_RepoCase):
         self.assertEqual(result["phase_results"]["1"]["status"], "FAIL")
         self.assertEqual(result["phase_results"]["5"]["status"], "FAIL")
         self.assertEqual(
-            _finding_names(result, "1"),
+            _finding_names(result, "1")[:2],
             ["Task prompt exceeds the 1,000-word limit", "Shipd flagged Too Many Requirements"],
         )
-        self.assertEqual(_finding_names(result, "5"), ["Too many passing agent runs"])
+        self.assertEqual(_finding_names(result, "5"), ["More than one model solved the task"])
 
     def test_dry_run_passes_a_compliant_submission(self) -> None:
         result = self._review(
@@ -308,7 +315,7 @@ class ReviewGraphOnScrapedPageTests(_RepoCase):
         )
         self.assertEqual(result["phase_results"]["1"]["status"], "PASS")
         self.assertEqual(result["phase_results"]["5"]["status"], "PASS")
-        self.assertIn("Nova 1/4", result["phase_results"]["5"]["summary"])
+        self.assertIn("Vega 1/4", result["phase_results"]["5"]["summary"])
         self.assertEqual(_finding_names(result, "1") + _finding_names(result, "5"), [])
 
     def test_full_graph_caps_and_reports_through_finalize(self) -> None:
@@ -322,7 +329,7 @@ class ReviewGraphOnScrapedPageTests(_RepoCase):
         self.assertEqual(result["decision"], "request_changes")
         self.assertEqual(result["phase_results"]["1"]["status"], "FAIL")
         self.assertEqual(result["phase_results"]["5"]["status"], "FAIL")
-        self.assertIn("Too many passing agent runs", _finding_names(result, "5"))
+        self.assertIn("More than one model solved the task", _finding_names(result, "5"))
         self.assertIn("Shipd flagged Too Many Requirements", _finding_names(result, "1"))
         self.assertEqual(result["band_ratings"]["problem"]["score"], 1)
 

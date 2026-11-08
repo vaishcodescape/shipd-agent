@@ -515,7 +515,9 @@ def test_full_graph_real_harness_to_scorer_to_saved_bundle(submission, retry):
                                                config=cfg)
     assert result["review_complete"] is True
     assert result["decision"] == "approve"
-    assert result["review_usage"]["model_calls"] == (5 if retry else 4)
+    # Finalize uses one call (two when the first payload is empty). Auto Review
+    # prediction then tries twice because this scorer does not emit that schema.
+    assert result["review_usage"]["model_calls"] == (7 if retry else 6)
     assert scorer.attempts == (2 if retry else 1)
     excerpt = scorer.payloads[0]["review_evidence"]["phases"]["4"]["citations"][0]["excerpt"]
     assert excerpt == "important " * 100

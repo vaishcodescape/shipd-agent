@@ -1,7 +1,10 @@
 # CLI for choosing the review LLM and managing its stored API key.
 #
 # Used by scripts/shipd.sh:
-#   configure   ./run.sh --configure-llm   interactive provider/model/key setup
+#   configure   ./run.sh --configure-llm   interactive provider/model/key setup,
+#                                          then the Auto Review settings
+#   configure-auto-review
+#               ./run.sh --configure-auto-review   only the Auto Review settings
 #   onboard     first thing in a review run: the same setup when no API key is
 #               configured yet (asks nothing once set up, or without a TTY)
 #   ensure-key  preflight before a review run (prompts only on a TTY)
@@ -25,17 +28,26 @@ from dotenv import load_dotenv
 
 from auth import REPO_ROOT
 from review import credentials
-from review.config import ReviewConfig, get_review_config, resolve_review_models
-from review.llm import llm_config_error, missing_api_key_message
+from review.config import (
+    ReviewConfig,
+    expected_agent_models_from_env,
+    get_review_config,
+    resolve_auto_review_model,
+    resolve_review_models,
+)
+from review.llm import llm_config_error, missing_api_key_message, role_model
 from review.llm_providers import (
     PROVIDERS,
     ProviderSpec,
     get_provider,
     normalize_provider_name,
 )
+from review.rubric_defaults import AGENT_TYPES
 
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$")
 _URL_RE = re.compile(r"^https?://\S+$")
+# Agent line-up entries are free-text labels ("Opus 5.5 (xhigh)"), not API IDs.
+_AGENT_LABEL_RE = re.compile(r"^[^\x00-\x1f#\"'\\=]{1,100}$")
 
 # `onboard` exit status when it saved new provider/model settings to the env
 # file: the caller (scripts/shipd.sh) reloads that file before continuing.
@@ -126,6 +138,61 @@ def _choose_base_url(spec: ProviderSpec, current: str) -> str:
         print("  Enter an http(s) URL.")
 
 
+def _configure_auto_review(
+    spec: ProviderSpec, finalize: str, *, same_provider: bool
+) -> tuple[dict[str, str], list[str]]:
+    """Ask whether to run Auto Review and which model; return (settings, remove)."""
+    settings: dict[str, str] = {}
+    remove: list[str] = []
+    enabled_now = os.getenv("REVIEW_AUTO_REVIEW", "1").strip().lower() in {"1", "true", "yes", "on"}
+    print(
+        "\nAuto Review prediction: the last stage rereads the whole submission and "
+        "predicts Shipd Auto Review findings. A concrete MAJOR blocks approve."
+    )
+    enabled = _confirm("Run the Auto Review prediction?", default=enabled_now)
+    settings["REVIEW_AUTO_REVIEW"] = "1" if enabled else "0"
+    if not enabled:
+        if not same_provider:
+            remove.append("REVIEW_AUTO_REVIEW_MODEL")
+        return settings, remove
+    current = resolve_auto_review_model(spec, finalize) if same_provider else finalize
+    print(f"Press Enter on the finalize model ({finalize}) to keep them in step.")
+    model = _choose_model(spec, "auto review", current)
+    if model == finalize:
+        remove.append("REVIEW_AUTO_REVIEW_MODEL")
+    else:
+        settings["REVIEW_AUTO_REVIEW_MODEL"] = model
+    return settings, remove
+
+
+def _configure_agent_models() -> tuple[dict[str, str], list[str]]:
+    """Optionally edit the expected Vega/Orion/Nova labels; return (settings, remove)."""
+    settings: dict[str, str] = {}
+    remove: list[str] = []
+    current = expected_agent_models_from_env()
+    base = expected_agent_models_from_env(per_agent=False)
+    print(
+        "\nExpected agent models. Shipd does not publish these; they are labels "
+        "recorded with the review and never decide a pass or fail:"
+    )
+    for agent in AGENT_TYPES:
+        print(f"  {agent}: {current.get(agent) or '(not set)'}")
+    if not _confirm("Change them?", default=False):
+        return settings, remove
+    for agent in AGENT_TYPES:
+        env_name = f"REVIEW_{agent.upper()}_MODEL"
+        while True:
+            answer = _ask(f"{agent} model", current.get(agent, ""))
+            if _AGENT_LABEL_RE.match(answer):
+                break
+            print("  Enter a short label (no quotes, #, =, or backslashes).")
+        if answer == base.get(agent):
+            remove.append(env_name)
+        else:
+            settings[env_name] = answer
+    return settings, remove
+
+
 def _prompt_and_store_key(spec: ProviderSpec) -> bool:
     print(
         f"Paste your {spec.label} API key. Input is hidden; it will be saved to "
@@ -160,6 +227,15 @@ def _write_env_settings(env_file: Path, values: dict[str, str], remove: list[str
     os.environ.update(values)
     for key in remove:
         os.environ.pop(key, None)
+
+
+def _print_settings(settings: dict[str, str], remove: list[str]) -> None:
+    print("")
+    for key, value in settings.items():
+        print(f"  {key}={value}")
+    for key in remove:
+        if key not in settings and os.getenv(key):
+            print(f"  {key} (removed)")
 
 
 def _configure_interactively(env_file: Path, *, first_run: bool = False) -> bool:
@@ -226,9 +302,19 @@ def _configure_interactively(env_file: Path, *, first_run: bool = False) -> bool
     else:
         # Never send this provider's key to a base URL chosen for another one.
         remove.append("REVIEW_LLM_BASE_URL")
-    print("")
-    for key, value in settings.items():
-        print(f"  {key}={value}")
+    if first_run:
+        # Keep the first run short; a model saved for another provider would
+        # only be ignored with a warning, so drop it.
+        if spec.name != current:
+            remove.append("REVIEW_AUTO_REVIEW_MODEL")
+    else:
+        for extra, extra_remove in (
+            _configure_auto_review(spec, finalize, same_provider=spec.name == current),
+            _configure_agent_models(),
+        ):
+            settings.update(extra)
+            remove.extend(extra_remove)
+    _print_settings(settings, remove)
     if first_run or _confirm(f"Save these settings to {env_file}?", default=True):
         _write_env_settings(env_file, settings, remove)
         print(f"Saved to {env_file} (no API key is written there).")
@@ -248,6 +334,36 @@ def cmd_configure(args: argparse.Namespace) -> int:
     print("Configure the review LLM (provider, models, API key).")
     _configure_interactively(Path(args.env_file).expanduser())
     print("Run ./run.sh --check to verify.")
+    return 0
+
+
+def cmd_configure_auto_review(args: argparse.Namespace) -> int:
+    if not _interactive():
+        _err(
+            "ERROR: --configure-auto-review needs an interactive terminal. In scripts, "
+            "set REVIEW_AUTO_REVIEW, REVIEW_AUTO_REVIEW_MODEL and "
+            "REVIEW_VEGA_MODEL / REVIEW_ORION_MODEL / REVIEW_NOVA_MODEL instead."
+        )
+        return 2
+    env_file = Path(args.env_file).expanduser()
+    load_dotenv(env_file)
+    try:
+        spec = get_provider(os.getenv("REVIEW_PROVIDER", ""))
+    except ValueError as exc:
+        _err(f"ERROR: {exc}")
+        return 2
+    _, finalize = resolve_review_models(spec)
+    print(f"Configure the Auto Review stage ({spec.label}, finalize model {finalize}).")
+    settings, remove = _configure_auto_review(spec, finalize, same_provider=True)
+    more, more_remove = _configure_agent_models()
+    settings.update(more)
+    remove.extend(more_remove)
+    _print_settings(settings, remove)
+    if _confirm(f"Save these settings to {env_file}?", default=True):
+        _write_env_settings(env_file, settings, remove)
+        print(f"Saved to {env_file}.")
+    else:
+        print("Not saved. Pass --auto-review-model / --no-auto-review or set the env vars.")
     return 0
 
 
@@ -293,6 +409,16 @@ def _summary_lines(config: ReviewConfig) -> list[str]:
         f"LLM explore model: {config.review_explore_model or '(not set)'}",
         f"LLM finalize model: {config.review_model or '(not set)'}",
     ]
+    if getattr(config, "review_auto_review", True):
+        lines.append(f"Auto Review prediction: on, model {role_model(config, 'auto_review') or '(not set)'}")
+    else:
+        lines.append("Auto Review prediction: off (REVIEW_AUTO_REVIEW=0)")
+    lineup = getattr(config, "expected_agent_models", None) or {}
+    if lineup:
+        lines.append(
+            "Expected agent models (unverified): "
+            + ", ".join(f"{agent}={model}" for agent, model in lineup.items())
+        )
     base_url = config.llm_base_url or spec.base_url
     if base_url:
         lines.append(f"LLM base URL: {base_url}")
@@ -360,7 +486,13 @@ def cmd_ensure_key(args: argparse.Namespace) -> int:
         return 1
     print(
         f"LLM: {spec.label} — explore={config.review_explore_model}, "
-        f"finalize={config.review_model}, key via {config.llm_api_key_source}"
+        f"finalize={config.review_model}, "
+        + (
+            f"auto_review={role_model(config, 'auto_review')}, "
+            if config.review_auto_review
+            else "auto_review=off, "
+        )
+        + f"key via {config.llm_api_key_source}"
     )
     return 0
 
@@ -410,6 +542,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Where to save REVIEW_PROVIDER / REVIEW_*MODEL (default: repo .env).",
     )
     configure.set_defaults(func=cmd_configure)
+    auto_review = sub.add_parser(
+        "configure-auto-review",
+        help="Interactive Auto Review settings: on/off, model, expected agent models.",
+    )
+    auto_review.add_argument(
+        "--env-file",
+        default=str(REPO_ROOT / ".env"),
+        help="Where to save REVIEW_AUTO_REVIEW* and REVIEW_<AGENT>_MODEL (default: repo .env).",
+    )
+    auto_review.set_defaults(func=cmd_configure_auto_review)
     onboard = sub.add_parser(
         "onboard", help="First run: interactive setup when no API key is configured."
     )

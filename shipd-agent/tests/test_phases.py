@@ -10,6 +10,7 @@ from pathlib import Path
 from review.review_phases import (
     _check_patch_apply,
     _validate_junit_xml,
+    flakiness_finding,
     run_phase0,
     run_phase0_fast,
     run_phase0_tests,
@@ -230,6 +231,75 @@ exit 0
         self.assertEqual(result.status, "PASS")
         self.assertIn("test.sh runs", result.phase0_log)
         self.assertIn("Docker test.sh base/new contract verified", result.summary)
+
+    def test_flakiness_repeats_zero_skips_the_extra_runs(self) -> None:
+        log, findings, critical = run_phase0_tests(
+            self.repo,
+            artifacts=self.artifacts,
+            timeout=30,
+            force_host_tests=True,
+            flakiness_repeats=0,
+        )
+        self.assertFalse(critical)
+        self.assertEqual(findings, [])
+        self.assertNotIn("Flakiness", log)
+
+    def test_changed_exit_code_is_a_blocker(self) -> None:
+        self.assertIsNone(flakiness_finding([0, 0, 0], [1, 1, 1]))
+        finding = flakiness_finding([0, 1], [1, 1])
+        self.assertIsNotNone(finding)
+        assert finding is not None
+        self.assertEqual(finding.finding, "Tests are flaky")
+        self.assertEqual(finding.severity, "BLOCKER")
+
+    def test_injected_runner_flags_a_changed_outcome(self) -> None:
+        class Runner:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def run_test_sh(self, test_sh_rel, mode, output_path, *, timeout):
+                self.calls += 1
+                output_path.write_text(
+                    '<?xml version="1.0"?><testsuite name="t" tests="1" failures="0"/>',
+                    encoding="utf-8",
+                )
+                # Contract: base pass, new fail, then both pass with the solution.
+                if self.calls <= 4:
+                    return (1, "new fails") if self.calls == 2 else (0, "ok")
+                if mode == "base" and self.calls == 6:
+                    return 1, "clean run changed"
+                return 0, "stable"
+
+        _, findings, critical = run_phase0_tests(
+            self.repo,
+            artifacts=self.artifacts,
+            timeout=30,
+            test_runner=Runner(),
+            flakiness_repeats=2,
+        )
+        self.assertTrue(critical)
+        self.assertTrue(any(f.finding == "Tests are flaky" for f in findings))
+
+    def test_repeat_results_are_compared_with_the_initial_contract_run(self) -> None:
+        class Runner:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def run_test_sh(self, test_sh_rel, mode, output_path, *, timeout):
+                self.calls += 1
+                _minimal_junit(output_path)
+                if self.calls <= 4:
+                    return (1 if self.calls == 2 else 0), "contract"
+                # Both repeat groups are internally stable, but have changed
+                # from the initial base=0/new=1 contract.
+                return (1 if mode == "base" else 0), "changed"
+
+        _, findings, critical = run_phase0_tests(
+            self.repo, artifacts=self.artifacts, test_runner=Runner(),
+            flakiness_repeats=2,
+        )
+        self.assertTrue(critical)
+        self.assertTrue(any(f.finding == "Tests are flaky" for f in findings))
 
     def test_run_phase0_fast_skips_tests(self) -> None:
         result = run_phase0(self.repo, run_tests=False)

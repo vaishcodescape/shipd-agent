@@ -27,7 +27,7 @@ from review.llm_providers import (
 if TYPE_CHECKING:
     from review.config import ReviewConfig
 
-Role = Literal["explore", "finalize"]
+Role = Literal["explore", "finalize", "auto_review"]
 
 CONFIGURE_HINT = "run ./run.sh --configure-llm"
 
@@ -81,12 +81,21 @@ def llm_config_error(config: ReviewConfig) -> str | None:
 
 
 def role_model(config: ReviewConfig, role: Role) -> str:
-    return config.review_explore_model if role == "explore" else config.review_model
+    if role == "explore":
+        return config.review_explore_model
+    if role == "auto_review":
+        return getattr(config, "review_auto_review_model", "") or config.review_model
+    return config.review_model
 
 
 def _max_tokens(config: ReviewConfig, role: Role) -> int:
     if role == "explore":
         return config.review_explore_max_output_tokens
+    if role == "auto_review":
+        return (
+            getattr(config, "review_auto_review_max_output_tokens", None)
+            or config.review_finalize_max_output_tokens
+        )
     return config.review_finalize_max_output_tokens
 
 
@@ -277,7 +286,10 @@ def text_content_class(base: Any) -> Any:
 def _build_chat_model(config: ReviewConfig, spec: ProviderSpec, role: Role) -> Any:
     model = role_model(config, role)
     if not model:
-        env_name = "REVIEW_EXPLORE_MODEL" if role == "explore" else "REVIEW_MODEL"
+        env_name = {
+            "explore": "REVIEW_EXPLORE_MODEL",
+            "auto_review": "REVIEW_AUTO_REVIEW_MODEL",
+        }.get(role, "REVIEW_MODEL")
         raise LLMConfigError(
             f"No {role} model configured for {spec.label}: set {env_name} "
             f"or {CONFIGURE_HINT}."
@@ -432,5 +444,6 @@ def describe_llm(config: ReviewConfig) -> str:
     spec = get_provider(config.llm_provider)
     return (
         f"provider={spec.name}, explore={config.review_explore_model}, "
-        f"finalize={config.review_model}"
+        f"finalize={config.review_model}, "
+        f"auto_review={role_model(config, 'auto_review')}"
     )

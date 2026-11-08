@@ -151,8 +151,8 @@ Review from the **problem description alone** — not reverse-engineered from te
 
 - Meets **all** stated requirements; no irrelevant edits; doesn't break existing code (Phase 0 `base` + reasoning).
 - Follows repo patterns; no AI slop; no code smells.
-- **LOC discipline:** estimate substantive solution LOC (exclude blanks, dead code, doc inflation, unrelated churn). Compare to **median agent solution LOC** when agent data exists — user solution should meet requirements without bloat or suspicious minimalism. Flag LOC bumps from reordering, irrelevant refactors, or filler.
-- **Olympus long-horizon:** effective solution LOC should be **≥ 400** substantive lines. Below 400 but ≥ 100 → Mars fit (`downgrade_to_mars`).
+- **LOC discipline:** estimate substantive solution LOC (exclude blanks, dead code, doc inflation, unrelated churn). Flag LOC bumps from reordering, irrelevant refactors, or filler. Do not downgrade Olympus because of LOC.
+- **Olympus:** there is **no solution-LOC floor**. Long horizon is Nova's average sequence length, not a line count.
 - **Mars minimum scope:** effective solution LOC should be **≥ 100** substantive lines; flag bloat above **600**.
 - Hardcoded / test-fit values vs general solution.
 - Security & robustness at boundaries.
@@ -163,17 +163,19 @@ Review from the **problem description alone** — not reverse-engineered from te
 
 ## Phase 5 — Agent runs & solvability
 
-When agent run data is available (pass/fail, diffs, failure reasons, LOC):
+When agent run data is available (pass/fail, diffs, failure reasons, sequence length):
 
-- **Required runs:** **Nova, Vega, and Orion** each run **four times** (12 runs) before approval.
-- **Pass bar:** exactly **one** of the 12 runs passes — one agent type with a single passing run. **0 passes** → unsolvable or unfair (localise the cause); **2+ passes** (same agent or across agents) → too easy.
-- **Scope medians (successful runs):** Olympus long-horizon — ≥ **3** files, ≥ **80** messages, ≥ **400** LOC; Mars minimum — ≥ **100** LOC median.
+- **Required runs:** **Nova, Vega, and Orion** each need **at least 4 finished unhinted runs**. More than 4 is allowed. Hinted runs never count.
+- **Pass bar:** exactly **one** model solves the task, at a rate **above 0% and at most 25%**. The other two stay at 0%. Zero solvers → unsolvable or unfair. Two solvers, or one solver above 25%, → too easy.
+- **Nova-only solve:** warning, not a failure, until Shipd settles a docs conflict. The criteria panel allows any one model; The Process says an unhinted Nova solve is too easy.
+- **Olympus long horizon:** Nova's average **sequence length above 400,000 tokens** (the run's largest request plus tokens the harness compacted or trimmed). A generic token count is not this metric. Averages above 400,000 raise the scope share of the reward through 500,000. That cap is not a second fail line.
+- **Mars:** median successful runs ≥ **100** LOC. Olympus does not use file, message, or LOC medians.
+- **Integrity, when the page shows it:** cheat rate below 20%; no run flagged unfair or broken; no run blocked by the environment or verifier. A missing flag is unverified, not a pass.
+- **False positives:** a passing run whose patch is on the page must really solve the task. One false pass fails. No patch on the page is a skip, not a pass.
 - **Do not trust pass/fail alone** — inspect diffs and failure reasons.
-- Passing agents → task may be solvable; also check for **weak tests** if short/incomplete solutions pass.
-- Failing agents → confirm failures are **fair** (expose ambiguous prompt or unfair tests vs trickery).
-- Compare user solution LOC to median agent LOC; flag mismatch with evidence.
-- For **Olympus:** `solvability_ok` — the one required passing run shows an agent could solve it; 0 passes may be one ambiguous sentence or one unfair test — localise which.
-- If no agent data → `SKIP` phase; note in `internal_notes`; do not assume solvability either way.
+- For **Olympus:** `solvability_ok` when one model solves it inside the rate cap and the Nova sequence bar is met.
+- If the panel has no per-agent counts, or Olympus has no labeled sequence length → `SKIP`. Do not turn that into a PASS.
+- Expected models (not published, never a pass/fail fact): Vega ≈ Opus 5.5 (xhigh), Orion ≈ Sol 6.1 (xhigh), Nova ≈ Gemini 4 Argon.
 
 ---
 
@@ -186,6 +188,17 @@ When agent run data is available (pass/fail, diffs, failure reasons, LOC):
 
 ---
 
+## Auto Review (prediction)
+
+Shipd's Auto Review is the last stage. It reviews the task, tests, solution, and agent runs together, and its criteria are not published. This agent predicts it in a separate stage that runs after the final scorer. Do not emit the `auto_review` phase in the scored review; that stage fills it in.
+
+- It reads the draft review, earlier findings, the prompt, `test.patch`, `solution.patch`, the agent runs, and the expected agent line-up.
+- **MAJOR** only for a concrete, cited disagreement among the parts: the prompt promises behavior no test checks, tests pin details the prompt never states, the solution does more or less than asked, or runs contradict the claimed difficulty. A MAJOR makes `auto_review` **FAIL**, which blocks `approve`.
+- Everything speculative is **QUESTION** and does not fail the stage. A model error or a disabled stage is **SKIP**, not a coverage gap.
+- Every finding and summary is labeled "Auto Review prediction" and is not Shipd's verdict. Do not invent the 7-criterion Task Quality rubric.
+
+---
+
 ## Mode-specific fields
 
 **Same decision posture on Mars and Olympus:** `request_changes` default for fixable issues; `reject` extreme only.
@@ -193,13 +206,13 @@ When agent run data is available (pass/fail, diffs, failure reasons, LOC):
 ### Olympus
 
 - Set `repo_eligible` and `solvability_ok` (boolean).
-- Long-horizon scope: effective solution LOC **≥ 400**; agent medians **≥ 3** files, **≥ 80** messages, **≥ 400** LOC; Nova/Vega/Orion **× 4** runs with **exactly one** pass.
+- Long horizon: Nova average sequence length **above 400,000** tokens. Nova, Vega, and Orion each have **at least 4** unhinted runs. One model only, above 0% and at most 25%. No solution-LOC floor.
 - Ineligible repo or solvability concerns → usually **`request_changes`**, not `reject`, unless wrong repo entirely.
 
 ### Mars
 
 - Set `quality` (1–3) and `difficulty` (1–3; usually 2, rarely 3).
-- Minimum scope: median successful agent runs **≥ 100** LOC; Nova/Vega/Orion **× 4** runs with **exactly one** pass.
+- Minimum scope: median successful agent runs **≥ 100** LOC. Nova, Vega, and Orion each have **at least 4** unhinted runs. One model only, above 0% and at most 25%.
 - Weight code quality heavily. Low ratings → **`request_changes`** with clear fixes, not `reject`, unless extreme.
 
 ---
