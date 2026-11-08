@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shipd-agent"
-version = "0.1.0"
+version = "2.0.0"
 description = "Autonomous Shipd.ai Olympus/Mars review automation"
 readme = "README.md"
 license = "MIT"
