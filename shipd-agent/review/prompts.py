@@ -15,14 +15,12 @@ from review.rubric_defaults import (
     MARS_MIN_MEDIAN_LOC,
     MAX_PROMPT_REQUIREMENTS,
     MAX_PROMPT_WORDS,
+    MAX_CHEAT_RATE,
+    NOVA_MIN_AVG_SEQUENCE_TOKENS,
     OLYMPUS_MIN_EFFECTIVE_LOC,
-    OLYMPUS_MIN_MEDIAN_FILES,
-    OLYMPUS_MIN_MEDIAN_LOC,
-    OLYMPUS_MIN_MEDIAN_MESSAGES,
+    NOVA_PAYOUT_SEQUENCE_CAP,
     PHASE0_PASS_CRITERIA,
     PROMPT_THRESHOLDS_PROMPT,
-    REQUIRED_AGENT_RUNS,
-    REQUIRED_PASSING_RUNS,
     RUNS_PER_AGENT_TYPE,
 )
 
@@ -41,8 +39,8 @@ Work through rubric phases **in order** (0 through 6):
 | 1 | Problem description quality (concise, no AI slop, repo fit, duplicates; ≤ {MAX_PROMPT_WORDS:,} words; not Too Many Requirements) |
 | 2 | Dockerfile & test.sh harness (minimal Dockerfile, base/new split) |
 | 3 | Test quality (coverage, determinism, behaviour not implementation, no network) |
-| 4 | Solution & code quality (requirements, repo patterns, LOC discipline — approve min band {APPROVE_MIN_BAND_SCORE}; see LOC thresholds below) |
-| 5 | Agent runs & solvability ({_AGENT_TYPES_TEXT} × {RUNS_PER_AGENT_TYPE} runs each, exactly {REQUIRED_PASSING_RUNS} passing run; use agent_runs + Holistic AI Check; SKIP if not available) |
+| 4 | Solution & code quality (requirements, repo patterns, LOC discipline — approve min band {APPROVE_MIN_BAND_SCORE}; Olympus has no LOC floor) |
+| 5 | Agent runs & solvability ({_AGENT_TYPES_TEXT} need at least {RUNS_PER_AGENT_TYPE} finished unhinted runs each; one model only, above 0% and at most 25%; Olympus long horizon is Nova average sequence length above {NOVA_MIN_AVG_SEQUENCE_TOKENS:,} tokens; SKIP if the panel is missing) |
 | 6 | Holistic / platform (related submissions, Holistic AI Check fairness notes, Mars vs Olympus fit, eligibility) |
 
 Band scores (0–3): {_BAND_SCORE_GUIDE}
@@ -68,9 +66,7 @@ Rules:
 - **LOC discipline (Phase 4):** deterministic effective LOC is computed at review start from `solution.patch`.
   Compare against quest thresholds. Do not contradict the precomputed `loc_analysis` unless you re-run
   `compute_effective_loc` and find an error.
-- **Olympus downgrade:** when effective LOC is below the Olympus long-horizon minimum (≥ 400)
-  but meets Mars minimum scope (≥ 100), recommend `downgrade_to_mars: true` and note Mars fit
-  in `other_notes` / contributor feedback.
+- **Olympus downgrade:** do not set `downgrade_to_mars` because of solution LOC. Olympus has no LOC floor. A LOC-only downgrade is cleared.
 - Stay within the tool budget — finish with a summary once key artifacts are inspected.
 
 When done, end with a structured summary:
@@ -137,20 +133,18 @@ def build_unified_review_user_prompt(
 ) -> str:
     holistic_section = holistic_check or _HOLISTIC_UNAVAILABLE
     loc_section = loc_analysis.strip() or "LOC analysis not yet run."
+    del olympus_min_loc  # kept for callers; Olympus no longer has a LOC floor
     loc_thresholds = LOC_THRESHOLDS_PROMPT.format(
-        olympus_min=olympus_min_loc,
         mars_min=mars_min_loc,
         mars_max=mars_max_loc,
     )
     agent_thresholds = AGENT_RUN_THRESHOLDS_PROMPT.format(
         agent_types=_AGENT_TYPES_TEXT,
         runs_per_agent=RUNS_PER_AGENT_TYPE,
-        required_runs=REQUIRED_AGENT_RUNS,
-        required_passes=REQUIRED_PASSING_RUNS,
-        olympus_median_files=OLYMPUS_MIN_MEDIAN_FILES,
-        olympus_median_messages=OLYMPUS_MIN_MEDIAN_MESSAGES,
-        olympus_median_loc=OLYMPUS_MIN_MEDIAN_LOC,
+        nova_min_sequence=f"{NOVA_MIN_AVG_SEQUENCE_TOKENS:,}",
+        nova_payout_cap=f"{NOVA_PAYOUT_SEQUENCE_CAP:,}",
         mars_median_loc=MARS_MIN_MEDIAN_LOC,
+        max_cheat_pct=MAX_CHEAT_RATE * 100,
     )
     prompt_section = prompt_analysis.strip() or "Task prompt checks not yet run."
     prompt_thresholds = PROMPT_THRESHOLDS_PROMPT.format(
@@ -232,14 +226,21 @@ FINALIZE_PHASE_INSTRUCTIONS = f"""
 
 **Effective LOC (Phase 4 — deterministic):**
 - `loc_analysis` and `loc_info` are precomputed from `solution.patch` at review start.
-- Thresholds: Olympus long-horizon minimum {OLYMPUS_MIN_EFFECTIVE_LOC} substantive LOC;
-  Mars minimum {MARS_MIN_EFFECTIVE_LOC}, maximum {MARS_MAX_EFFECTIVE_LOC}.
+- Olympus has no solution-LOC floor. Do not set `downgrade_to_mars` from LOC.
+- Mars minimum {MARS_MIN_EFFECTIVE_LOC}, maximum {MARS_MAX_EFFECTIVE_LOC}.
 - Populate `loc_analysis` with the precomputed summary unless you re-ran `compute_effective_loc`.
-- For **Olympus** quest: set `downgrade_to_mars: true` when effective LOC is below the Olympus
-  minimum but at least Mars minimum; `false` when ≥ Olympus minimum; do not downgrade when below
-  Mars minimum.
-- Phase `"4"` status from deterministic LOC check is authoritative for LOC limits; incorporate
-  your code-quality findings into phase 4 summary and solution band without reversing LOC PASS/FAIL.
+- Phase `"4"` status from the deterministic LOC check is authoritative for Mars size limits.
+
+**Agent runs (Phase 5 — platform bars):**
+- {_AGENT_TYPES_TEXT} need at least {RUNS_PER_AGENT_TYPE} finished unhinted runs each.
+  More than {RUNS_PER_AGENT_TYPE} is allowed. Hinted runs never count.
+- Exactly one model solves the task, at a rate above 0% and at most 25%. The other two stay at 0%.
+- A Nova-only solve is a warning, not a failure, until Shipd settles a docs conflict.
+- Olympus long horizon: Nova average sequence length above {NOVA_MIN_AVG_SEQUENCE_TOKENS:,} tokens.
+- Mars: median successful runs ≥ {MARS_MIN_MEDIAN_LOC} LOC.
+- Missing per-agent counts or an unlabeled sequence length are not a pass.
+- Deterministic phase 5 checks run when agent run data is scraped. Do not reverse a FAIL.
+  A SKIP means the bar was not on the page; do not turn it into a PASS.
 
 **Task prompt (Phase 1 — platform bars):**
 - At most {MAX_PROMPT_WORDS:,} words.
@@ -248,15 +249,6 @@ FINALIZE_PHASE_INSTRUCTIONS = f"""
 - `prompt_analysis` holds the deterministic word count, requirement estimate, and any Shipd flag.
   A deterministic phase 1 FAIL is authoritative; fold your clarity / AI-slop / repo-fit judgement
   into the phase 1 summary and problem band without reversing it.
-
-**Agent runs (Phase 5 — platform bars):**
-- {_AGENT_TYPES_TEXT} must each run {RUNS_PER_AGENT_TYPE} times ({REQUIRED_AGENT_RUNS} runs total).
-- Exactly {REQUIRED_PASSING_RUNS} run must pass, so the passing run belongs to a single agent type;
-  0 passes → unsolvable or unfair, more → too easy.
-- Olympus: median successful runs ≥ {OLYMPUS_MIN_MEDIAN_FILES} files, ≥ {OLYMPUS_MIN_MEDIAN_MESSAGES:.0f} messages, ≥ {OLYMPUS_MIN_MEDIAN_LOC} LOC.
-- Mars: median successful runs ≥ {MARS_MIN_MEDIAN_LOC} LOC.
-- Deterministic phase 5 checks run when agent run data is scraped; incorporate without reversing
-  PASS/FAIL unless you have contradictory evidence.
 
 **Shipd page context (when provided):**
 - `agent_run_notes` ← agent runs scrape (per-agent pass counts, failure patterns, LOC hints).

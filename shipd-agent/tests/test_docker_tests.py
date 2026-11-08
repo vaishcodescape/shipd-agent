@@ -210,5 +210,72 @@ class Phase0DockerIntegrationTests(unittest.TestCase):
             )
 
 
+class DockerfileRuleTests(unittest.TestCase):
+    def test_pinned_accepted_image_passes(self) -> None:
+        from review.harness_checks import evaluate_dockerfile
+
+        text = """
+FROM python:3.12
+WORKDIR /app
+RUN useradd -m -u 1000 model
+USER model
+ENTRYPOINT ["bash"]
+""".strip()
+        self.assertEqual(evaluate_dockerfile(text), [])
+
+    def test_unpinned_base_tests_and_user_fail(self) -> None:
+        from review.harness_checks import evaluate_dockerfile, evaluate_python_install, evaluate_test_harness
+
+        text = """
+FROM ubuntu
+WORKDIR /tmp
+RUN pytest
+RUN pip install requests
+ENTRYPOINT ["python", "app.py"]
+""".strip()
+        names = [item.finding for item in evaluate_dockerfile(text)]
+        for title in (
+            "Dockerfile base image is not a pinned accepted image",
+            "Dockerfile workdir is not /app",
+            "Dockerfile runs tests during the build",
+            "Dockerfile installs an unpinned package",
+            "Dockerfile does not run as model:1000",
+            "Dockerfile entrypoint is not an interactive shell",
+        ):
+            self.assertIn(title, names)
+
+        install = evaluate_python_install("RUN pip install /app\n", "")
+        self.assertEqual(
+            install[0].finding,
+            "Python install is not editable and the prompt does not say how tests run",
+        )
+        self.assertEqual(evaluate_python_install("RUN pip install /app\n", "Run the tests with pytest."), [])
+
+        harness = evaluate_test_harness(
+            "#!/bin/sh\npip install pytest\npytest -x --tb=no\n",
+            executable=False,
+            test_patch=(
+                "+++ b/src/app.py\n+print('solve')\n"
+                "+++ b/check.py\n+assert result == '" + ("x" * 130) + "'\n"
+                "+++ b/tests/odd_case.py\n+# datacurve\n+assert True\n"
+            ),
+            solution_patch="+++ b/src/app.py\n+print('solve')\n",
+        )
+        harness_names = [item.finding for item in harness]
+        for title in (
+            "test.sh has no base mode",
+            "test.sh has no new mode",
+            "test.sh is not executable",
+            "test.sh installs packages",
+            "Test patch contains a banned marker",
+            "Tests use a fail-fast flag",
+            "Tests hide failure diagnostics",
+            "Tests pin an oversized expected output",
+            "Test file name is not predictable",
+            "Test patch contains solution code",
+        ):
+            self.assertIn(title, harness_names)
+
+
 if __name__ == "__main__":
     unittest.main()

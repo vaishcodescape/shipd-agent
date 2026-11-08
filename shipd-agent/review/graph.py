@@ -90,6 +90,8 @@ class ReviewState(TypedDict, total=False):
     loc_info: dict
     loc_analysis: str
     prompt_analysis: str
+    prompt_body: str
+    repo_check_notes: str
     review_result: dict
     error: str
 
@@ -146,6 +148,7 @@ _PHASE_LABELS: dict[str, str] = {
     "4": "solution / LOC",
     "5": "agent runs",
     "6": "platform / related",
+    "auto_review": "Auto Review (prediction)",
 }
 
 # Phases always evaluable from the cloned repo (their artifacts are local).
@@ -187,6 +190,9 @@ def scrape_node(state: ReviewState) -> dict:
                     "holistic_check_reviewer_notes", ""
                 ),
                 "holistic_check_raw": ctx.get("holistic_check_raw", ""),
+                "submission_criteria": ctx.get("submission_criteria", ""),
+                "auto_review_panel": ctx.get("auto_review_panel", ""),
+                "fp_check_panel": ctx.get("fp_check_panel", ""),
             },
         }
         out.update(
@@ -212,18 +218,58 @@ def scrape_node(state: ReviewState) -> dict:
     }
 
 
+def _agent_run_kwargs(state: ReviewState) -> dict[str, Any]:
+    config = state.get("config")
+    if config is None:
+        return {}
+    kwargs: dict[str, Any] = {}
+    for name in (
+        "min_unhinted_runs",
+        "max_solve_rate",
+        "nova_min_sequence_tokens",
+        "nova_payout_sequence_cap",
+        "max_cheat_rate",
+    ):
+        value = getattr(config, name, None)
+        if value is not None:
+            kwargs[name] = value
+    return kwargs
+
+
 def _run_agent_runs_analysis(state: ReviewState) -> dict:
-    """Run deterministic Phase 5 agent run platform checks when scraped."""
+    """Run deterministic Phase 5 checks, including the local false-positive pass."""
+    from review.fp_check import evaluate_false_positives
+
     quest = state.get("quest", "olympus")
     agent_runs_data = state.get("agent_runs_data") or {}
     phase5_result, phase5_findings = evaluate_agent_runs_phase5(
         agent_runs_data,
         quest=quest,
+        **_agent_run_kwargs(state),
     )
-    if phase5_result.status == "SKIP":
+    if phase5_result.status == "SKIP" and "manual phase 5" in phase5_result.summary:
         # Nothing measurable — leave phase 5 to the reviewer instead of
         # stamping a deterministic verdict over it.
         return {}
+
+    fp_result, fp_findings = evaluate_false_positives(agent_runs_data)
+    phase5_findings = [*phase5_findings, *fp_findings]
+    if fp_result.status == "FAIL":
+        phase5_result = PhaseResult(
+            status="FAIL",
+            summary=f"{phase5_result.summary} {fp_result.summary}".strip(),
+        )
+    elif fp_result.status == "SKIP" and phase5_result.status == "PASS":
+        phase5_result = PhaseResult(
+            status="PASS",
+            summary=f"{phase5_result.summary} {fp_result.summary}".strip(),
+        )
+    elif fp_result.status == "PASS" and phase5_result.status == "PASS":
+        phase5_result = PhaseResult(
+            status="PASS",
+            summary=f"{phase5_result.summary} {fp_result.summary}".strip(),
+        )
+
     phase_results = dict(state.get("phase_results", {}))
     phase_results["5"] = phase5_result.model_dump()
     findings = list(state.get("findings", []))
@@ -245,7 +291,10 @@ def _run_prompt_analysis(state: ReviewState) -> dict:
         "max_words": config.max_prompt_words,
         "max_requirements": config.max_prompt_requirements,
     }
-    out: dict[str, Any] = {"prompt_analysis": format_prompt_analysis(analysis, **limits)}
+    out: dict[str, Any] = {
+        "prompt_analysis": format_prompt_analysis(analysis, **limits),
+        "prompt_body": analysis.body,
+    }
     phase1_result, phase1_findings = evaluate_prompt_phase1(analysis, **limits)
     if phase1_result is not None:
         phase_results = dict(state.get("phase_results", {}))
@@ -254,6 +303,44 @@ def _run_prompt_analysis(state: ReviewState) -> dict:
         findings.extend(f.model_dump() for f in phase1_findings)
         out.update({"phase_results": phase_results, "findings": findings})
     return out
+
+
+def _run_static_checks(state: ReviewState) -> dict:
+    """Dockerfile, test-patch, and repo checks that do not need the model."""
+    from pathlib import Path
+
+    from review.harness_checks import evaluate_harness
+    from review.repo_checks import evaluate_repo
+
+    repo_path = Path(state["repo_path"])
+    prompt = str(state.get("prompt_body") or "")
+    harness = evaluate_harness(repo_path, prompt=prompt)
+    repo_phase, repo_findings = evaluate_repo(repo_path)
+    findings = list(state.get("findings", []))
+    phase_results = dict(state.get("phase_results", {}))
+    for finding in harness:
+        findings.append(finding.model_dump())
+    for phase in ("2", "3"):
+        phase_findings = [item for item in harness if item.phase == phase and item.severity in {"BLOCKER", "MAJOR"}]
+        if phase_findings:
+            phase_results[phase] = {
+                "status": "FAIL",
+                "summary": "Harness prechecks failed: "
+                + "; ".join(item.finding for item in phase_findings),
+            }
+    if repo_phase.status == "FAIL":
+        phase_results["6"] = repo_phase.model_dump()
+        findings.extend(item.model_dump() for item in repo_findings)
+    elif repo_phase.status == "SKIP":
+        notes = str(state.get("repo_check_notes") or "")
+        state_note = repo_phase.summary
+        if state_note not in notes:
+            return {
+                "phase_results": phase_results,
+                "findings": findings,
+                "repo_check_notes": state_note,
+            }
+    return {"phase_results": phase_results, "findings": findings}
 
 
 def _run_loc_analysis(state: ReviewState) -> dict:
@@ -308,6 +395,9 @@ def _run_phase0_into_state(state: ReviewState) -> dict:
             run_tests=config.review_phase0 != "fast",
             test_timeout=config.review_phase0_test_timeout,
             build_timeout=config.review_phase0_docker_build_timeout,
+            flakiness_repeats=config.flakiness_repeats
+            if config.flakiness_repeats is not None
+            else 6,
         )
     log_activity(
         f"Phase 0 result: {phase0.status} — {phase0.summary}", category="phase0"
@@ -328,6 +418,7 @@ def _run_phase0_into_state(state: ReviewState) -> dict:
     }
     out.update(_run_loc_analysis({**state, **out}))
     out.update(_run_prompt_analysis({**state, **out}))
+    out.update(_run_static_checks({**state, **out}))
     return out
 
 
@@ -609,6 +700,7 @@ def finalize_node(state: ReviewState) -> dict:
         "Evaluate all rubric phases 0–6 and output structured ReviewResult fields.\n"
         "Structured review_evidence contains validated source citations and phase reports. "
         "Use these reports for scoring; do not invent findings or treat prose as coverage.\n"
+        "Do not emit an auto_review phase; a later stage fills it in.\n"
         f"--- rubric excerpt ---\n{rubric}"
     )
     log_activity(
@@ -780,6 +872,26 @@ def finalize_node(state: ReviewState) -> dict:
             *[Finding(**f) for f in phase1_findings],
         ]
 
+    for phase_key in ("2", "3", "6"):
+        deterministic = state.get("phase_results", {}).get(phase_key)
+        if not deterministic or deterministic.get("status") != "FAIL":
+            continue
+        merged_phases = dict(loc_updates.get("phase_results", review.phase_results))
+        merged_phases[phase_key] = PhaseResult(**deterministic)
+        loc_updates["phase_results"] = merged_phases
+        extra = [
+            f for f in state.get("findings", [])
+            if isinstance(f, dict)
+            and f.get("phase") == phase_key
+            and (phase_key, f.get("finding", "")) not in existing_finding_keys
+        ]
+        if extra:
+            base_findings = loc_updates.get("findings", review.findings)
+            loc_updates["findings"] = [
+                *base_findings,
+                *[Finding(**f) for f in extra],
+            ]
+
     if loc_updates:
         review = review.model_copy(update=loc_updates)
 
@@ -900,6 +1012,20 @@ def _with_review_audit(result: dict, state: ReviewState) -> dict:
         result["review_evidence"] = state["review_evidence"]
     if state.get("review_budget") is not None:
         result["review_usage"] = state["review_budget"].snapshot()
+    repo = state.get("repo_path")
+    if repo:
+        from pathlib import Path
+
+        from review.staleness import content_fingerprint, staleness_note
+
+        config = state.get("config")
+        lineup = getattr(config, "expected_agent_models", None)
+        fingerprint = content_fingerprint(Path(repo), agent_lineup=lineup)
+        result["submission_fingerprint"] = fingerprint
+        note = staleness_note(Path(repo), fingerprint)
+        if note:
+            internal = str(result.get("internal_notes") or "").strip()
+            result["internal_notes"] = f"{internal}\n{note}".strip() if internal else note
     return result
 
 
@@ -926,7 +1052,8 @@ def _apply_evidence_reports(review: ReviewResult, state: ReviewState) -> ReviewR
                 evidence=evidence, suggested_fix=finding.get("suggested_fix", ""),
             ))
     for phase, deterministic in state.get("phase_results", {}).items():
-        if phase == "0" or deterministic.get("status") == "FAIL":
+        status = deterministic.get("status") if isinstance(deterministic, dict) else None
+        if phase in {"0", "auto_review"} or status == "FAIL" or (phase == "5" and status == "SKIP"):
             phases[phase] = PhaseResult.model_validate(deterministic)
     unique: dict[tuple[str, str], Finding] = {}
     severity_rank = {"BLOCKER": 4, "MAJOR": 3, "MINOR": 2, "QUESTION": 1}
@@ -1093,17 +1220,85 @@ def _fallback_result(state: ReviewState, reason: str) -> dict:
     return _with_review_audit(mark_review_incomplete(result.to_submit_dict(), error=reason), state)
 
 
+def auto_review_node(state: ReviewState) -> dict:
+    """Last stage: predict Auto Review from the submission as a whole."""
+    from pathlib import Path
+
+    from review.auto_review import PHASE_KEY, run_auto_review
+    from review.llm import role_model
+
+    raw = state.get("review_result")
+    config = state.get("config")
+    if not raw or config is None or config.review_dry_run:
+        return {}
+    if not getattr(config, "review_auto_review", True):
+        return {}
+    # A provider failure leaves the review incomplete. Do not replace that
+    # result with a prediction. Phase failures still reach this node, because
+    # finalize marks those reviews complete.
+    if raw.get("review_complete") is False:
+        return {}
+
+    scrape = state.get("scrape_context") or {}
+    log_activity(
+        f"auto review: predicting with {role_model(config, 'auto_review')}",
+        category="review",
+    )
+    phase, findings = run_auto_review(
+        config=config,
+        repo_path=Path(state["repo_path"]),
+        draft=raw,
+        quest=state.get("quest", "olympus"),
+        prompt_analysis=str(state.get("prompt_analysis") or ""),
+        agent_runs=str(scrape.get("agent_runs") or ""),
+        platform_panel=str(scrape.get("auto_review_panel") or ""),
+        budget=state.get("review_budget"),
+    )
+    log_activity(f"auto review: {phase.status}", category="review")
+
+    review = ReviewResult.model_validate(raw)
+    phases = dict(review.phase_results)
+    phases[PHASE_KEY] = phase
+    merged = list(review.findings)
+    seen = {(item.phase, item.finding) for item in merged}
+    for finding in findings:
+        if (finding.phase, finding.finding) not in seen:
+            merged.append(finding)
+    updates: dict[str, Any] = {"phase_results": phases, "findings": merged}
+    if phase.status == "FAIL":
+        feedback = review.contributor_feedback.strip()
+        line = (
+            "Predicted Auto Review issues are listed as \"Auto Review prediction\" "
+            "findings. They are a prediction, not Shipd's Auto Review verdict."
+        )
+        if line not in feedback:
+            updates["contributor_feedback"] = f"{feedback}\n{line}".strip()
+    review = review.model_copy(update=updates)
+    # This stage runs after scoring, so its findings have no earlier ledger
+    # report. Keep them in authoritative state for validate's reconciliation.
+    return {
+        "review_result": {**raw, **review.to_submit_dict()},
+        "phase_results": {**state.get("phase_results", {}), PHASE_KEY: phase.model_dump()},
+        "findings": [
+            *[f for f in state.get("findings", []) if f.get("phase") != PHASE_KEY],
+            *[f.model_dump() for f in findings],
+        ],
+    }
+
+
 def build_review_graph():
     graph = StateGraph(ReviewState)
     graph.add_node("scrape", scrape_node)
     graph.add_node("unified_review", unified_review_node)
     graph.add_node("finalize", finalize_node)
+    graph.add_node("auto_review", auto_review_node)
     graph.add_node("validate", validate_node)
 
     graph.add_edge(START, "scrape")
     graph.add_edge("scrape", "unified_review")
     graph.add_edge("unified_review", "finalize")
-    graph.add_edge("finalize", "validate")
+    graph.add_edge("finalize", "auto_review")
+    graph.add_edge("auto_review", "validate")
     graph.add_edge("validate", END)
     return graph.compile()
 

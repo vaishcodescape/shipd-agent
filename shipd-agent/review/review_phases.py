@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,6 +17,7 @@ from review.docker_tests import (
     TestRunner,
     create_test_runner,
 )
+from review.rubric_defaults import FLAKINESS_REPEATS
 from review.schemas import Finding, PhaseResult
 
 DEFAULT_TEST_TIMEOUT_SEC = 600
@@ -60,18 +62,19 @@ def _check_patch_apply(repo_path: Path, rel_path: str) -> tuple[bool, str]:
     code, output = _run_git(["apply", "--check", str(patch_path)], repo_path)
     if code == 0:
         return True, f"{rel_path}: git apply --check OK"
-    if "already exists" in output.lower():
-        rev_code, rev_output = _run_git(
-            ["apply", "--check", "--reverse", str(patch_path)],
-            repo_path,
+    # Applied edits and deletions fail the forward check with different Git
+    # messages from additions. The reverse check is the evidence, not the text
+    # of Git's (potentially localized) error.
+    rev_code, rev_output = _run_git(
+        ["apply", "--check", "--reverse", str(patch_path)], repo_path,
+    )
+    if rev_code == 0:
+        return (
+            True,
+            f"{rel_path}: git apply --check OK "
+            f"(patch already applied; reverse check passed)",
         )
-        if rev_code == 0:
-            return (
-                True,
-                f"{rel_path}: git apply --check OK "
-                f"(patch already applied; reverse check passed)",
-            )
-        output = f"{output}\nreverse apply --check FAILED\n{rev_output}"
+    output = f"{output}\nreverse apply --check FAILED\n{rev_output}"
     return False, f"{rel_path}: git apply --check FAILED\n{output}"
 
 
@@ -119,12 +122,13 @@ def _validate_junit_xml(path: Path) -> tuple[bool, str]:
     if not path.is_file():
         return False, f"JUnit XML not produced: {path}"
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        root = ET.parse(path).getroot()
     except OSError as exc:
         return False, f"Cannot read JUnit XML {path}: {exc}"
-    lowered = text.lower()
-    if "testsuite" not in lowered and "testsuites" not in lowered:
-        return False, f"Invalid JUnit XML (no testsuite element): {path}"
+    except ET.ParseError as exc:
+        return False, f"Invalid JUnit XML {path}: {exc}"
+    if root.tag.rsplit("}", 1)[-1] not in {"testsuite", "testsuites"}:
+        return False, f"Invalid JUnit XML (root must be testsuite or testsuites): {path}"
     return True, f"JUnit XML OK: {path}"
 
 
@@ -187,6 +191,27 @@ def _restore_patch_state(
     return lines
 
 
+def flakiness_finding(clean_codes: list[int], patched_codes: list[int]) -> Finding | None:
+    """Fail when either suite's exit code changes across repeats."""
+    changed: list[str] = []
+    if len(set(clean_codes)) > 1:
+        changed.append(f"clean repo exits {clean_codes}")
+    if len(set(patched_codes)) > 1:
+        changed.append(f"test patch exits {patched_codes}")
+    if not changed:
+        return None
+    return Finding(
+        phase="0",
+        severity="BLOCKER",
+        finding="Tests are flaky",
+        evidence="; ".join(changed),
+        suggested_fix=(
+            "Make the clean-repo run and the test-patch run return the same result "
+            "every time. One changed exit code blocks later steps."
+        ),
+    )
+
+
 def run_phase0_tests(
     repo_path: Path,
     *,
@@ -195,6 +220,7 @@ def run_phase0_tests(
     build_timeout: int = DEFAULT_BUILD_TIMEOUT_SEC,
     test_runner: TestRunner | None = None,
     force_host_tests: bool = False,
+    flakiness_repeats: int = FLAKINESS_REPEATS,
 ) -> tuple[str, list[Finding], bool]:
     """
     Run rubric Phase 0 test.sh checks inside Docker (--network none).
@@ -467,6 +493,80 @@ def run_phase0_tests(
                 log_lines.append("\n--- With solution ---")
                 log_lines.append("  SKIPPED — solution.patch empty or missing")
 
+            if not critical_fail and flakiness_repeats > 0:
+                log_lines.append(
+                    f"\n--- Flakiness ({flakiness_repeats} clean, "
+                    f"{flakiness_repeats} with test patch) ---"
+                )
+                if has_solution and solution_rel and _is_patch_applied(repo_path, solution_rel):
+                    ok, msg = _reverse_patch(repo_path, solution_rel)
+                    log_lines.append(f"  prep (drop solution): {msg}")
+                    if not ok:
+                        critical_fail = True
+                        findings.append(
+                            Finding(
+                                phase="0",
+                                severity="BLOCKER",
+                                finding="Could not restore the clean tree for the flakiness check",
+                                evidence=msg,
+                                suggested_fix="Reset to the test patch before repeating the tests.",
+                            )
+                        )
+                if not critical_fail and test_rel and _is_patch_applied(repo_path, test_rel):
+                    test_sh_path = repo_path / test_sh_rel
+                    ok, msg = _reverse_patch(repo_path, test_rel)
+                    log_lines.append(f"  prep (clean tree): {msg}")
+                    if not ok or not test_sh_path.is_file():
+                        if not _is_patch_applied(repo_path, test_rel):
+                            restored, restore_msg = _apply_patch(repo_path, test_rel)
+                            log_lines.append(f"  prep (restore test patch): {restore_msg}")
+                            if not restored:
+                                critical_fail = True
+                        log_lines.append(
+                            "  test.sh is part of the test patch; "
+                            "clean suite is test.sh base and the test-patch suite is test.sh new."
+                        )
+                if not critical_fail:
+                    clean_codes = _repeat_mode(
+                        test_runner,
+                        test_sh_rel,
+                        "base",
+                        tmp_path / "flake-clean",
+                        repeats=flakiness_repeats,
+                        timeout=timeout,
+                    )
+                    if test_rel and not _is_patch_applied(repo_path, test_rel):
+                        ok, msg = _apply_patch(repo_path, test_rel)
+                        log_lines.append(f"  prep (test patch): {msg}")
+                        if not ok:
+                            critical_fail = True
+                            findings.append(
+                                Finding(
+                                    phase="0",
+                                    severity="BLOCKER",
+                                    finding="Could not reapply test.patch for the flakiness check",
+                                    evidence=msg,
+                                    suggested_fix="Keep test.patch applicable to the clean tree.",
+                                )
+                            )
+                    if not critical_fail:
+                        patched_codes = _repeat_mode(
+                            test_runner,
+                            test_sh_rel,
+                            "new",
+                            tmp_path / "flake-patched",
+                            repeats=flakiness_repeats,
+                            timeout=timeout,
+                        )
+                        log_lines.append(f"  clean base exits: {clean_codes}")
+                        log_lines.append(f"  test-patch new exits: {patched_codes}")
+                        flake = flakiness_finding(
+                            [base_code, *clean_codes], [new_code, *patched_codes],
+                        )
+                        if flake is not None:
+                            critical_fail = True
+                            findings.append(flake)
+
     finally:
         restore_lines = _restore_patch_state(
             repo_path,
@@ -490,6 +590,28 @@ def run_phase0_tests(
         )
 
     return "\n".join(log_lines), findings, critical_fail
+
+
+def _repeat_mode(
+    test_runner: TestRunner,
+    test_sh_rel: str,
+    mode: str,
+    directory: Path,
+    *,
+    repeats: int,
+    timeout: int,
+) -> list[int]:
+    directory.mkdir(parents=True, exist_ok=True)
+    codes: list[int] = []
+    for index in range(repeats):
+        code, _out = test_runner.run_test_sh(
+            test_sh_rel,
+            mode,
+            directory / f"{index}.xml",
+            timeout=timeout,
+        )
+        codes.append(code)
+    return codes
 
 
 def run_phase0_fast(
@@ -620,6 +742,7 @@ def run_phase0(
     build_timeout: int = DEFAULT_BUILD_TIMEOUT_SEC,
     test_runner: TestRunner | None = None,
     force_host_tests: bool = False,
+    flakiness_repeats: int = FLAKINESS_REPEATS,
 ) -> Phase0Result:
     """Run Phase 0 mechanical checks; optionally run deterministic test.sh contract."""
     result = run_phase0_fast(
@@ -653,6 +776,7 @@ def run_phase0(
         build_timeout=build_timeout,
         test_runner=test_runner,
         force_host_tests=force_host_tests,
+        flakiness_repeats=flakiness_repeats,
     )
 
     combined_log = result.phase0_log + "\n" + test_log
@@ -718,6 +842,9 @@ def ensure_all_phase_results(
             out[key] = {"status": default_status, "summary": default_summary}
         else:
             out[key] = phase_result_to_dict(item)
+    for key, item in raw.items():
+        if str(key) not in out and item is not None:
+            out[str(key)] = phase_result_to_dict(item)
     return out
 
 
@@ -752,7 +879,8 @@ def dry_run_phase_results(phase0: dict) -> dict[str, PhaseResult]:
 def any_phase_failed(phase_results: dict[str, dict | PhaseResult]) -> list[str]:
     """Return phase keys with status FAIL."""
     failed: list[str] = []
-    for key in PHASE_KEYS:
+    keys = list(PHASE_KEYS) + [key for key in phase_results if key not in PHASE_KEYS]
+    for key in keys:
         item = phase_results.get(key, {})
         if isinstance(item, PhaseResult):
             status = item.status

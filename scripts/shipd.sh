@@ -42,10 +42,13 @@ EXTRA_ARGS=()
 SHUTDOWN=0
 FRESH=0
 RESUME_BATCH=0
-# Review LLM overrides from --provider / --model / --explore-model.
+# Review LLM overrides from --provider / --model / --explore-model /
+# --auto-review-model / --no-auto-review.
 CLI_PROVIDER=""
 CLI_MODEL=""
 CLI_EXPLORE_MODEL=""
+CLI_AUTO_REVIEW_MODEL=""
+CLI_AUTO_REVIEW=""
 
 # Terminal UX state (colors/spinners when stdout is a TTY; plain otherwise).
 USE_TTY_UI=0
@@ -74,6 +77,13 @@ Review LLM (any provider):
                        provider uses that provider's default models.
   --model ID           Finalize model (overrides REVIEW_MODEL)
   --explore-model ID   Explore model (overrides REVIEW_EXPLORE_MODEL)
+
+Auto Review prediction (last stage; a concrete MAJOR blocks approve):
+  --configure-auto-review  Turn it on/off, pick its model, and edit the
+                       expected Vega/Orion/Nova model names; saves to .env
+  --auto-review-model ID   Model for this run (default: the finalize model)
+  --no-auto-review     Skip the stage for this run
+  --auto-review        Run the stage for this run even if .env turns it off
 
 Run modes:
   --once               Run exactly one review (no count prompt)
@@ -112,6 +122,8 @@ Environment:
 Examples:
   ./run.sh --setup
   ./run.sh --configure-llm             # Pick provider/models, store API key
+  ./run.sh --configure-auto-review     # Auto Review on/off, model, agent names
+  ./run.sh --once --no-submit --auto-review-model claude-sonnet-4-6
   ./run.sh --check
   ./run.sh --once --no-submit --provider openai   # One run on GPT (provider defaults)
   ./run.sh --once --no-submit          # Live review; feedback is not submitted
@@ -735,8 +747,24 @@ while [[ $# -gt 0 ]]; do
             CLI_EXPLORE_MODEL="${2:?--explore-model requires a value}"
             shift 2
             ;;
+        --auto-review-model)
+            CLI_AUTO_REVIEW_MODEL="${2:?--auto-review-model requires a value}"
+            shift 2
+            ;;
+        --auto-review)
+            CLI_AUTO_REVIEW=1
+            shift
+            ;;
+        --no-auto-review)
+            CLI_AUTO_REVIEW=0
+            shift
+            ;;
         --configure-llm)
             EXTRA_ARGS=(configure_llm)
+            shift
+            ;;
+        --configure-auto-review)
+            EXTRA_ARGS=(configure_auto_review)
             shift
             ;;
         --forget-llm-key)
@@ -873,11 +901,14 @@ apply_llm_overrides() {
         if [[ "${wanted}" != "${current}" ]]; then
             [[ -z "${CLI_MODEL}" ]] && export REVIEW_MODEL=""
             [[ -z "${CLI_EXPLORE_MODEL}" ]] && export REVIEW_EXPLORE_MODEL=""
+            [[ -z "${CLI_AUTO_REVIEW_MODEL}" ]] && export REVIEW_AUTO_REVIEW_MODEL=""
         fi
         export REVIEW_PROVIDER="${CLI_PROVIDER}"
     fi
     [[ -n "${CLI_MODEL}" ]] && export REVIEW_MODEL="${CLI_MODEL}"
     [[ -n "${CLI_EXPLORE_MODEL}" ]] && export REVIEW_EXPLORE_MODEL="${CLI_EXPLORE_MODEL}"
+    [[ -n "${CLI_AUTO_REVIEW_MODEL}" ]] && export REVIEW_AUTO_REVIEW_MODEL="${CLI_AUTO_REVIEW_MODEL}"
+    [[ -n "${CLI_AUTO_REVIEW}" ]] && export REVIEW_AUTO_REVIEW="${CLI_AUTO_REVIEW}"
     return 0
 }
 
@@ -915,7 +946,7 @@ setup_llm_on_first_run() {
     if [[ "${rc}" -eq 3 ]]; then
         # New settings were saved to .env. Drop this shell's exported copies so
         # a base URL the setup removed cannot linger, then reload them.
-        unset REVIEW_PROVIDER REVIEW_MODEL REVIEW_EXPLORE_MODEL REVIEW_LLM_BASE_URL
+        unset REVIEW_PROVIDER REVIEW_MODEL REVIEW_EXPLORE_MODEL REVIEW_LLM_BASE_URL REVIEW_AUTO_REVIEW_MODEL
         load_env_file "${ENV_FILE}"
     elif [[ "${rc}" -ne 0 ]]; then
         die "Review LLM is not set up (see above): rerun ./run.sh to try again, set the provider's API key in .env, or use --no-review (missing packages: ./run.sh --setup)"
@@ -1544,7 +1575,7 @@ main() {
                 print_version
                 exit 0
                 ;;
-            configure_llm|forget_llm_key)
+            configure_llm|configure_auto_review|forget_llm_key)
                 resolve_python
                 activate_venv
                 load_env_file "${ENV_FILE}"
@@ -1552,6 +1583,8 @@ main() {
                 if [[ "${EXTRA_ARGS[0]}" == "configure_llm" ]]; then
                     # Runs on the terminal directly: interactive prompts, hidden key input.
                     llm_tool configure --env-file "${ENV_FILE}"
+                elif [[ "${EXTRA_ARGS[0]}" == "configure_auto_review" ]]; then
+                    llm_tool configure-auto-review --env-file "${ENV_FILE}"
                 else
                     llm_tool forget
                 fi

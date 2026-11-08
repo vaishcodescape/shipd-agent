@@ -38,6 +38,14 @@ def _words(n: int) -> str:
     return " ".join(["word"] * n)
 
 
+def _paragraphs(n: int) -> str:
+    """n words split so no paragraph trips the wall-of-text flag."""
+    words = ["word"] * n
+    return "\n\n".join(
+        " ".join(words[index : index + 40]) for index in range(0, n, 40)
+    )
+
+
 class _RepoCase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -122,12 +130,12 @@ class EvaluatePromptPhase1Tests(_RepoCase):
         self.assertEqual(findings, [])
 
     def test_exactly_1000_words_passes(self) -> None:
-        _, phase, findings = self._evaluate(_words(1000))
+        _, phase, findings = self._evaluate(_paragraphs(1000))
         self.assertEqual(phase.status, "PASS")
         self.assertEqual(findings, [])
 
     def test_1001_words_fails(self) -> None:
-        _, phase, findings = self._evaluate(_words(1001))
+        _, phase, findings = self._evaluate(_paragraphs(1001))
         self.assertEqual(phase.status, "FAIL")
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0].phase, "1")
@@ -137,9 +145,11 @@ class EvaluatePromptPhase1Tests(_RepoCase):
     def test_too_many_requirements_fails(self) -> None:
         _, phase, findings = self._evaluate(SPRAWLING_PROMPT)
         self.assertEqual(phase.status, "FAIL")
-        self.assertEqual(
-            [f.finding for f in findings], ["Too many independent requirements in task prompt"]
+        self.assertIn(
+            "Too many independent requirements in task prompt",
+            [f.finding for f in findings],
         )
+        self.assertIn("Task prompt uses a bulleted requirement list", [f.finding for f in findings])
         self.assertIn("~12 independent requirements", findings[0].evidence)
 
     def test_platform_flag_fails_even_for_a_short_prompt(self) -> None:
@@ -153,12 +163,16 @@ class EvaluatePromptPhase1Tests(_RepoCase):
         _, _, findings = self._evaluate(
             SPRAWLING_PROMPT, holistic="Too Many Requirements: FAIL"
         )
-        self.assertEqual([f.finding for f in findings], ["Shipd flagged Too Many Requirements"])
+        names = [f.finding for f in findings]
+        self.assertIn("Shipd flagged Too Many Requirements", names)
+        self.assertNotIn("Too many independent requirements in task prompt", names)
         self.assertIn("~12 independent requirements", findings[0].evidence)
 
     def test_long_and_sprawling_reports_both(self) -> None:
         _, _, findings = self._evaluate(SPRAWLING_PROMPT + "\n\n" + _words(1000))
-        self.assertEqual(len(findings), 2)
+        names = [f.finding for f in findings]
+        self.assertIn("Task prompt exceeds the 1,000-word limit", names)
+        self.assertIn("Too many independent requirements in task prompt", names)
 
     def test_limits_are_configurable(self) -> None:
         _, phase, _ = self._evaluate(FOCUSED_PROMPT, max_words=10)
@@ -178,6 +192,49 @@ class EvaluatePromptPhase1Tests(_RepoCase):
         phase, findings = evaluate_prompt_phase1(analysis)
         self.assertEqual(phase.status, "FAIL")
         self.assertEqual(len(findings), 1)
+
+    def test_separate_title_counts_toward_the_word_limit(self) -> None:
+        (self.repo / "title.txt").write_text("extra title words\n", encoding="utf-8")
+        _, phase, findings = self._evaluate(_paragraphs(998))
+        self.assertEqual(phase.status, "FAIL")
+        self.assertIn("1001 words (limit 1000)", findings[0].evidence)
+
+    def test_title_already_in_the_prompt_is_not_counted_twice(self) -> None:
+        text = "Exporter title\n\n" + _paragraphs(10)
+        (self.repo / "title.txt").write_text("Exporter title\n", encoding="utf-8")
+        analysis, phase, _ = self._evaluate(text)
+        self.assertEqual(phase.status, "PASS")
+        self.assertEqual(analysis.word_count, count_words(text))
+
+    def test_style_flags_are_major_and_headings_stay_minor(self) -> None:
+        line = "Keep every quoted field."
+        line = line + ("." * (72 - len(line)))
+        wrapped = "\n".join([line] * 8)
+        hard, phase, findings = self._evaluate(wrapped)
+        self.assertEqual(phase.status, "FAIL")
+        self.assertIn("Task prompt looks hard-wrapped", [f.finding for f in findings])
+        self.assertIsNotNone(hard)
+
+        prose = "Fix the exporter.\n\n## Details\n\nKeep the rows."
+        _, phase, findings = self._evaluate(prose)
+        self.assertEqual(phase.status, "PASS")
+        self.assertEqual(
+            [f.finding for f in findings],
+            ["Task prompt uses headings"],
+        )
+        self.assertEqual(findings[0].severity, "MINOR")
+
+        flagged = "See the rows — then the file — then the path — then the end — done."
+        _, phase, findings = self._evaluate(flagged + "\n\nhttps://example.com\n\nline\n\n\n\n\nmore café")
+        names = [f.finding for f in findings]
+        self.assertEqual(phase.status, "FAIL")
+        for title in (
+            "Task prompt uses frequent em dashes",
+            "Task prompt has four or more blank lines in a row",
+            "Task prompt contains non-ASCII characters",
+            "Task prompt contains a URL",
+        ):
+            self.assertIn(title, names)
 
     def test_analysis_text_reports_counts(self) -> None:
         analysis, _, _ = self._evaluate(FOCUSED_PROMPT)

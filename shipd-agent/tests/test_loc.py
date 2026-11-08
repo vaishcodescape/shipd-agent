@@ -74,24 +74,24 @@ class EffectiveLocTests(unittest.TestCase):
         self.assertEqual(phase.status, "PASS")
         self.assertEqual(findings, [])
 
-    def test_olympus_below_minimum_recommends_downgrade(self) -> None:
+    def test_olympus_below_old_floor_still_passes(self) -> None:
         loc_info = {
             "method": "solution.patch",
             "effective_loc": 200,
             "files_analyzed": ["a.py"],
         }
-        phase, findings, _ = evaluate_loc_phase4(
+        phase, findings, summary = evaluate_loc_phase4(
             loc_info,
             quest="olympus",
             olympus_min_loc=OLYMPUS_MIN_EFFECTIVE_LOC,
             mars_min_loc=MARS_MIN_EFFECTIVE_LOC,
             mars_max_loc=MARS_MAX_EFFECTIVE_LOC,
         )
-        self.assertEqual(phase.status, "FAIL")
-        self.assertEqual(len(findings), 1)
-        self.assertIn("Mars", findings[0].finding)
+        self.assertEqual(phase.status, "PASS")
+        self.assertEqual(findings, [])
+        self.assertIn("no solution-LOC floor", summary)
 
-    def test_apply_downgrade_sets_flag(self) -> None:
+    def test_apply_downgrade_does_not_set_flag_from_loc(self) -> None:
         loc_info = {
             "method": "solution.patch",
             "effective_loc": 200,
@@ -115,8 +115,39 @@ class EffectiveLocTests(unittest.TestCase):
             mars_min_loc=MARS_MIN_EFFECTIVE_LOC,
             mars_max_loc=MARS_MAX_EFFECTIVE_LOC,
         )
-        self.assertTrue(updated.downgrade_to_mars)
-        self.assertEqual(updated.decision, "request_changes")
+        self.assertFalse(updated.downgrade_to_mars)
+        self.assertEqual(updated.decision, "approve")
+
+    def test_apply_downgrade_clears_a_loc_only_flag(self) -> None:
+        loc_info = {
+            "method": "solution.patch",
+            "effective_loc": 200,
+            "files_analyzed": ["a.py"],
+        }
+        review = ReviewResult(
+            decision="approve",
+            band_ratings=BandRatings(
+                problem=BandRating(score=3, confidence="high"),
+                tests=BandRating(score=3, confidence="high"),
+                solution=BandRating(score=3, confidence="high"),
+            ),
+            recommendation_summary="Looks good",
+            contributor_feedback="Nice work",
+            downgrade_to_mars=True,
+            suggested_tags=["Lines of code"],
+            other_notes="Effective LOC is below the Olympus long-horizon minimum.",
+        )
+        updated = apply_downgrade_logic(
+            review,
+            loc_info,
+            quest="olympus",
+            olympus_min_loc=OLYMPUS_MIN_EFFECTIVE_LOC,
+            mars_min_loc=MARS_MIN_EFFECTIVE_LOC,
+            mars_max_loc=MARS_MAX_EFFECTIVE_LOC,
+        )
+        self.assertFalse(updated.downgrade_to_mars)
+        self.assertNotIn("Lines of code", updated.suggested_tags)
+        self.assertEqual(updated.decision, "approve")
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ The review agent works with any of these providers. Anthropic stays the default,
 | xAI | `xai` | `XAI_API_KEY` |
 | OpenAI-compatible endpoint | `openai-compatible` | `REVIEW_LLM_API_KEY` |
 
-The **explore** model drives the Deep Agents reviewer and its focused workers. The **finalize** model (`REVIEW_MODEL`) writes the structured verdict from verified phase reports. Choose a model your account can access that supports the tools and structured output this pipeline uses. Repository defaults live in [`llm_providers.py`](../shipd-agent/review/llm_providers.py); they are not a guarantee of provider availability. After upgrading, rerun `./run.sh --setup` to install the pinned Deep Agents and compatible LangChain packages.
+The **explore** model drives the Deep Agents reviewer and its focused workers. The **finalize** model (`REVIEW_MODEL`) writes the structured verdict from verified phase reports. The **Auto Review** model (`REVIEW_AUTO_REVIEW_MODEL`, default: the finalize model) makes one structured call at the end to predict Shipd Auto Review findings. Choose a model your account can access that supports the tools and structured output this pipeline uses. Repository defaults live in [`llm_providers.py`](../shipd-agent/review/llm_providers.py); they are not a guarantee of provider availability. After upgrading, rerun `./run.sh --setup` to install the pinned Deep Agents and compatible LangChain packages.
 
 **Interactive setup (recommended)**
 
@@ -47,6 +47,22 @@ This asks for the provider, an explore model and a finalize model (pick from a l
 
 If you switch provider with `--provider` and leave out `--model` and `--explore-model`, that provider's default models are used, not the models saved in `.env`.
 
+**Auto Review prediction**
+
+`./run.sh --configure-llm` ends with three Auto Review questions. `./run.sh --configure-auto-review` asks only these:
+
+- Run the stage or not (`REVIEW_AUTO_REVIEW`).
+- Which model it uses (`REVIEW_AUTO_REVIEW_MODEL`). Press Enter on the finalize model to keep the two in step.
+- Whether to change the expected Vega, Orion, and Nova model names (`REVIEW_VEGA_MODEL`, `REVIEW_ORION_MODEL`, `REVIEW_NOVA_MODEL`).
+
+The first-run setup skips these questions and keeps the defaults. `./run.sh --check` shows the current values.
+
+```bash
+./run.sh --configure-auto-review                                       # on/off, model, agent names
+./run.sh --once --no-submit --auto-review-model claude-sonnet-4-6       # this run only
+./run.sh --once --no-submit --no-auto-review                            # skip the stage this run
+```
+
 **Provider notes**
 
 - **OpenAI:** calls go through the Responses API, as configured by this project’s provider adapter.
@@ -70,11 +86,15 @@ See [`.env.example`](../.env.example) for all settings. Start with one review an
 | `REVIEW_MAX_TOTAL_TOKENS` | Stop new calls once provider-reported review usage reaches the limit (default 200,000); in-flight calls can overshoot |
 | `REVIEW_EXPLORE_MAX_OUTPUT_TOKENS` | Cap exploration output per call |
 | `REVIEW_FINALIZE_MAX_OUTPUT_TOKENS` | Cap finalization output per call |
+| `REVIEW_AUTO_REVIEW` | Run the Auto Review prediction stage (default 1; 0 turns it off). It gets two calls of its own on top of the shared budget, under the same token limit |
+| `REVIEW_AUTO_REVIEW_MAX_OUTPUT_TOKENS` | Cap Auto Review prediction output per call (default 4,096) |
 | `REVIEW_PHASE0_TEST_TIMEOUT` | Bound each test invocation |
 | `REVIEW_PHASE0_DOCKER_BUILD_TIMEOUT` | Bound the Docker build |
 | `CLEANUP_AFTER_REVIEW=0` | Keep cloned repositories and Docker artifacts |
 
 These limits bound individual operations; they are not a monetary spending cap. LLM API usage is billed by your provider. The reviewer reads existing Nova/Vega/Orion results; it has no supported command for launching those evaluations.
+
+Olympus difficulty is at least four unhinted runs per model, one model solving at most 25% of the time, and a Nova average sequence length above 400,000 tokens. `REVIEW_FLAKINESS_REPEATS` (default 6) repeats the clean-repo run and the test-patch run after the one-shot Docker contract passes. Set it to 0 to skip those repeats. `REVIEW_AGENT_MODELS` is a JSON object of expected model names, and `REVIEW_VEGA_MODEL`, `REVIEW_ORION_MODEL`, and `REVIEW_NOVA_MODEL` override one agent each (they win over the JSON). Shipd does not publish these models; the defaults (Opus 5.5 xhigh, Sol 6.1 xhigh, Gemini 4 Argon) are guesses. The names are recorded with the review and shown to the Auto Review prediction, and are never a pass or fail.
 
 Review bundles include `review_evidence` with verified citation excerpts and `review_usage` with shared call counts, reported tokens, and missing usage. Provider-internal HTTP retries follow the client SDK policy. See the [review harness](../README.md#deep-agents-review-harness) and [validation report](deep-agents-validation.md) for details.
 

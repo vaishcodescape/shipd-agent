@@ -127,6 +127,20 @@ class ValidateNodeCoverageTests(unittest.TestCase):
         out = g.validate_node(self._state(review, scrape))["review_result"]
         self.assertEqual(out["decision"], "request_changes")
 
+    def test_recorded_pass_cannot_override_unverified_sequence_length(self) -> None:
+        state = self._state(_review(), {"agent_runs": "Vega: 1/4 pass; Nova: 0/4 pass; Orion: 0/4 pass"})
+        state["agent_runs_data"] = {"available": True, "raw_text": state["scrape_context"]["agent_runs"]}
+        state.update(g._run_agent_runs_analysis(state))
+        state["review_evidence"] = {"phases": {
+            str(i): {"status": "PASS", "summary": "Reviewer says pass", "findings": []}
+            for i in range(1, 7)
+        }}
+        out = g.validate_node(state)["review_result"]
+        self.assertEqual(out["phase_results"]["5"]["status"], "SKIP")
+        self.assertIn("Long horizon unverified", out["phase_results"]["5"]["summary"])
+        self.assertEqual(out["decision"], "request_changes")
+        self.assertIn("Phase 5", out["internal_notes"])
+
 
 if __name__ == "__main__":
     unittest.main()

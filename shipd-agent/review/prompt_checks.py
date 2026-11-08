@@ -46,6 +46,7 @@ class PromptAnalysis:
     word_count: int | None = None
     requirements: list[str] = field(default_factory=list)
     platform_flag: str | None = None
+    body: str = ""
 
     @property
     def requirement_count(self) -> int:
@@ -139,6 +140,141 @@ def platform_too_many_requirements_flag(holistic_text: str) -> str | None:
     return None
 
 
+_EM_DASH_RE = re.compile(r"—|–|(?:\s--\s)")
+_URL_RE = re.compile(r"https?://|www\.\w", re.I)
+_BLANK_RUN_RE = re.compile(r"(?:[ \t]*\n){4,}")
+_NON_ASCII_RE = re.compile(r"[^\x00-\x7F]")
+
+
+def _external_title(repo_path: Path, prompt_text: str) -> str:
+    """A title that is not already inside the prompt file."""
+    front = re.match(r"^---\n(.*?)\n---", prompt_text, re.S)
+    if front:
+        match = re.search(r"^title:\s*[\"']?(.+?)[\"']?\s*$", front.group(1), re.I | re.M)
+        if match and match.group(1).strip() in prompt_text:
+            return ""
+    for name in ("title.txt", "TITLE", "title.md"):
+        path = repo_path / name
+        if not path.is_file():
+            continue
+        try:
+            title = path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        if title and title not in prompt_text:
+            return title.splitlines()[0].strip()
+    return ""
+
+
+def style_findings(text: str, *, source: str) -> list[Finding]:
+    """Precheck and style flags. Category fit stays with the Phase 1 reviewer."""
+    findings: list[Finding] = []
+    prose = "\n".join(_strip_code_fences(text or ""))
+    wrapped = [
+        line
+        for line in prose.splitlines()
+        if 68 <= len(line.rstrip()) <= 88 and line.strip()
+    ]
+    if len(wrapped) >= 8:
+        findings.append(
+            Finding(
+                phase="1",
+                severity="MAJOR",
+                finding="Task prompt looks hard-wrapped",
+                evidence=f"{source}: {len(wrapped)} lines are between 68 and 88 characters.",
+                suggested_fix="Write ordinary paragraphs. Do not hard-wrap near 70 to 85 characters.",
+            )
+        )
+    if len(_EM_DASH_RE.findall(text or "")) >= 4:
+        findings.append(
+            Finding(
+                phase="1",
+                severity="MAJOR",
+                finding="Task prompt uses frequent em dashes",
+                evidence=f"{source}: frequent em dashes or spaced double hyphens.",
+                suggested_fix="Prefer commas or full stops. Frequent em dashes read as generated prose.",
+            )
+        )
+    for paragraph in re.split(r"\n\s*\n", prose):
+        if count_words(paragraph) >= 120:
+            findings.append(
+                Finding(
+                    phase="1",
+                    severity="MAJOR",
+                    finding="Task prompt has a wall-of-text paragraph",
+                    evidence=f"{source}: a paragraph is at least 120 words.",
+                    suggested_fix="Break the paragraph so a reader can see the ask.",
+                )
+            )
+            break
+    if _BLANK_RUN_RE.search(text or ""):
+        findings.append(
+            Finding(
+                phase="1",
+                severity="MAJOR",
+                finding="Task prompt has four or more blank lines in a row",
+                evidence=source,
+                suggested_fix="Collapse the extra blank lines.",
+            )
+        )
+    non_ascii = [
+        char
+        for char in _NON_ASCII_RE.findall(text or "")
+        if char not in "—–"
+    ]
+    if non_ascii:
+        findings.append(
+            Finding(
+                phase="1",
+                severity="MAJOR",
+                finding="Task prompt contains non-ASCII characters",
+                evidence=f"{source}: {''.join(sorted(set(non_ascii))[:12])!r}",
+                suggested_fix="Keep the prompt in ASCII.",
+            )
+        )
+    if _URL_RE.search(text or ""):
+        findings.append(
+            Finding(
+                phase="1",
+                severity="MAJOR",
+                finding="Task prompt contains a URL",
+                evidence=source,
+                suggested_fix="Remove URLs from the prompt.",
+            )
+        )
+    if any(_LIST_ITEM_RE.match(line) for line in prose.splitlines()):
+        findings.append(
+            Finding(
+                phase="1",
+                severity="MINOR",
+                finding="Task prompt uses a bulleted requirement list",
+                evidence=source,
+                suggested_fix="State the ask in prose instead of a bullet list of requirements.",
+            )
+        )
+    if any(_HEADING_RE.match(line) for line in (text or "").splitlines()):
+        findings.append(
+            Finding(
+                phase="1",
+                severity="MINOR",
+                finding="Task prompt uses headings",
+                evidence=source,
+                suggested_fix="Drop markdown headings. The prompt should read as prose.",
+            )
+        )
+    if _FENCE_RE.search(text or ""):
+        findings.append(
+            Finding(
+                phase="1",
+                severity="MINOR",
+                finding="Task prompt contains a code snippet",
+                evidence=source,
+                suggested_fix="Describe the behaviour in prose when a snippet is not required.",
+            )
+        )
+    return findings
+
+
 def analyze_task_prompt(repo_path: Path, *, holistic_text: str = "") -> PromptAnalysis:
     path = find_task_prompt_path(repo_path)
     flag = platform_too_many_requirements_flag(holistic_text)
@@ -148,11 +284,15 @@ def analyze_task_prompt(repo_path: Path, *, holistic_text: str = "") -> PromptAn
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return PromptAnalysis(source=None, platform_flag=flag)
+    repo = resolve_repo_path(repo_path)
+    title = _external_title(repo, text)
+    word_count = count_words(text) + (count_words(title) if title else 0)
     return PromptAnalysis(
-        source=str(path.relative_to(resolve_repo_path(repo_path))),
-        word_count=count_words(text),
+        source=str(path.relative_to(repo)),
+        word_count=word_count,
         requirements=extract_requirements(text),
         platform_flag=flag,
+        body=text,
     )
 
 
@@ -252,16 +392,25 @@ def evaluate_prompt_phase1(
             f"~{analysis.requirement_count} requirements > {max_requirements}"
         )
 
-    if findings:
+    if analysis.body:
+        findings.extend(style_findings(analysis.body, source=source))
+
+    blocking = [item for item in findings if item.severity in {"BLOCKER", "MAJOR"}]
+    if blocking:
         return (
             PhaseResult(
                 status="FAIL",
-                summary="Task prompt checks failed: " + "; ".join(issues),
+                summary="Task prompt checks failed: " + "; ".join(issues or [item.finding for item in blocking]),
             ),
             findings,
         )
-    if analysis.source is None:
+    if analysis.source is None and not findings:
         return None, []
+    if analysis.source is None:
+        return (
+            PhaseResult(status="PASS", summary="No task prompt file to measure."),
+            findings,
+        )
     return (
         PhaseResult(
             status="PASS",
@@ -270,5 +419,5 @@ def evaluate_prompt_phase1(
                 f"{analysis.requirements_label}."
             ),
         ),
-        [],
+        findings,
     )

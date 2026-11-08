@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 
@@ -16,10 +17,18 @@ from review.llm_providers import (
     get_provider,
 )
 from review.rubric_defaults import (
+    AGENT_TYPES,
     MARS_MAX_EFFECTIVE_LOC,
     MARS_MIN_EFFECTIVE_LOC,
+    EXPECTED_AGENT_MODELS,
+    FLAKINESS_REPEATS,
+    MAX_CHEAT_RATE,
     MAX_PROMPT_REQUIREMENTS,
     MAX_PROMPT_WORDS,
+    MAX_SOLVE_RATE,
+    MIN_UNHINTED_RUNS,
+    NOVA_MIN_AVG_SEQUENCE_TOKENS,
+    NOVA_PAYOUT_SEQUENCE_CAP,
     OLYMPUS_MIN_EFFECTIVE_LOC,
 )
 
@@ -44,6 +53,7 @@ DEFAULT_REVIEW_SCRAPE_PANEL_MAX_CHARS = 2_500
 DEFAULT_REVIEW_FINALIZE_PAYLOAD_MAX_CHARS = 32_000
 DEFAULT_REVIEW_EXPLORE_MAX_OUTPUT_TOKENS = 4_096
 DEFAULT_REVIEW_FINALIZE_MAX_OUTPUT_TOKENS = 8_192
+DEFAULT_REVIEW_AUTO_REVIEW_MAX_OUTPUT_TOKENS = 4_096
 
 # Coverage recheck: after the main explore pass, re-prompt the same agent to
 # gather evidence for any rubric phase it skipped (bounded, conditional, and
@@ -89,6 +99,19 @@ class ReviewConfig:
     max_prompt_words: int = MAX_PROMPT_WORDS
     max_prompt_requirements: int = MAX_PROMPT_REQUIREMENTS
     review_max_total_tokens: int = 200_000
+    min_unhinted_runs: int = MIN_UNHINTED_RUNS
+    max_solve_rate: float = MAX_SOLVE_RATE
+    nova_min_sequence_tokens: int = NOVA_MIN_AVG_SEQUENCE_TOKENS
+    nova_payout_sequence_cap: int = NOVA_PAYOUT_SEQUENCE_CAP
+    max_cheat_rate: float = MAX_CHEAT_RATE
+    flakiness_repeats: int = FLAKINESS_REPEATS
+    expected_agent_models: dict[str, str] = field(
+        default_factory=lambda: dict(EXPECTED_AGENT_MODELS)
+    )
+    review_auto_review: bool = True
+    # Empty means the finalize model (review_model).
+    review_auto_review_model: str = ""
+    review_auto_review_max_output_tokens: int = DEFAULT_REVIEW_AUTO_REVIEW_MAX_OUTPUT_TOKENS
 
 
 def _truthy(value: str) -> bool:
@@ -138,6 +161,11 @@ def resolve_review_models(spec: ProviderSpec) -> tuple[str, str]:
     return explore, finalize or explore
 
 
+def resolve_auto_review_model(spec: ProviderSpec, finalize: str) -> str:
+    """REVIEW_AUTO_REVIEW_MODEL for ``spec``, else the finalize model."""
+    return _model_from_env(spec, "REVIEW_AUTO_REVIEW_MODEL", default=finalize)
+
+
 def _structured_output_method_from_env() -> str:
     method = os.getenv("REVIEW_STRUCTURED_OUTPUT_METHOD", "").strip().lower()
     if method and method not in STRUCTURED_OUTPUT_METHODS:
@@ -146,6 +174,31 @@ def _structured_output_method_from_env() -> str:
             f"{', '.join(STRUCTURED_OUTPUT_METHODS)} (got {method!r})."
         )
     return method
+
+
+def expected_agent_models_from_env(*, per_agent: bool = True) -> dict[str, str]:
+    """Expectation map only. It never decides a pass or a fail.
+
+    ``per_agent=False`` leaves out the REVIEW_<AGENT>_MODEL overrides, i.e. the
+    line-up those overrides are compared against.
+    """
+    models = dict(EXPECTED_AGENT_MODELS)
+    raw = os.getenv("REVIEW_AGENT_MODELS", "").strip()
+    if raw:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict):
+            models = {str(key): str(value) for key, value in data.items()}
+    if not per_agent:
+        return models
+    # REVIEW_VEGA_MODEL, REVIEW_ORION_MODEL, REVIEW_NOVA_MODEL win over the JSON map.
+    for agent in AGENT_TYPES:
+        override = os.getenv(f"REVIEW_{agent.upper()}_MODEL", "").strip()
+        if override:
+            models[agent] = override
+    return models
 
 
 def get_review_config(*, dry_run_override: bool | None = None) -> ReviewConfig:
@@ -269,5 +322,38 @@ def get_review_config(*, dry_run_override: bool | None = None) -> ReviewConfig:
         ),
         max_prompt_requirements=int(
             os.getenv("REVIEW_MAX_PROMPT_REQUIREMENTS", str(MAX_PROMPT_REQUIREMENTS))
+        ),
+        min_unhinted_runs=int(
+            os.getenv("REVIEW_MIN_UNHINTED_RUNS", str(MIN_UNHINTED_RUNS))
+        ),
+        max_solve_rate=float(
+            os.getenv("REVIEW_MAX_SOLVE_RATE", str(MAX_SOLVE_RATE))
+        ),
+        nova_min_sequence_tokens=int(
+            os.getenv(
+                "REVIEW_NOVA_MIN_SEQUENCE_TOKENS",
+                str(NOVA_MIN_AVG_SEQUENCE_TOKENS),
+            )
+        ),
+        nova_payout_sequence_cap=int(
+            os.getenv(
+                "REVIEW_NOVA_PAYOUT_SEQUENCE_CAP",
+                str(NOVA_PAYOUT_SEQUENCE_CAP),
+            )
+        ),
+        max_cheat_rate=float(
+            os.getenv("REVIEW_MAX_CHEAT_RATE", str(MAX_CHEAT_RATE))
+        ),
+        flakiness_repeats=int(
+            os.getenv("REVIEW_FLAKINESS_REPEATS", str(FLAKINESS_REPEATS))
+        ),
+        expected_agent_models=expected_agent_models_from_env(),
+        review_auto_review=_truthy(os.getenv("REVIEW_AUTO_REVIEW", "1")),
+        review_auto_review_model=resolve_auto_review_model(provider, review_model),
+        review_auto_review_max_output_tokens=int(
+            os.getenv(
+                "REVIEW_AUTO_REVIEW_MAX_OUTPUT_TOKENS",
+                str(DEFAULT_REVIEW_AUTO_REVIEW_MAX_OUTPUT_TOKENS),
+            )
         ),
     )

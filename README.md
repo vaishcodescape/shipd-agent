@@ -103,8 +103,10 @@ The code includes the criteria reported in community assessment feedback:
 | --- | --- |
 | **Prompt length** | Flags explicit task-prompt files over **1,000 words** |
 | **Too Many Requirements** | Reads the platform flag and estimates independent requirements locally |
-| **Agent runs** | Checks **Nova × 4, Vega × 4, Orion × 4** — 12 runs total |
-| **Passing runs** | Requires **exactly one passing run overall**, belonging to one agent type |
+| **Agent runs** | At least **4 finished unhinted runs** each for Nova, Vega, and Orion. More is allowed. Hinted runs do not count |
+| **Passing runs** | **One model only**, above 0% and at most **25%**. The other two stay at 0%. A Nova-only solve is a warning |
+| **Long horizon** | Olympus: Nova average **sequence length above 400,000** tokens. There is no solution-LOC floor |
+| **Auto Review (prediction)** | Last stage: one model call reads the whole draft review and flags places where the prompt, tests, solution, and runs disagree. A concrete MAJOR blocks approve. Labeled a prediction, not Shipd's verdict |
 
 The requirement-count threshold defaults to 10 and is a **local heuristic**, not a published Shipd threshold. Existing run results are read without clicking evaluation controls. The agent does not launch Nova, Vega, or Orion runs.
 
@@ -125,6 +127,7 @@ A good reviewer does more than check whether tests are green. They ask whether t
 | **Review like a maintainer** | **Phase 4:** judges correctness against the problem, repository conventions, security, maintainability, and unnecessary changes |
 | **Investigate agent outcomes** | **Phase 5:** uses available run results and failure evidence to assess solvability and fairness; a pass rate alone is insufficient |
 | **Make the overall judgment** | **Phase 6:** considers platform checks, related submissions, eligibility, and Mars/Olympus fit using available evidence |
+| **Read it as a whole** | **Auto Review (prediction):** after scoring, rereads the submission together and flags parts that disagree, ahead of Shipd's own Auto Review |
 
 The Deep Agents reviewer can read numbered source pages, search the repository, inspect patches, and delegate focused investigations. Each phase records structured evidence against successful read receipts. A bounded coverage recheck targets missing phase reports. The finalization model turns that evidence into **Problem / Tests / Solution scores (0–3)**, confidence levels, severity-tagged findings, and concrete feedback. Deterministic decision guards then constrain the result so known failures cannot be waved away by a positive LLM summary.
 
@@ -142,8 +145,10 @@ flowchart LR
     B --> C[Docker and patch checks]
     C --> D[Deep Agents evidence collection]
     E[Existing platform results] --> D
-    D --> I[Final scorer and rubric guards]
-    I --> F[Structured review bundle]
+    D --> I[Final scorer]
+    I --> J[Auto Review prediction]
+    J --> K[Rubric guards]
+    K --> F[Structured review bundle]
     F --> G[Inspect locally]
     F --> H[Submit when enabled]
 ```

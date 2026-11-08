@@ -89,9 +89,10 @@ PHASE0_PASS_CRITERIA: Final[tuple[str, ...]] = (
 # rubric: "Phase 0 failure → BLOCKER finding(s). Default request_changes"
 PHASE0_FAIL_DEFAULT_DECISION: Final[str] = "request_changes"
 
-# --- Effective LOC (Phase 4 / Phase 6 Mars vs Olympus) ---
+# --- Effective LOC (Phase 4) ---
 
-# Shipd platform scope bars (substantive solution LOC from solution.patch).
+# Olympus no longer has a solution-LOC floor. The constant remains so older
+# env files keep loading; it is not a pass/fail bar. Mars still has a size range.
 OLYMPUS_MIN_EFFECTIVE_LOC: Final[int] = 400
 MARS_MIN_EFFECTIVE_LOC: Final[int] = 100
 MARS_MAX_EFFECTIVE_LOC: Final[int] = 600
@@ -111,16 +112,29 @@ MAX_PROMPT_REQUIREMENTS: Final[int] = 10
 
 # --- Agent run platform bars (Phase 5) ---
 
-# Each agent type runs this many times, and exactly one run across all of them
-# may pass — so the single passing run belongs to a single agent type.
+# At least this many finished unhinted runs per agent. More than this is allowed.
+# Shipd does not publish the models behind these names; the map is an expectation
+# and must never be treated as a pass/fail fact.
 AGENT_TYPES: Final[tuple[str, ...]] = ("Nova", "Vega", "Orion")
-RUNS_PER_AGENT_TYPE: Final[int] = 4
-REQUIRED_AGENT_RUNS: Final[int] = RUNS_PER_AGENT_TYPE * len(AGENT_TYPES)
-REQUIRED_PASSING_RUNS: Final[int] = 1
-# Median of successful agent runs (long-horizon / minimum scope).
-OLYMPUS_MIN_MEDIAN_LOC: Final[int] = 400
-OLYMPUS_MIN_MEDIAN_FILES: Final[int] = 3
-OLYMPUS_MIN_MEDIAN_MESSAGES: Final[float] = 80.0
+EXPECTED_AGENT_MODELS: Final[dict[str, str]] = {
+    "Vega": "Opus 5.5 (xhigh)",
+    "Orion": "Sol 6.1 (xhigh)",
+    "Nova": "Gemini 4 Argon",
+}
+MIN_UNHINTED_RUNS: Final[int] = 4
+# Older name. It is a minimum, not an exact count.
+RUNS_PER_AGENT_TYPE: Final[int] = MIN_UNHINTED_RUNS
+REQUIRED_AGENT_RUNS: Final[int] = MIN_UNHINTED_RUNS * len(AGENT_TYPES)
+# One model solves the task at a rate above 0 and at most this fraction.
+MAX_SOLVE_RATE: Final[float] = 0.25
+# Nova's average sequence length (largest request plus compacted or trimmed tokens).
+NOVA_MIN_AVG_SEQUENCE_TOKENS: Final[int] = 400_000
+# Scope share of the reward keeps rising through this average. Not a fail line.
+NOVA_PAYOUT_SEQUENCE_CAP: Final[int] = 500_000
+MAX_CHEAT_RATE: Final[float] = 0.20
+# Verify Flakiness: clean repo, then the test patch. 0 disables the extra runs.
+FLAKINESS_REPEATS: Final[int] = 6
+# Mars still uses a median solution-LOC minimum. Olympus does not.
 MARS_MIN_MEDIAN_LOC: Final[int] = 100
 
 # --- Mars mode-specific fields ---
@@ -138,7 +152,7 @@ MARS_DIFFICULTY_TYPICAL: Final[int] = 2
 # permissive license, production-grade, allowed language → repo_eligible"
 OLYMPUS_MIN_REPO_STARS: Final[int] = 500
 
-# rubric: Phase 5 — "For Olympus: solvability_ok — at least one agent could solve"
+# rubric: Phase 5 — solvability_ok when one model solves the task inside the rate cap
 OLYMPUS_SOLVABILITY_MIN_PASSES: Final[int] = 1
 
 # --- Suggested tags (Required output format) ---
@@ -158,22 +172,24 @@ SUGGESTED_TAGS: Final[tuple[str, ...]] = (
 
 LOC_THRESHOLDS_PROMPT: Final[str] = (
     "LOC thresholds (substantive added lines in solution.patch): "
-    "Olympus long-horizon minimum {olympus_min}; Mars minimum scope {mars_min}, "
-    "Mars maximum {mars_max}. "
-    "Olympus: effective LOC < {olympus_min} → too small for long-horizon Olympus; "
-    "recommend downgrade_to_mars when ≥ {mars_min}. "
+    "Olympus has no LOC floor and must not be downgraded to Mars because of LOC. "
+    "Mars minimum scope {mars_min}, Mars maximum {mars_max}. "
     "Mars: effective LOC < {mars_min} → below minimum scope; "
     "> {mars_max} → bloat (MAJOR Phase 4 finding)."
 )
 
 AGENT_RUN_THRESHOLDS_PROMPT: Final[str] = (
-    "Agent run platform bars: {agent_types} must each run {runs_per_agent} times "
-    "({required_runs} runs total), and exactly {required_passes} run must pass — so the "
-    "passing run comes from a single agent type. Zero passes → unsolvable or unfair; "
-    "more than {required_passes} → too easy. "
-    "Olympus: median successful runs ≥ {olympus_median_files} files, "
-    "≥ {olympus_median_messages:.0f} messages, ≥ {olympus_median_loc} LOC (long-horizon). "
-    "Mars: median successful runs ≥ {mars_median_loc} LOC (minimum scope)."
+    "Agent run platform bars: {agent_types} need at least {runs_per_agent} finished "
+    "unhinted runs each. Hinted runs never count. Exactly one model solves the task, "
+    "at a rate above 0% and at most 25%; the other models stay at 0%. "
+    "A Nova-only solve is a warning, not a failure, until Shipd settles a docs conflict. "
+    "Olympus long horizon: Nova average sequence length above {nova_min_sequence} tokens "
+    "(largest request plus tokens the harness compacted or trimmed). "
+    "Averages above that raise the scope share of the reward through {nova_payout_cap}. "
+    "Mars: median successful runs ≥ {mars_median_loc} LOC. "
+    "Cheat rate below {max_cheat_pct:.0f}% across unhinted runs. "
+    "No run flagged unfair or blocked by the environment or verifier. "
+    "A missing field is unverified, not a pass."
 )
 
 PROMPT_THRESHOLDS_PROMPT: Final[str] = (
