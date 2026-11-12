@@ -7,25 +7,7 @@ import os
 import signal
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Iterator
-
-from playwright.sync_api import (
-    Browser,
-    BrowserContext,
-    Page,
-    Playwright,
-    sync_playwright,
-)
-
-DEFAULT_PAGE_TIMEOUT_MS = 20_000
-DEFAULT_NAVIGATION_TIMEOUT_MS = 30_000
-
-# Skip images, fonts, and media — enough for Shipd UI automation, much lighter.
-_BLOCKED_RESOURCE_TYPES = frozenset({"image", "media", "font"})
-
-# Chromium flags tuned for headless background use on Apple Silicon Macs.
+from less background use on Apple Silicon Macs.
 LIGHTWEIGHT_CHROMIUM_ARGS = (
     "--disable-dev-shm-usage",
     "--disable-background-networking",
