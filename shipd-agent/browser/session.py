@@ -7,7 +7,6 @@ import os
 import signal
 import time
 from contextlib import contextmanager
-from less background use on Apple Silicon Macs.
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
